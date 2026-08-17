@@ -1,0 +1,11 @@
+{
+  "name": "local-proxy-e2e",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "pretest": "cargo build --manifest-path ../Cargo.toml",
+    "test": "bun test",
+    "test:mock": "bun test e2e/mock.test.ts",
+    "test:live": "bun test e2e/live-zen.test.ts"
+  }
+}

@@ -19,6 +19,14 @@ providers:
     format: openai
     models:
       - gpt-4o
+  - name: zen
+    base_url: https://opencode.ai/zen
+    api_key_env: OPENCODE_ZEN_KEY
+    format: openai
+    models:
+      - deepseek-v4-flash-free
+      - claude-sonnet-4-5
+      - gpt-5.1
 
 routes:
   - model: claude-sonnet
@@ -27,6 +35,9 @@ routes:
     upstream_model: claude-sonnet-4-5
   - model: gpt-4o
     provider: openai
+  - model: deepseek-free
+    provider: zen
+    upstream_model: deepseek-v4-flash-free
 
 defaults:
   provider: anthropic
