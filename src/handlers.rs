@@ -1,9 +1,11 @@
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
-use axum::body::Bytes;
+use axum::body::{Body, Bytes};
 use axum::extract::State;
 use axum::http::{header, HeaderMap, StatusCode};
+use axum::response::sse::{KeepAlive, Sse};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -13,6 +15,8 @@ use serde_json::{json, Value};
 use crate::config::{Config, ProviderFormat};
 use crate::error::ApiError;
 use crate::router::Router;
+use crate::streams;
+use crate::streams::UpstreamStream;
 use crate::translate;
 use crate::upstream::{send_and_read, ProviderClient, UpstreamError};
 
@@ -107,16 +111,33 @@ fn parse_body(body: &Bytes) -> Result<Value, ApiError> {
     serde_json::from_slice(body).map_err(|_| ApiError::bad_request("invalid JSON body"))
 }
 
-/// Seam for task 003: streaming is detected but not implemented yet. Requests
-/// with `stream: true` are rejected with a clear error instead of being
-/// forwarded naively (which would hang or corrupt the response stream).
-fn ensure_non_streaming(body: &Value) -> Result<(), ApiError> {
-    if body.get("stream").and_then(Value::as_bool) == Some(true) {
-        return Err(ApiError::bad_request(
-            "streaming is not supported yet (planned for a later task)",
-        ));
+/// Seam replaced by task 003: streaming is now fully supported. A request is
+/// streaming when it carries `stream: true`.
+fn wants_stream(body: &Value) -> bool {
+    body.get("stream").and_then(Value::as_bool) == Some(true)
+}
+
+/// Ask the upstream OpenAI-style server to include usage in the final chunk.
+fn enable_usage(body: &mut Value) {
+    if body.get("stream_options").is_none() {
+        body["stream_options"] = json!({"include_usage": true});
     }
-    Ok(())
+}
+
+fn sse_response(stream: UpstreamStream) -> Response {
+    Sse::new(stream)
+        .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
+        .into_response()
+}
+
+/// Forward a same-format upstream SSE response verbatim.
+fn passthrough_stream(resp: reqwest::Response) -> Response {
+    Response::builder()
+        .status(resp.status())
+        .header(header::CONTENT_TYPE, "text/event-stream")
+        .header(header::CACHE_CONTROL, "no-cache")
+        .body(Body::from_stream(resp.bytes_stream()))
+        .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
 fn resolve_model(
@@ -165,25 +186,39 @@ async fn handle_messages(
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
     let mut body = parse_body(body)?;
-    ensure_non_streaming(&body)?;
+    let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state, &body)?;
     body["model"] = json!(upstream_model);
     let client = client_for(state, &provider)?;
 
-    let upstream_body = match provider.format {
+    let mut upstream_body = match provider.format {
         ProviderFormat::Anthropic => translate::normalize_anthropic_request(&body),
         ProviderFormat::Openai => translate::anthropic_to_openai_request(body)?,
     };
+    if streaming && provider.format == ProviderFormat::Openai {
+        enable_usage(&mut upstream_body);
+    }
 
     let resp = client
         .chat_request(client.default_path(), upstream_body, client_key)
         .await
         .map_err(ApiError::from)?;
-    let (status, rbody) = send_and_read(resp).await;
+    let status = resp.status().as_u16();
     if status >= 400 {
+        let (status, rbody) = send_and_read(resp).await;
         return Err(ApiError::from_upstream(status, rbody));
     }
+    if streaming {
+        return match provider.format {
+            ProviderFormat::Anthropic => Ok(passthrough_stream(resp)),
+            ProviderFormat::Openai => Ok(sse_response(streams::anthropic_from_openai(
+                resp,
+                upstream_model,
+            ))),
+        };
+    }
 
+    let rbody = resp.json::<Value>().await.unwrap_or(Value::Null);
     match provider.format {
         ProviderFormat::Anthropic => Ok(json_response(StatusCode::OK, rbody)),
         ProviderFormat::Openai => {
@@ -219,25 +254,39 @@ async fn handle_chat_completions(
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
     let mut body = parse_body(body)?;
-    ensure_non_streaming(&body)?;
+    let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state, &body)?;
     body["model"] = json!(upstream_model);
     let client = client_for(state, &provider)?;
 
-    let upstream_body = match provider.format {
+    let mut upstream_body = match provider.format {
         ProviderFormat::Openai => body,
         ProviderFormat::Anthropic => translate::openai_to_anthropic_request(body)?,
     };
+    if streaming && provider.format == ProviderFormat::Openai {
+        enable_usage(&mut upstream_body);
+    }
 
     let resp = client
         .chat_request(client.default_path(), upstream_body, client_key)
         .await
         .map_err(ApiError::from)?;
-    let (status, rbody) = send_and_read(resp).await;
+    let status = resp.status().as_u16();
     if status >= 400 {
+        let (status, rbody) = send_and_read(resp).await;
         return Err(ApiError::from_upstream(status, rbody));
     }
+    if streaming {
+        return match provider.format {
+            ProviderFormat::Openai => Ok(passthrough_stream(resp)),
+            ProviderFormat::Anthropic => Ok(sse_response(streams::openai_from_anthropic(
+                resp,
+                upstream_model,
+            ))),
+        };
+    }
 
+    let rbody = resp.json::<Value>().await.unwrap_or(Value::Null);
     match provider.format {
         ProviderFormat::Openai => Ok(json_response(StatusCode::OK, rbody)),
         ProviderFormat::Anthropic => {
@@ -273,25 +322,42 @@ async fn handle_responses(
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
     let mut body = parse_body(body)?;
-    ensure_non_streaming(&body)?;
+    let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state, &body)?;
     body["model"] = json!(upstream_model);
     let client = client_for(state, &provider)?;
 
-    let upstream_body = match provider.format {
+    let mut upstream_body = match provider.format {
         ProviderFormat::Openai => translate::responses_to_openai_request(body)?,
         ProviderFormat::Anthropic => translate::responses_to_anthropic_request(body)?,
     };
+    if streaming && provider.format == ProviderFormat::Openai {
+        enable_usage(&mut upstream_body);
+    }
 
     let resp = client
         .chat_request(client.default_path(), upstream_body, client_key)
         .await
         .map_err(ApiError::from)?;
-    let (status, rbody) = send_and_read(resp).await;
+    let status = resp.status().as_u16();
     if status >= 400 {
+        let (status, rbody) = send_and_read(resp).await;
         return Err(ApiError::from_upstream(status, rbody));
     }
+    if streaming {
+        return match provider.format {
+            ProviderFormat::Openai => Ok(sse_response(streams::responses_from_openai(
+                resp,
+                upstream_model,
+            ))),
+            ProviderFormat::Anthropic => Ok(sse_response(streams::responses_from_anthropic(
+                resp,
+                upstream_model,
+            ))),
+        };
+    }
 
+    let rbody = resp.json::<Value>().await.unwrap_or(Value::Null);
     let translated = match provider.format {
         ProviderFormat::Openai => translate::openai_to_responses_response(rbody, &upstream_model)
             .map_err(ApiError::from)?,
