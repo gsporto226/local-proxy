@@ -1,0 +1,33 @@
+server:
+  host: 127.0.0.1
+  port: 8787
+  api_keys:
+    - sk-proxy
+  passthrough_keys: false
+
+providers:
+  - name: anthropic
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    format: anthropic
+    models:
+      - claude-sonnet-4-5
+      - claude-opus-4-1
+  - name: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    format: openai
+    models:
+      - gpt-4o
+      - o3
+
+routes:
+  - model: claude-sonnet
+    provider: anthropic
+    prefix: true
+    upstream_model: claude-sonnet-4-5
+  - model: gpt-4o
+    provider: openai
+
+defaults:
+  provider: anthropic
