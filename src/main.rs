@@ -1,8 +1,10 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
 
 use local_proxy::config::{Config, DEFAULT_CONFIG_PATH};
+use local_proxy::handlers::{self, AppState};
 use local_proxy::router::Router;
 
 const LOG_TARGET: &str = "local_proxy";
@@ -62,26 +64,29 @@ async fn run_serve(
     let path = config_flag
         .or_else(Config::env_config_path)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
-    let config = Config::load(&path)?;
+    let config = Arc::new(Config::load(&path)?);
     tracing::info!(target: LOG_TARGET, path = %path.display(), "loaded config");
 
-    let host = host_flag.unwrap_or_else(|| config.server.host.clone());
-    let port = port_flag.unwrap_or(config.server.port);
-
-    let _registry = Router::new(&config)?;
+    let router = Arc::new(Router::new(config.clone())?);
     tracing::info!(target: LOG_TARGET, routes = config.routes.len(), providers = config.providers.len(), "router ready");
 
+    let clients = Arc::new(handlers::build_clients(&config)?);
+    let state = AppState {
+        config,
+        router,
+        clients,
+    };
+
+    let host = host_flag.unwrap_or_else(|| state.config.server.host.clone());
+    let port = port_flag.unwrap_or(state.config.server.port);
+
     let addr = format!("{host}:{port}");
-    let app = axum::Router::new().route("/health", axum::routing::get(health));
+    let app = handlers::app(state);
 
     let listener = tokio::net::TcpListener::bind(&addr).await?;
     tracing::info!(target: LOG_TARGET, %addr, "listening");
     axum::serve(listener, app).await?;
     Ok(())
-}
-
-async fn health() -> &'static str {
-    "ok"
 }
 
 fn init_tracing() {

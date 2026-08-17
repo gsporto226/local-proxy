@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::config::{Config, Provider};
 
@@ -11,31 +12,31 @@ pub enum RouterError {
 }
 
 #[derive(Debug)]
-pub struct ResolvedRoute<'a> {
-    pub provider: &'a Provider,
+pub struct ResolvedRoute {
+    pub provider: Arc<Provider>,
     pub upstream_model: String,
 }
 
 #[derive(Debug)]
-pub struct Router<'a> {
-    config: &'a Config,
-    exact: HashMap<&'a str, usize>,
-    providers: HashMap<&'a str, usize>,
+pub struct Router {
+    config: Arc<Config>,
+    exact: HashMap<String, usize>,
+    providers: HashMap<String, usize>,
     prefixes: Vec<usize>,
     default_provider: Option<usize>,
 }
 
-impl<'a> Router<'a> {
-    pub fn new(config: &'a Config) -> Result<Self, RouterError> {
+impl Router {
+    pub fn new(config: Arc<Config>) -> Result<Self, RouterError> {
         let mut providers = HashMap::new();
         for (i, provider) in config.providers.iter().enumerate() {
-            providers.insert(provider.name.as_str(), i);
+            providers.insert(provider.name.clone(), i);
         }
 
         let mut exact = HashMap::new();
         let mut prefixes = Vec::new();
         for (i, route) in config.routes.iter().enumerate() {
-            if !providers.contains_key(route.provider.as_str()) {
+            if !providers.contains_key(&route.provider) {
                 return Err(RouterError::ProviderNotFound {
                     provider: route.provider.clone(),
                 });
@@ -43,7 +44,7 @@ impl<'a> Router<'a> {
             if route.prefix {
                 prefixes.push(i);
             } else {
-                exact.insert(route.model.as_str(), i);
+                exact.insert(route.model.clone(), i);
             }
         }
 
@@ -61,7 +62,7 @@ impl<'a> Router<'a> {
         })
     }
 
-    pub fn resolve_model(&self, model: &str) -> Result<ResolvedRoute<'a>, RouterError> {
+    pub fn resolve_model(&self, model: &str) -> Result<ResolvedRoute, RouterError> {
         if let Some(&route_idx) = self.exact.get(model) {
             return self.resolve_route(route_idx, model);
         }
@@ -69,7 +70,7 @@ impl<'a> Router<'a> {
         if let Some((provider_name, upstream)) = model.split_once('/') {
             if let Some(&provider_idx) = self.providers.get(provider_name) {
                 return Ok(ResolvedRoute {
-                    provider: &self.config.providers[provider_idx],
+                    provider: Arc::new(self.config.providers[provider_idx].clone()),
                     upstream_model: upstream.to_string(),
                 });
             }
@@ -92,7 +93,7 @@ impl<'a> Router<'a> {
         for provider in &self.config.providers {
             if provider.models.iter().any(|m| m == model) {
                 return Ok(ResolvedRoute {
-                    provider,
+                    provider: Arc::new(provider.clone()),
                     upstream_model: model.to_string(),
                 });
             }
@@ -100,7 +101,7 @@ impl<'a> Router<'a> {
 
         if let Some(provider_idx) = self.default_provider {
             return Ok(ResolvedRoute {
-                provider: &self.config.providers[provider_idx],
+                provider: Arc::new(self.config.providers[provider_idx].clone()),
                 upstream_model: model.to_string(),
             });
         }
@@ -110,15 +111,30 @@ impl<'a> Router<'a> {
         })
     }
 
-    fn resolve_route(
-        &self,
-        route_idx: usize,
-        model: &str,
-    ) -> Result<ResolvedRoute<'a>, RouterError> {
+    /// Catalog of models a client may request: exact route models plus each
+    /// provider's native model list.
+    pub fn list_models(&self) -> Vec<String> {
+        let mut models: Vec<String> = Vec::new();
+        for route in &self.config.routes {
+            if !route.prefix && !models.contains(&route.model) {
+                models.push(route.model.clone());
+            }
+        }
+        for provider in &self.config.providers {
+            for model in &provider.models {
+                if !models.contains(model) {
+                    models.push(model.clone());
+                }
+            }
+        }
+        models
+    }
+
+    fn resolve_route(&self, route_idx: usize, model: &str) -> Result<ResolvedRoute, RouterError> {
         let route = &self.config.routes[route_idx];
-        let provider_idx = self.providers[route.provider.as_str()];
+        let provider_idx = self.providers[&route.provider];
         Ok(ResolvedRoute {
-            provider: &self.config.providers[provider_idx],
+            provider: Arc::new(self.config.providers[provider_idx].clone()),
             upstream_model: route
                 .upstream_model
                 .clone()
@@ -130,7 +146,7 @@ impl<'a> Router<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{Defaults, Provider, ProviderFormat, Route, Server};
+    use crate::config::{Defaults, ProviderFormat, Route, Server};
 
     fn config() -> Config {
         Config {
@@ -183,10 +199,13 @@ mod tests {
         c
     }
 
+    fn router_for(config: Config) -> Router {
+        Router::new(Arc::new(config)).unwrap()
+    }
+
     #[test]
     fn exact_route_match_wins() {
-        let config = config();
-        let router = Router::new(&config).unwrap();
+        let router = router_for(config());
         let resolved = router.resolve_model("gpt-4o").unwrap();
         assert_eq!(resolved.provider.name, "openai");
         assert_eq!(resolved.upstream_model, "gpt-4o");
@@ -196,15 +215,14 @@ mod tests {
     fn exact_route_with_upstream_model() {
         let mut c = config();
         c.routes[0].upstream_model = Some("gpt-4o-mini".to_string());
-        let router = Router::new(&c).unwrap();
+        let router = router_for(c);
         let resolved = router.resolve_model("gpt-4o").unwrap();
         assert_eq!(resolved.upstream_model, "gpt-4o-mini");
     }
 
     #[test]
     fn provider_slash_model_syntax() {
-        let config = config();
-        let router = Router::new(&config).unwrap();
+        let router = router_for(config());
         let resolved = router.resolve_model("openai/gpt-anything").unwrap();
         assert_eq!(resolved.provider.name, "openai");
         assert_eq!(resolved.upstream_model, "gpt-anything");
@@ -212,8 +230,7 @@ mod tests {
 
     #[test]
     fn provider_slash_model_unknown_provider_ignored() {
-        let config = config();
-        let router = Router::new(&config).unwrap();
+        let router = router_for(config());
         let resolved = router.resolve_model("nope/foo").unwrap();
         assert_eq!(resolved.provider.name, "anthropic");
         assert_eq!(resolved.upstream_model, "nope/foo");
@@ -221,8 +238,7 @@ mod tests {
 
     #[test]
     fn prefix_longest_match_wins() {
-        let config = config();
-        let router = Router::new(&config).unwrap();
+        let router = router_for(config());
         let resolved = router.resolve_model("claude-sonnet-4-5").unwrap();
         assert_eq!(resolved.provider.name, "openai");
         assert_eq!(resolved.upstream_model, "kimi-k2.6");
@@ -234,8 +250,7 @@ mod tests {
 
     #[test]
     fn native_models_list_match() {
-        let config = config();
-        let router = Router::new(&config).unwrap();
+        let router = router_for(config());
         let resolved = router.resolve_model("gpt-native-1").unwrap();
         assert_eq!(resolved.provider.name, "openai");
         assert_eq!(resolved.upstream_model, "gpt-native-1");
@@ -243,8 +258,7 @@ mod tests {
 
     #[test]
     fn default_provider_fallback() {
-        let config = config();
-        let router = Router::new(&config).unwrap();
+        let router = router_for(config());
         let resolved = router.resolve_model("totally-unknown-model").unwrap();
         assert_eq!(resolved.provider.name, "anthropic");
         assert_eq!(resolved.upstream_model, "totally-unknown-model");
@@ -252,8 +266,7 @@ mod tests {
 
     #[test]
     fn model_not_found_without_default() {
-        let config = no_default_config();
-        let router = Router::new(&config).unwrap();
+        let router = router_for(no_default_config());
         let err = router.resolve_model("totally-unknown-model").unwrap_err();
         assert!(matches!(err, RouterError::ModelNotFound { .. }));
     }
@@ -267,7 +280,17 @@ mod tests {
             prefix: false,
             upstream_model: None,
         });
-        let err = Router::new(&c).unwrap_err();
+        let err = Router::new(Arc::new(c)).unwrap_err();
         assert!(matches!(err, RouterError::ProviderNotFound { .. }));
+    }
+
+    #[test]
+    fn list_models_catalog() {
+        let router = router_for(config());
+        let models = router.list_models();
+        assert!(models.contains(&"gpt-4o".to_string()));
+        assert!(models.contains(&"claude-native-1".to_string()));
+        assert!(models.contains(&"gpt-native-1".to_string()));
+        assert!(!models.contains(&"claude".to_string()));
     }
 }
