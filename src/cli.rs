@@ -60,10 +60,7 @@ pub enum CliError {
 
     /// An external CLI tool could not be spawned.
     #[error("{message}")]
-    #[diagnostic(
-        code(cli::tool),
-        help("ensure the CLI tool is installed and on PATH")
-    )]
+    #[diagnostic(code(cli::tool), help("ensure the CLI tool is installed and on PATH"))]
     Tool {
         /// Human-readable description of the failure.
         message: String,
@@ -373,9 +370,7 @@ pub fn launch(
     }
     cmd.args(&args);
     let status = cmd.status().map_err(|e| CliError::Tool {
-        message: format!(
-            "failed to spawn '{tool_cmd}' (is it installed and on PATH?): {e}"
-        ),
+        message: format!("failed to spawn '{tool_cmd}' (is it installed and on PATH?): {e}"),
     })?;
     std::process::exit(status.code().unwrap_or(1));
 }

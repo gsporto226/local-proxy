@@ -68,7 +68,9 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 }
 
 fn main() -> miette::Result<()> {
-    miette::set_hook(Box::new(|_| Box::new(miette::GraphicalReportHandler::new())))?;
+    miette::set_hook(Box::new(
+        |_| Box::new(miette::GraphicalReportHandler::new()),
+    ))?;
     let cli = Cli::parse();
     let config = cli::resolve_config_path(cli.config);
     match cli.command {

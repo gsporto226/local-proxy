@@ -226,7 +226,9 @@ fn byte_offset(content: &str, line: usize, column: usize) -> usize {
             None => return content.len(),
         }
     }
-    let line_len = content[start..].find('\n').map_or(content.len() - start, |i| i);
+    let line_len = content[start..]
+        .find('\n')
+        .map_or(content.len() - start, |i| i);
     start + column.min(line_len)
 }
 
