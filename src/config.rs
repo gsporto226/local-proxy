@@ -462,6 +462,7 @@ mod tests {
 
     #[test]
     fn env_config_path_override() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         std::env::remove_var(ENV_CONFIG_PATH);
         assert!(Config::env_config_path().is_none());
 

@@ -155,6 +155,11 @@ Truncar `tool_result` a 120k chars ao reenviar (Anthropic impõe limite).
 - `launch design [-- args...]` — idem p/ Claude Design (`ANTHROPIC_BASE_URL` + auth).
 - `status` / `stop` — pid file.
 - `models` — lista modelos roteados.
+- `update [--check] [--force] [--repo owner/repo] [--no-verify]` — baixa o binário mais recente do
+  último release do GitHub (padrão `gsporto226/local-proxy` ou `$env:LOCAL_PROXY_REPO`), verifica
+  SHA256 (`sha2`) e faz *stage* como `<bin>.new` ao lado do executável em uso, imprimindo o comando
+  manual para concluir (não sobrescreve o binário em execução). `--check` só informa a versão.
+  Erros com códigos `update::unsupported/fetch/no_asset/verify/download/stage`.
 
 ## Módulos
 
@@ -162,6 +167,7 @@ Truncar `tool_result` a 120k chars ao reenviar (Anthropic impõe limite).
 src/
 ├── main.rs        CLI + boot (erros com miette, códigos config::/cli::)
 ├── config.rs      Config/Provider/Route, load YAML/JSON — global, auto-criado
+├── cli.rs         serve/launch/status/stop/models/update + erros miette
 ├── router.rs      resolve_model → (Provider, upstream_model)
 ├── upstream.rs    chamada HTTP + streaming por formato
 ├── translate.rs   requests/responses A↔O↔Responses

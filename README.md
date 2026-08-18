@@ -76,6 +76,19 @@ claude
 Claude Code fala `/v1/messages`; o proxy roteia para o provider configurado e traduz (ex.:
 `deepseek-free` → deepseek-v4-flash-free via opencode-zen).
 
+## Atualizar (`update`)
+
+Baixa o binário mais recente do último release do GitHub e faz *stage* ao lado do binário em uso,
+imprimindo o comando manual para concluir (não sobrescreve o executável em execução):
+
+```powershell
+local-proxy update --check        # só informa a versão mais recente
+local-proxy update                # baixa, verifica SHA256 e faz stage
+local-proxy update --force        # atualiza mesmo se já estiver na latest
+local-proxy update --repo dono/repo  # repositório alternativo (ou $env:LOCAL_PROXY_REPO)
+local-proxy update --no-verify    # pula a verificação de SHA256
+```
+
 ## Testes
 
 - **Unit (Rust)**: `cargo test` — traduções, roteamento, erros, máquinas de streaming.
@@ -97,6 +110,7 @@ $env:OPENCODE_ZEN_KEY="sk-..."; bun test live-zen.test.ts   # live (best-effort)
 src/
 ├── main.rs        CLI + boot (erros com miette, códigos config::/cli::)
 ├── config.rs      Config/Provider/Route (YAML/JSON) — global, auto-created
+├── cli.rs         serve/launch/status/stop/models/update + erros miette
 ├── router.rs      resolve_model → (provider, upstream_model)
 ├── upstream.rs    chamada HTTP + auth por formato
 ├── translate.rs   requests/responses A↔O↔Responses

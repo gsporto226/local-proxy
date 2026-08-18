@@ -59,6 +59,21 @@ enum Command {
     Stop,
     /// List routed models
     Models,
+    /// Check for a newer release and stage a manual update from GitHub Releases
+    Update {
+        /// GitHub owner/repo (overrides `LOCAL_PROXY_REPO`)
+        #[arg(long)]
+        repo: Option<String>,
+        /// Only report the latest version, without downloading
+        #[arg(long)]
+        check: bool,
+        /// Update even if already on the latest version
+        #[arg(long)]
+        force: bool,
+        /// Skip SHA256 verification
+        #[arg(long)]
+        no_verify: bool,
+    },
 }
 
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -97,5 +112,11 @@ fn main() -> miette::Result<()> {
         Some(Command::Status) => cli::status(config),
         Some(Command::Stop) => cli::stop(config),
         Some(Command::Models) => cli::models(config),
+        Some(Command::Update {
+            repo,
+            check,
+            force,
+            no_verify,
+        }) => block_on(cli::update(repo, check, force, no_verify)),
     }
 }

@@ -31,9 +31,18 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
 - Verificação pendente: `cargo test`, `cargo clippy --all-targets -- -D warnings` e a suíte e2e
   (`bun test e2e/mock.test.ts`, `bun test e2e/live-zen.test.ts`) após a mudança.
 
+### Nova rodada — comando `update`
+- Novo comando `local-proxy update [--check] [--force] [--repo owner/repo] [--no-verify]`: consulta o
+  último release do GitHub (`gsporto226/local-proxy` ou `$env:LOCAL_PROXY_REPO`), compara a versão com
+  a atual, baixa o binário, verifica SHA256 (`sha2`) e faz *stage* como `<bin>.new` ao lado do
+  executável em uso, imprimindo o comando manual para concluir (não sobrescreve o binário em execução).
+- `--check` apenas informa a versão mais recente; `--force` atualiza mesmo já na latest.
+- Erros com códigos `update::unsupported/fetch/no_asset/verify/download/stage` via miette.
+- Testes unitários p/ `asset_name`, `parse_version`, `is_newer`, `resolve_repo`.
+
 ### Entregas
 - Proxy completo (endpoints, tradução A↔O↔Responses, streaming, erros, auth, count_tokens, /v1/models).
-- CLI launcher (`serve`, `launch claude|design`, `status`, `stop`, `models`).
+- CLI launcher (`serve`, `launch claude|design`, `status`, `stop`, `models`, `update`).
 - Suíte e2e em Bun, README, config.example.yaml (com provider `zen`), docs/PLAN.md, docs/PENDING.md.
 
 ## Pendências futuras (não-bloqueantes / fora do escopo v1)

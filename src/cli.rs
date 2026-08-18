@@ -9,6 +9,8 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use miette::Diagnostic;
+use serde::Deserialize;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::config::{Config, DEFAULT_CONFIG_PATH};
@@ -65,6 +67,14 @@ pub enum CliError {
         /// Human-readable description of the failure.
         message: String,
     },
+
+    /// The proxy could not self-update from GitHub Releases.
+    #[error("failed to update local-proxy")]
+    #[diagnostic(
+        code(cli::update),
+        help("check the release exists and the network is reachable")
+    )]
+    Update(#[from] UpdateError),
 }
 
 // ---------------------------------------------------------------------------
@@ -464,6 +474,360 @@ pub fn resolve_config_path(flag: Option<PathBuf>) -> PathBuf {
 }
 
 // ---------------------------------------------------------------------------
+// update (self-update from GitHub Releases)
+// ---------------------------------------------------------------------------
+
+/// GitHub repository used when no override is given via `--repo` or
+/// `LOCAL_PROXY_REPO`.
+const DEFAULT_REPO: &str = "gsporto226/local-proxy";
+
+/// Environment variable that overrides the GitHub repository for updates.
+const UPDATE_ENV_REPO: &str = "LOCAL_PROXY_REPO";
+
+/// Version of this binary, taken from the crate manifest.
+const CURRENT_VERSION: &str = env!("CARGO_PKG_VERSION");
+
+#[cfg(target_os = "windows")]
+const CURRENT_OS: &str = "windows";
+#[cfg(target_os = "linux")]
+const CURRENT_OS: &str = "linux";
+#[cfg(target_os = "macos")]
+const CURRENT_OS: &str = "darwin";
+#[cfg(not(any(target_os = "windows", target_os = "linux", target_os = "macos")))]
+const CURRENT_OS: &str = "unknown";
+
+#[cfg(target_arch = "x86_64")]
+const CURRENT_ARCH: &str = "x86_64";
+#[cfg(target_arch = "aarch64")]
+const CURRENT_ARCH: &str = "aarch64";
+#[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
+const CURRENT_ARCH: &str = "unknown";
+
+/// A GitHub release listing (the fields `update` needs).
+#[derive(Debug, Deserialize)]
+struct Release {
+    /// The release tag, e.g. `v1.2.3`.
+    tag_name: String,
+    /// Assets attached to the release.
+    assets: Vec<ReleaseAsset>,
+}
+
+/// A single release asset.
+#[derive(Debug, Deserialize)]
+struct ReleaseAsset {
+    /// Asset file name, e.g. `local-proxy.exe`.
+    name: String,
+    /// Direct download URL for the asset.
+    browser_download_url: String,
+}
+
+/// Errors that can occur while self-updating.
+#[derive(Debug, Error, Diagnostic)]
+pub enum UpdateError {
+    /// No prebuilt binary is published for the current platform.
+    #[error("no prebuilt binary is published for this platform (os={os}, arch={arch})")]
+    #[diagnostic(
+        code(update::unsupported),
+        help("local-proxy publishes x86_64 builds for Linux and Windows")
+    )]
+    Unsupported {
+        /// Detected operating system.
+        os: String,
+        /// Detected CPU architecture.
+        arch: String,
+    },
+    /// The GitHub Releases API call failed.
+    #[error("failed to fetch release info from {repo}: {source}")]
+    #[diagnostic(code(update::fetch))]
+    Fetch {
+        /// Repository queried.
+        repo: String,
+        /// Underlying HTTP error.
+        #[source]
+        source: reqwest::Error,
+    },
+    /// The requested binary is not among the release assets.
+    #[error("binary '{bin}' not found in release {tag}")]
+    #[diagnostic(code(update::no_asset))]
+    NoAsset {
+        /// Expected asset name.
+        bin: String,
+        /// Release tag that was inspected.
+        tag: String,
+    },
+    /// The downloaded binary failed SHA256 verification.
+    #[error("SHA256 mismatch for {path}: expected {expected}, got {actual}")]
+    #[diagnostic(code(update::verify), help("retry the download or use --no-verify"))]
+    Verify {
+        /// Path of the staged binary.
+        path: String,
+        /// Expected digest from the release.
+        expected: String,
+        /// Actual computed digest.
+        actual: String,
+    },
+    /// The binary could not be downloaded.
+    #[error("failed to download {url}: {source}")]
+    #[diagnostic(code(update::download))]
+    Download {
+        /// URL being downloaded.
+        url: String,
+        /// Underlying HTTP error.
+        #[source]
+        source: reqwest::Error,
+    },
+    /// The staged binary could not be written to disk.
+    #[error("failed to stage update at {path}: {source}")]
+    #[diagnostic(code(update::stage))]
+    Stage {
+        /// Path that could not be written.
+        path: String,
+        /// Underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
+}
+
+/// The asset file name for a published platform, or `None` if no prebuilt
+/// binary is released for it.
+#[must_use]
+pub fn asset_name(os: &str, arch: &str) -> Option<String> {
+    if arch != "x86_64" {
+        return None;
+    }
+    match os {
+        "windows" => Some("local-proxy.exe".to_string()),
+        "linux" => Some("local-proxy".to_string()),
+        _ => None,
+    }
+}
+
+/// Parse a semantic version tag (`v1.2.3`) into a comparable `(major, minor,
+/// patch)` tuple, ignoring any pre-release/build suffix. Returns `None` on
+/// malformed input.
+#[must_use]
+pub fn parse_version(tag: &str) -> Option<(u32, u32, u32)> {
+    let v = tag.strip_prefix('v').unwrap_or(tag);
+    let mut parts = v.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    let patch = parts
+        .next()?
+        .split(|c: char| !c.is_ascii_digit())
+        .next()
+        .and_then(|s| s.parse().ok())?;
+    Some((major, minor, patch))
+}
+
+/// Whether version `a` is strictly newer than version `b`.
+#[must_use]
+pub fn is_newer(a: &str, b: &str) -> bool {
+    match (parse_version(a), parse_version(b)) {
+        (Some(x), Some(y)) => x > y,
+        _ => false,
+    }
+}
+
+/// The GitHub repository to query for updates, from `--repo`, the
+/// `LOCAL_PROXY_REPO` env var, or the default.
+fn resolve_repo(flag: Option<String>) -> String {
+    flag.or_else(|| {
+        std::env::var(UPDATE_ENV_REPO)
+            .ok()
+            .filter(|s| !s.is_empty())
+    })
+    .unwrap_or_else(|| DEFAULT_REPO.to_string())
+}
+
+/// Check for a newer release and, if `check` is false, stage the latest binary
+/// for a manual replace. Never overwrites the running executable.
+///
+/// # Errors
+///
+/// Returns [`CliError::Update`] if the release cannot be fetched, verified, or
+/// staged.
+/// Fetch the latest release metadata for `repo` from the GitHub Releases API.
+async fn fetch_release(client: &reqwest::Client, repo: &str) -> Result<Release, UpdateError> {
+    let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    client
+        .get(&api_url)
+        .header("Accept", "application/vnd.github+json")
+        .header("User-Agent", "local-proxy-updater")
+        .send()
+        .await
+        .map_err(|source| UpdateError::Fetch {
+            repo: repo.to_string(),
+            source,
+        })?
+        .error_for_status()
+        .map_err(|source| UpdateError::Fetch {
+            repo: repo.to_string(),
+            source,
+        })?
+        .json()
+        .await
+        .map_err(|source| UpdateError::Fetch {
+            repo: repo.to_string(),
+            source,
+        })
+}
+
+/// Download the binary at `asset_url` and, unless `no_verify`, check its SHA256
+/// against the sibling `.sha256` file.
+async fn download_and_verify(
+    client: &reqwest::Client,
+    asset_url: &str,
+    staged: &Path,
+    no_verify: bool,
+) -> Result<Vec<u8>, UpdateError> {
+    let body = client
+        .get(asset_url)
+        .send()
+        .await
+        .map_err(|source| UpdateError::Download {
+            url: asset_url.to_string(),
+            source,
+        })?
+        .error_for_status()
+        .map_err(|source| UpdateError::Download {
+            url: asset_url.to_string(),
+            source,
+        })?
+        .bytes()
+        .await
+        .map_err(|source| UpdateError::Download {
+            url: asset_url.to_string(),
+            source,
+        })?;
+
+    if no_verify {
+        println!("> verificação SHA256 pulada");
+        return Ok(body.to_vec());
+    }
+
+    let sha_url = format!("{asset_url}.sha256");
+    let sha_text = client
+        .get(&sha_url)
+        .send()
+        .await
+        .map_err(|source| UpdateError::Download {
+            url: sha_url.clone(),
+            source,
+        })?
+        .error_for_status()
+        .map_err(|source| UpdateError::Download {
+            url: sha_url.clone(),
+            source,
+        })?
+        .text()
+        .await
+        .map_err(|source| UpdateError::Download {
+            url: sha_url.clone(),
+            source,
+        })?;
+    let expected = sha_text
+        .split_whitespace()
+        .next()
+        .unwrap_or_default()
+        .to_lowercase();
+    let mut hasher = Sha256::new();
+    hasher.update(&body);
+    let actual = format!("{:x}", hasher.finalize());
+    if expected.is_empty() || actual != expected {
+        return Err(UpdateError::Verify {
+            path: staged.display().to_string(),
+            expected,
+            actual,
+        });
+    }
+    println!("> SHA256 OK ({actual})");
+    Ok(body.to_vec())
+}
+
+/// Print the manual steps to replace the running binary with the staged one.
+fn print_replace_instructions(staged: &Path, exe: &Path) {
+    println!("para concluir, substitua o binário em uso:");
+    if CURRENT_OS == "windows" {
+        println!(
+            "  (pare o proxy) move /y \"{}\" \"{}\"",
+            staged.display(),
+            exe.display()
+        );
+    } else {
+        println!(
+            "  mv \"{}\" \"{}\" && chmod +x \"{}\"",
+            staged.display(),
+            exe.display(),
+            exe.display()
+        );
+    }
+}
+
+/// Check for a newer release and, if `check` is false, stage the latest binary
+/// for a manual replace. Never overwrites the running executable.
+///
+/// # Errors
+///
+/// Returns [`CliError::Update`] if the release cannot be fetched, verified, or
+/// staged.
+pub async fn update(
+    repo_flag: Option<String>,
+    check: bool,
+    force: bool,
+    no_verify: bool,
+) -> miette::Result<()> {
+    let repo = resolve_repo(repo_flag);
+    let bin = asset_name(CURRENT_OS, CURRENT_ARCH).ok_or_else(|| UpdateError::Unsupported {
+        os: CURRENT_OS.to_string(),
+        arch: CURRENT_ARCH.to_string(),
+    })?;
+    let client = reqwest::Client::new();
+    let release = fetch_release(&client, &repo).await?;
+
+    let latest = release.tag_name.clone();
+    if check {
+        if is_newer(&latest, CURRENT_VERSION) {
+            println!("versão mais recente disponível: {latest} (atual: v{CURRENT_VERSION})");
+        } else {
+            println!("já está na versão mais recente: v{CURRENT_VERSION}");
+        }
+        return Ok(());
+    }
+    if !force && !is_newer(&latest, CURRENT_VERSION) {
+        println!("já está na versão mais recente (v{CURRENT_VERSION})");
+        return Ok(());
+    }
+
+    let asset = release
+        .assets
+        .iter()
+        .find(|a| a.name == bin)
+        .ok_or_else(|| UpdateError::NoAsset {
+            bin: bin.clone(),
+            tag: latest.clone(),
+        })?;
+    let asset_url = asset.browser_download_url.clone();
+
+    let exe = std::env::current_exe().map_err(|source| UpdateError::Stage {
+        path: bin.clone(),
+        source,
+    })?;
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let staged = dir.join(format!("{bin}.new"));
+
+    let body = download_and_verify(&client, &asset_url, &staged, no_verify).await?;
+    std::fs::write(&staged, body).map_err(|source| UpdateError::Stage {
+        path: staged.display().to_string(),
+        source,
+    })?;
+
+    println!("atualizado para {latest} (de v{CURRENT_VERSION})");
+    println!("binário staged em: {}", staged.display());
+    print_replace_instructions(&staged, &exe);
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // tests
 // ---------------------------------------------------------------------------
 
@@ -529,9 +893,11 @@ mod tests {
 
     #[test]
     fn resolve_config_path_uses_cwd_yaml_when_present() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         let prev = std::env::current_dir().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         std::fs::write(tmp.path().join("config.yaml"), "server: {}\n").unwrap();
+        std::env::remove_var("LOCAL_PROXY_CONFIG");
         std::env::set_current_dir(tmp.path()).unwrap();
         let result = resolve_config_path(None);
         std::env::set_current_dir(prev).unwrap();
@@ -540,6 +906,7 @@ mod tests {
 
     #[test]
     fn resolve_config_path_defaults_to_global_when_no_cwd_file() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         let prev = std::env::current_dir().unwrap();
         std::env::remove_var("LOCAL_PROXY_CONFIG");
         let tmp = tempfile::tempdir().unwrap();
@@ -553,5 +920,51 @@ mod tests {
     fn resolve_config_path_explicit_flag_wins() {
         let explicit = PathBuf::from("/explicit/custom.yaml");
         assert_eq!(resolve_config_path(Some(explicit.clone())), explicit);
+    }
+
+    #[test]
+    fn asset_name_matches_published_platforms() {
+        assert_eq!(
+            asset_name("windows", "x86_64"),
+            Some("local-proxy.exe".to_string())
+        );
+        assert_eq!(
+            asset_name("linux", "x86_64"),
+            Some("local-proxy".to_string())
+        );
+        assert_eq!(asset_name("darwin", "x86_64"), None);
+        assert_eq!(asset_name("windows", "aarch64"), None);
+        assert_eq!(asset_name("linux", "aarch64"), None);
+    }
+
+    #[test]
+    fn parse_version_handles_v_prefix_and_suffix() {
+        assert_eq!(parse_version("v1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("1.2.3"), Some((1, 2, 3)));
+        assert_eq!(parse_version("v1.2.3-beta"), Some((1, 2, 3)));
+        assert_eq!(parse_version("v1.2.3+build.7"), Some((1, 2, 3)));
+        assert_eq!(parse_version("nope"), None);
+        assert_eq!(parse_version("v1"), None);
+    }
+
+    #[test]
+    fn is_newer_compares_semver_versions() {
+        assert!(is_newer("v1.2.4", "v1.2.3"));
+        assert!(is_newer("v2.0.0", "v1.9.9"));
+        assert!(!is_newer("v1.2.3", "v1.2.3"));
+        assert!(!is_newer("v1.2.2", "v1.2.3"));
+        assert!(!is_newer("garbage", "v1.2.3"));
+    }
+
+    #[test]
+    fn resolve_repo_prefers_flag_over_env_and_default() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        std::env::remove_var(UPDATE_ENV_REPO);
+        assert_eq!(resolve_repo(None), DEFAULT_REPO);
+        assert_eq!(resolve_repo(Some("other/repo".to_string())), "other/repo");
+        std::env::set_var(UPDATE_ENV_REPO, "env/repo");
+        assert_eq!(resolve_repo(None), "env/repo");
+        assert_eq!(resolve_repo(Some("flag/repo".to_string())), "flag/repo");
+        std::env::remove_var(UPDATE_ENV_REPO);
     }
 }
