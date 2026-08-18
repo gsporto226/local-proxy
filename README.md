@@ -131,16 +131,21 @@ Claude Code fala `/v1/messages`; o proxy roteia para o provider configurado e tr
 
 ## Atualizar (`update`)
 
-Baixa o binário mais recente do último release do GitHub e faz *stage* ao lado do binário em uso,
-imprimindo o comando manual para concluir (não sobrescreve o executável em execução):
+Baixa o binário mais recente do último release do GitHub, verifica SHA256 e **aplica no lugar**:
+no Linux o swap é atômico (rename POSIX, funciona com o binário em execução); no Windows o
+executável em uso é renomeado para um backup e o novo assume o lugar na hora, com a limpeza do
+backup feita ao sair e no próximo start. Instalações via `cargo` delegam ao cargo:
 
 ```powershell
 local-proxy update --check        # só informa a versão mais recente
-local-proxy update                # baixa, verifica SHA256 e faz stage
+local-proxy update                # baixa, verifica SHA256 e aplica
 local-proxy update --force        # atualiza mesmo se já estiver na latest
 local-proxy update --repo dono/repo  # repositório alternativo (ou $env:LOCAL_PROXY_REPO)
 local-proxy update --no-verify    # pula a verificação de SHA256
 ```
+
+O `serve` aceita `--check-update` para avisar no log quando há versão mais recente
+(desative com `$env:LOCAL_PROXY_DISABLE_AUTOUPDATE=1`).
 
 ## Testes
 

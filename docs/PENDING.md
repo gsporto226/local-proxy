@@ -45,8 +45,22 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
   o modelo do harness** e roteia pelo selecionado (persiste entre reinícios; aplica em runtime via
   watcher).
 
+### Nova rodada — update automático (upgrade estilo opencode)
+- `update` detecta o método de instalação (`~/.local/bin` → standalone, `~/.cargo/bin`/`$CARGO_HOME` →
+  cargo, senão custom) e aplica de verdade:
+  - **Linux**: rename POSIX atômico sobre o binário em execução (o processo velho mantém o inode).
+  - **Windows**: o exe em uso é renomeado para `local-proxy.old` (rename é permitido) e o novo assume o
+    lugar; o `.old` é apagado por helper `cmd` destacado e limpo também no próximo start
+    (`cleanup_stale_backups`).
+  - **Cargo**: delega para `cargo install --force local-proxy` (como o opencode delega ao npm).
+- Sem permissão no diretório → o binário novo fica staged (`<stem>.new.<pid>[.exe]`) e o erro
+  `update::replace` mostra o comando manual.
+- `serve --check-update`: avisa no log se houver release mais nova (desativável com
+  `$env:LOCAL_PROXY_DISABLE_AUTOUPDATE=1`).
+- `cargo test --all-features`: **95** unit tests verdes; fmt/clippy limpos.
+
 ### Estado de verificação (task 010)
-- `cargo test --all-features`: **91** unit tests verdes.
+- `cargo test --all-features`: **95** unit tests verdes.
 - `cargo clippy --all-targets --all-features -- -D warnings`: limpo.
 - `cargo fmt --all -- --check`: limpo.
 - `bun test e2e/mock.test.ts`: **17** testes determinísticos verdes.

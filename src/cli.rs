@@ -246,6 +246,7 @@ pub async fn serve(
     host_flag: Option<String>,
     port_flag: Option<u16>,
     background: bool,
+    check_update: bool,
 ) -> miette::Result<()> {
     if background {
         let mut args = vec![
@@ -261,6 +262,9 @@ pub async fn serve(
             args.push("--port".to_string());
             args.push(p.to_string());
         }
+        if check_update {
+            args.push("--check-update".to_string());
+        }
         let child = spawn_background(&args).map_err(CliError::from)?;
         println!(
             "started in background (pid {}), log: {}",
@@ -271,6 +275,18 @@ pub async fn serve(
     }
 
     init_tracing();
+    if let Ok(exe) = std::env::current_exe() {
+        cleanup_stale_backups(&exe);
+    }
+    if check_update && std::env::var_os("LOCAL_PROXY_DISABLE_AUTOUPDATE").is_none() {
+        if let Some(v) = latest_available_version().await {
+            tracing::warn!(
+                target: LOG_TARGET,
+                %v,
+                "uma versão mais recente está disponível; rode `local-proxy update` para atualizar"
+            );
+        }
+    }
     let runtime = handlers::build_runtime_state(&config_path).map_err(CliError::from)?;
     tracing::info!(target: LOG_TARGET, path = %config_path.display(), "loaded config");
 
@@ -766,6 +782,23 @@ pub enum UpdateError {
         #[source]
         source: io::Error,
     },
+    /// The running binary could not be replaced within the retry window.
+    #[error("could not replace the running binary {exe} with {path}")]
+    #[diagnostic(
+        code(update::replace),
+        help("stop any running local-proxy process, then run: {command}")
+    )]
+    Replace {
+        /// Path of the staged binary.
+        path: String,
+        /// Path of the running executable.
+        exe: String,
+        /// Manual command that completes the replacement.
+        command: String,
+        /// Underlying I/O error.
+        #[source]
+        source: io::Error,
+    },
 }
 
 /// The asset file name for a published platform, or `None` if no prebuilt
@@ -819,13 +852,6 @@ fn resolve_repo(flag: Option<String>) -> String {
     .unwrap_or_else(|| DEFAULT_REPO.to_string())
 }
 
-/// Check for a newer release and, if `check` is false, stage the latest binary
-/// for a manual replace. Never overwrites the running executable.
-///
-/// # Errors
-///
-/// Returns [`CliError::Update`] if the release cannot be fetched, verified, or
-/// staged.
 /// Fetch the latest release metadata for `repo` from the GitHub Releases API.
 async fn fetch_release(client: &reqwest::Client, repo: &str) -> Result<Release, UpdateError> {
     let api_url = format!("https://api.github.com/repos/{repo}/releases/latest");
@@ -924,27 +950,155 @@ async fn download_and_verify(
     Ok(body.to_vec())
 }
 
-/// Print the manual steps to replace the running binary with the staged one.
-fn print_replace_instructions(staged: &Path, exe: &Path) {
-    println!("para concluir, substitua o binário em uso:");
-    if CURRENT_OS == "windows" {
-        println!(
-            "  (pare o proxy) move /y \"{}\" \"{}\"",
-            staged.display(),
-            exe.display()
-        );
-    } else {
-        println!(
-            "  mv \"{}\" \"{}\" && chmod +x \"{}\"",
-            staged.display(),
-            exe.display(),
-            exe.display()
-        );
+/// Path of the staged (downloaded) binary, in the same directory as `exe` so
+/// the final swap is a same-filesystem rename. The `.exe` suffix on Windows is
+/// required for the detached helper to be launched.
+fn staged_path(exe: &Path, pid: u32) -> PathBuf {
+    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
+    let stem = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("local-proxy");
+    #[cfg(target_os = "windows")]
+    {
+        dir.join(format!("{stem}.new.{pid}.exe"))
+    }
+    #[cfg(not(target_os = "windows"))]
+    {
+        dir.join(format!("{stem}.new.{pid}"))
     }
 }
 
-/// Check for a newer release and, if `check` is false, stage the latest binary
-/// for a manual replace. Never overwrites the running executable.
+/// Manual command that completes the binary swap (used as a fallback when the
+/// binary swap cannot be applied).
+fn manual_replace_command(staged: &Path, exe: &Path) -> String {
+    if CURRENT_OS == "windows" {
+        format!("move /y \"{}\" \"{}\"", staged.display(), exe.display())
+    } else {
+        format!("mv \"{}\" \"{}\"", staged.display(), exe.display())
+    }
+}
+
+/// How the running binary was installed, which determines how updates apply.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallMethod {
+    /// Installed by the install script into `~/.local/bin` (or `%USERPROFILE%\.local\bin`).
+    Standalone,
+    /// Installed via cargo into the cargo bin dir (`$CARGO_HOME/bin` or `~/.cargo/bin`).
+    Cargo,
+    /// Installed at any other custom location.
+    Custom,
+}
+
+/// Detect how the running binary was installed, so the update can choose the
+/// right way to apply itself (in-place swap for standalone/custom, delegation
+/// to cargo for cargo installs).
+#[must_use]
+fn install_method(exe: &Path) -> InstallMethod {
+    let home = directories::BaseDirs::new().map(|d| d.home_dir().to_path_buf());
+    let local_bin = home.as_ref().map(|h| h.join(".local").join("bin"));
+    let cargo_bin = std::env::var_os("CARGO_HOME")
+        .map(PathBuf::from)
+        .or_else(|| home.as_ref().map(|h| h.join(".cargo")))
+        .map(|p| p.join("bin"));
+    if local_bin.as_deref().is_some_and(|d| exe.starts_with(d)) {
+        InstallMethod::Standalone
+    } else if cargo_bin.as_deref().is_some_and(|d| exe.starts_with(d)) {
+        InstallMethod::Cargo
+    } else {
+        InstallMethod::Custom
+    }
+}
+
+/// Atomically swap the staged binary into the running executable's path.
+///
+/// On Unix, renaming over a running executable is allowed: the old process
+/// keeps its inode and the path atomically becomes the new binary. On Windows
+/// the running image cannot be overwritten, so the current executable is first
+/// renamed aside to a `.old` sibling (renames are allowed) and the new binary
+/// is moved into place; the stale `.old` is then deleted by a detached helper
+/// and cleaned up again on the next startup.
+fn swap_binary(staged: &Path, exe: &Path) -> Result<(), UpdateError> {
+    #[cfg(not(target_os = "windows"))]
+    {
+        std::fs::rename(staged, exe).map_err(|source| UpdateError::Replace {
+            path: staged.display().to_string(),
+            exe: exe.display().to_string(),
+            command: manual_replace_command(staged, exe),
+            source,
+        })?;
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755));
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const DETACHED_PROCESS: u32 = 0x0000_0008;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let old = exe.with_extension("old");
+        std::fs::rename(exe, &old).map_err(|source| UpdateError::Replace {
+            path: staged.display().to_string(),
+            exe: exe.display().to_string(),
+            command: manual_replace_command(staged, exe),
+            source,
+        })?;
+        std::fs::rename(staged, exe).map_err(|source| UpdateError::Replace {
+            path: staged.display().to_string(),
+            exe: exe.display().to_string(),
+            command: manual_replace_command(staged, exe),
+            source,
+        })?;
+        let script = format!(
+            "timeout /t 2 /nobreak >nul & del /f /q \"{}\"",
+            old.display()
+        );
+        let mut cmd = Command::new("cmd");
+        cmd.args(["/c", &script]);
+        cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
+        cmd.stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        let _ = cmd.spawn();
+        Ok(())
+    }
+}
+
+/// Remove stale `<stem>*.old` backup files left next to the executable by a
+/// Windows update swap (best-effort; called at server startup as a safety net).
+fn cleanup_stale_backups(exe: &Path) {
+    let Some(dir) = exe.parent().map(Path::to_path_buf) else {
+        return;
+    };
+    let stem = exe
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("local-proxy");
+    if let Ok(entries) = std::fs::read_dir(dir) {
+        for entry in entries.flatten() {
+            let name = entry.file_name();
+            let name = name.to_string_lossy();
+            if name.starts_with(stem) && name.ends_with(".old") {
+                let _ = std::fs::remove_file(entry.path());
+            }
+        }
+    }
+}
+
+/// The latest published version tag if it is newer than the running one, or
+/// `None` if already up to date or the release cannot be fetched.
+async fn latest_available_version() -> Option<String> {
+    let repo = resolve_repo(None);
+    let client = reqwest::Client::new();
+    match fetch_release(&client, &repo).await {
+        Ok(r) if is_newer(&r.tag_name, CURRENT_VERSION) => Some(r.tag_name),
+        _ => None,
+    }
+}
+
+/// Check for a newer release and, unless `check`, download and apply it.
+/// Applies in place for standalone/custom installs, delegates to cargo for
+/// cargo installs, and never blocks on the running process.
 ///
 /// # Errors
 ///
@@ -992,19 +1146,39 @@ pub async fn update(
         path: bin.clone(),
         source,
     })?;
-    let dir = exe.parent().unwrap_or_else(|| Path::new("."));
-    let staged = dir.join(format!("{bin}.new"));
+
+    if install_method(&exe) == InstallMethod::Cargo {
+        println!("instalado via cargo — atualize pelo cargo:");
+        println!("  cargo install --force local-proxy");
+        println!("(com cargo-update:  cargo install-update local-proxy)");
+        return Ok(());
+    }
+
+    let staged = staged_path(&exe, std::process::id());
 
     let body = download_and_verify(&client, &asset_url, &staged, no_verify).await?;
     std::fs::write(&staged, body).map_err(|source| UpdateError::Stage {
         path: staged.display().to_string(),
         source,
     })?;
+    #[cfg(not(target_os = "windows"))]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(&staged, std::fs::Permissions::from_mode(0o755));
+    }
 
-    println!("atualizado para {latest} (de v{CURRENT_VERSION})");
-    println!("binário staged em: {}", staged.display());
-    print_replace_instructions(&staged, &exe);
-    Ok(())
+    match swap_binary(&staged, &exe) {
+        Ok(()) => {
+            println!("atualizado para {latest} (de v{CURRENT_VERSION})");
+            #[cfg(target_os = "windows")]
+            println!("a troca será concluída ao sair; reinicie o proxy para usar a nova versão.");
+            Ok(())
+        }
+        Err(err) => {
+            println!("o binário novo está em: {}", staged.display());
+            Err(err.into())
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1137,6 +1311,89 @@ mod tests {
         assert_eq!(asset_name("darwin", "x86_64"), None);
         assert_eq!(asset_name("windows", "aarch64"), None);
         assert_eq!(asset_name("linux", "aarch64"), None);
+    }
+
+    #[test]
+    fn install_method_detects_standalone_cargo_and_custom() {
+        let home = directories::BaseDirs::new()
+            .expect("base dirs")
+            .home_dir()
+            .to_path_buf();
+        let standalone = home.join(".local").join("bin").join("local-proxy");
+        assert_eq!(install_method(&standalone), InstallMethod::Standalone);
+
+        let cargo_dir = std::env::var_os("CARGO_HOME")
+            .map_or_else(|| home.join(".cargo"), PathBuf::from)
+            .join("bin");
+        assert_eq!(
+            install_method(&cargo_dir.join("local-proxy")),
+            InstallMethod::Cargo
+        );
+
+        let custom = Path::new("/opt/tools").join("local-proxy");
+        assert_eq!(install_method(&custom), InstallMethod::Custom);
+    }
+
+    #[cfg(target_os = "windows")]
+    #[test]
+    fn staged_path_uses_pid_and_exe_suffix_on_windows() {
+        let exe = Path::new("C:\\tools\\local-proxy.exe");
+        assert_eq!(
+            staged_path(exe, 1234),
+            Path::new("C:\\tools\\local-proxy.new.1234.exe")
+        );
+    }
+
+    #[cfg(not(target_os = "windows"))]
+    #[test]
+    fn staged_path_uses_pid_suffix_on_unix() {
+        let exe = Path::new("/usr/local/bin/local-proxy");
+        assert_eq!(
+            staged_path(exe, 1234),
+            Path::new("/usr/local/bin/local-proxy.new.1234")
+        );
+    }
+
+    #[test]
+    fn manual_command_matches_platform() {
+        let staged = Path::new(if cfg!(target_os = "windows") {
+            "C:\\tools\\local-proxy.new.1.exe"
+        } else {
+            "/tools/local-proxy.new.1"
+        });
+        let exe = Path::new(if cfg!(target_os = "windows") {
+            "C:\\tools\\local-proxy.exe"
+        } else {
+            "/tools/local-proxy"
+        });
+        let command = manual_replace_command(staged, exe);
+        if cfg!(target_os = "windows") {
+            assert_eq!(
+                command,
+                "move /y \"C:\\tools\\local-proxy.new.1.exe\" \"C:\\tools\\local-proxy.exe\""
+            );
+        } else {
+            assert_eq!(
+                command,
+                "mv \"/tools/local-proxy.new.1\" \"/tools/local-proxy\""
+            );
+        }
+    }
+
+    #[test]
+    fn cleanup_stale_backups_removes_only_old_siblings() {
+        let dir = tempfile::tempdir().unwrap();
+        let exe = dir.path().join("local-proxy.exe");
+        std::fs::write(&exe, b"x").unwrap();
+        std::fs::write(dir.path().join("local-proxy.old"), b"old").unwrap();
+        std::fs::write(dir.path().join("local-proxy.new.1.exe"), b"new").unwrap();
+        std::fs::write(dir.path().join("unrelated.txt"), b"keep").unwrap();
+
+        cleanup_stale_backups(&exe);
+
+        assert!(!dir.path().join("local-proxy.old").exists());
+        assert!(dir.path().join("local-proxy.new.1.exe").exists());
+        assert!(dir.path().join("unrelated.txt").exists());
     }
 
     #[test]

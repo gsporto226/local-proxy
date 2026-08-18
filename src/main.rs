@@ -35,6 +35,9 @@ enum Command {
         /// Run detached in the background
         #[arg(long)]
         background: bool,
+        /// Check once at startup for a newer release and warn in the log
+        #[arg(long)]
+        check_update: bool,
     },
     /// Start the proxy (if needed) and launch an Anthropic-compatible tool
     Launch {
@@ -105,12 +108,13 @@ fn main() -> miette::Result<()> {
     let cli = Cli::parse();
     let config = cli::resolve_config_path(cli.config);
     match cli.command {
-        None => block_on(cli::serve(config, None, None, false)),
+        None => block_on(cli::serve(config, None, None, false, false)),
         Some(Command::Serve {
             host,
             port,
             background,
-        }) => block_on(cli::serve(config, host, port, background)),
+            check_update,
+        }) => block_on(cli::serve(config, host, port, background, check_update)),
         Some(Command::Launch {
             tool,
             model,

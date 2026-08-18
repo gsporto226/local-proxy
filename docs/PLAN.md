@@ -185,9 +185,13 @@ Truncar `tool_result` a 120k chars ao reenviar (Anthropic impõe limite).
 - `mcp` — servidor MCP stdio (rmcp).
 - `update [--check] [--force] [--repo owner/repo] [--no-verify]` — baixa o binário mais recente do
   último release do GitHub (padrão `gsporto226/local-proxy` ou `$env:LOCAL_PROXY_REPO`), verifica
-  SHA256 (`sha2`) e faz *stage* como `<bin>.new` ao lado do executável em uso, imprimindo o comando
-  manual para concluir (não sobrescreve o binário em execução). `--check` só informa a versão.
-  Erros com códigos `update::unsupported/fetch/no_asset/verify/download/stage`.
+  SHA256 (`sha2`) e aplica no lugar: no Linux o swap é um rename POSIX atômico (funciona com o
+  binário em execução); no Windows o executável em uso é renomeado para um backup (`.old`) e o novo
+  assume a posição, com o backup apagado por helper destacado e no próximo start. Instalações via
+  cargo (`~/.cargo/bin` ou `$CARGO_HOME/bin`) delegam ao `cargo install --force`. `--check` só
+  informa a versão. `serve --check-update` avisa no log se houver release mais nova
+  (desativável com `$env:LOCAL_PROXY_DISABLE_AUTOUPDATE=1`).
+  Erros com códigos `update::unsupported/fetch/no_asset/verify/download/stage/replace`.
 
 ## Módulos
 
