@@ -43,6 +43,7 @@ jobs:
       - name: e2e mock (Bun)
         working-directory: e2e
         run: |
+          cargo build --manifest-path ../Cargo.toml
           bun install
           bun test mock.test.ts
 
