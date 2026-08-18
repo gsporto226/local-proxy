@@ -59,6 +59,22 @@ enum Command {
     Stop,
     /// List routed models
     Models,
+    /// Store the API key for an existing provider (catalog or config)
+    Connect {
+        /// Provider name (must exist in the catalog or config)
+        provider: String,
+        /// API key; prompted hidden if omitted
+        key: Option<String>,
+    },
+    /// Remove the stored API key for a provider
+    Disconnect {
+        /// Provider name
+        provider: String,
+    },
+    /// List effective providers (catalog ∪ config) with key status
+    Providers,
+    /// Run the MCP stdio server (connect/disconnect/models/providers)
+    Mcp,
     /// Check for a newer release and stage a manual update from GitHub Releases
     Update {
         /// GitHub owner/repo (overrides `LOCAL_PROXY_REPO`)
@@ -112,6 +128,10 @@ fn main() -> miette::Result<()> {
         Some(Command::Status) => cli::status(config),
         Some(Command::Stop) => cli::stop(config),
         Some(Command::Models) => cli::models(config),
+        Some(Command::Connect { provider, key }) => cli::connect(config, provider, key),
+        Some(Command::Disconnect { provider }) => cli::disconnect(config, provider),
+        Some(Command::Providers) => cli::providers(config),
+        Some(Command::Mcp) => block_on(cli::mcp(config)),
         Some(Command::Update {
             repo,
             check,

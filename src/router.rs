@@ -181,6 +181,7 @@ mod tests {
                     name: "anthropic".to_string(),
                     base_url: "https://api.anthropic.com".to_string(),
                     api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
+                    api_key: None,
                     format: ProviderFormat::Anthropic,
                     models: vec!["claude-native-1".to_string()],
                 },
@@ -188,6 +189,7 @@ mod tests {
                     name: "openai".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),
                     api_key_env: Some("OPENAI_API_KEY".to_string()),
+                    api_key: None,
                     format: ProviderFormat::Openai,
                     models: vec!["gpt-native-1".to_string()],
                 },
@@ -214,6 +216,7 @@ mod tests {
             ],
             defaults: Defaults {
                 provider: "anthropic".to_string(),
+                model: None,
             },
         }
     }

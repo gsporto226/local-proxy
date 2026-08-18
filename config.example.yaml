@@ -1,3 +1,11 @@
+# local-proxy example configuration.
+#
+# The provider catalog is embedded in the binary (src/catalog.yaml). This file
+# only *adds* or *overrides* providers/routes/defaults from that catalog.
+# For the full list of embedded providers (anthropic, openai, opencode-go, zen,
+# groq, xai, google, deepseek, openrouter) and their models, edit the catalog or
+# run `local-proxy providers`.
+
 server:
   host: 127.0.0.1
   port: 8787
@@ -5,39 +13,27 @@ server:
     - sk-proxy
   passthrough_keys: false
 
-providers:
-  - name: anthropic
-    base_url: https://api.anthropic.com
-    api_key_env: ANTHROPIC_API_KEY
-    format: anthropic
-    models:
-      - claude-sonnet-4-5
-      - claude-opus-4-1
-  - name: openai
-    base_url: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
-    format: openai
-    models:
-      - gpt-4o
-  - name: zen
-    base_url: https://opencode.ai/zen
-    api_key_env: OPENCODE_ZEN_KEY
-    format: openai
-    models:
-      - deepseek-v4-flash-free
-      - claude-sonnet-4-5
-      - gpt-5.1
-
-routes:
-  - model: claude-sonnet
-    provider: anthropic
-    prefix: true
-    upstream_model: claude-sonnet-4-5
-  - model: gpt-4o
-    provider: openai
-  - model: deepseek-free
-    provider: zen
-    upstream_model: deepseek-v4-flash-free
-
-defaults:
-  provider: anthropic
+# Example: override an existing provider (same name replaces the catalog entry).
+# providers:
+#   - name: openai
+#     base_url: https://api.openai.com/v1
+#     api_key_env: OPENAI_API_KEY
+#     format: openai
+#     models:
+#       - gpt-4o
+#
+# Example: add a custom provider.
+# providers:
+#   - name: mylocal
+#     base_url: http://127.0.0.1:8080/v1
+#     api_key_env: MYLOCAL_API_KEY
+#     format: openai
+#     models:
+#       - local-model
+#
+# routes:
+#   - model: mylocal-model
+#     provider: mylocal
+#
+# defaults:
+#   provider: anthropic

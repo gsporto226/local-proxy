@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -10,25 +11,172 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use axum::Router as AxumRouter;
+use miette::Diagnostic;
+use notify::RecursiveMode;
 use serde_json::{json, Value};
+use thiserror::Error;
+use tokio::sync::RwLock;
 
-use crate::config::{Config, ProviderFormat};
+use crate::config::{Config, ConfigError, ProviderFormat};
 use crate::error::ApiError;
-use crate::router::Router;
+use crate::router::{Router, RouterError};
 use crate::streams;
 use crate::streams::UpstreamStream;
 use crate::translate;
 use crate::upstream::{send_and_read, ProviderClient, UpstreamError};
 
-/// Shared application state threaded through the axum handlers.
+/// The current, hot-reloadable runtime state shared by the HTTP handlers.
 #[derive(Clone)]
-pub struct AppState {
-    /// The loaded server configuration.
+pub struct RuntimeState {
+    /// The effective (catalog-merged) configuration.
     pub config: Arc<Config>,
     /// The model/router resolution logic.
     pub router: Arc<Router>,
     /// The built upstream clients, keyed by provider name.
     pub clients: Arc<HashMap<String, ProviderClient>>,
+}
+
+/// Shared application state threaded through the axum handlers.
+#[derive(Clone)]
+pub struct AppState {
+    inner: Arc<RwLock<RuntimeState>>,
+}
+
+impl AppState {
+    /// Wrap a [`RuntimeState`] in shared, lockable application state.
+    #[must_use]
+    pub fn new(state: RuntimeState) -> Self {
+        Self {
+            inner: Arc::new(RwLock::new(state)),
+        }
+    }
+
+    /// Snapshot the current runtime state (cheap Arc clones).
+    pub async fn snapshot(&self) -> RuntimeState {
+        self.inner.read().await.clone()
+    }
+}
+
+/// Errors while (re)building the runtime state.
+#[derive(Debug, Error, Diagnostic)]
+pub enum RuntimeError {
+    /// The config overlay could not be loaded.
+    #[error("failed to load config {path}: {source}")]
+    #[diagnostic(code(runtime::config))]
+    Config {
+        /// Path of the config file.
+        path: String,
+        /// Underlying config error.
+        #[source]
+        source: ConfigError,
+    },
+    /// The router could not be built.
+    #[error("failed to build router: {0}")]
+    #[diagnostic(code(runtime::router))]
+    Router(#[source] RouterError),
+    /// The upstream clients could not be built.
+    #[error("failed to build upstream clients: {0}")]
+    #[diagnostic(code(runtime::clients))]
+    Clients(#[source] UpstreamError),
+    /// The file watcher could not be created or started.
+    #[error("failed to start config watcher: {message}")]
+    #[diagnostic(code(runtime::watcher))]
+    Watcher {
+        /// Underlying watcher error message.
+        message: String,
+    },
+}
+
+/// Build the effective runtime state for `config_path` by loading the overlay,
+/// merging it with the embedded catalog, and building the router and clients.
+///
+/// # Errors
+///
+/// Returns a [`RuntimeError`] if the config, router, or clients fail to build.
+#[allow(clippy::result_large_err)]
+pub fn build_runtime_state(config_path: &Path) -> Result<RuntimeState, RuntimeError> {
+    let overlay = if config_path.exists() {
+        Config::load(config_path).map_err(|source| RuntimeError::Config {
+            path: config_path.display().to_string(),
+            source,
+        })?
+    } else {
+        Config::default()
+    };
+    let base = crate::catalog::load().map_err(|source| RuntimeError::Config {
+        path: "<catalog>".to_string(),
+        source,
+    })?;
+    let config = Arc::new(crate::catalog::effective_config(base, overlay));
+    let router = Arc::new(Router::new(config.clone()).map_err(RuntimeError::Router)?);
+    let clients = Arc::new(build_clients(&config).map_err(RuntimeError::Clients)?);
+    Ok(RuntimeState {
+        config,
+        router,
+        clients,
+    })
+}
+
+/// Spawn a file-watcher task that rebuilds `state` when the config or auth file
+/// changes (hot-reload without restart). Watches the global config dir and the
+/// parent of `config_path` when they differ.
+///
+/// # Errors
+///
+/// Returns an error if the file watcher cannot be created or started.
+#[allow(clippy::result_large_err)]
+pub fn spawn_watcher(config_path: PathBuf, app_state: &AppState) -> Result<(), RuntimeError> {
+    let (tx, rx) = std::sync::mpsc::channel();
+    let mut debouncer = notify_debouncer_full::new_debouncer(
+        Duration::from_millis(300),
+        None,
+        move |result: notify_debouncer_full::DebounceEventResult| {
+            if result.is_ok() {
+                let _ = tx.send(());
+            }
+        },
+    )
+    .map_err(|e| RuntimeError::Watcher {
+        message: format!("{e}"),
+    })?;
+
+    let mut dirs = vec![crate::config::global_config_dir()];
+    if let Some(parent) = config_path.parent() {
+        let parent = parent.to_path_buf();
+        if !dirs.contains(&parent) {
+            dirs.push(parent);
+        }
+    }
+    for dir in dirs {
+        if dir.exists() {
+            debouncer
+                .watch(&dir, RecursiveMode::NonRecursive)
+                .map_err(|e| RuntimeError::Watcher {
+                    message: format!("failed to watch {}: {e}", dir.display()),
+                })?;
+        }
+    }
+
+    let state = app_state.inner.clone();
+    let (btx, mut brx) = tokio::sync::mpsc::unbounded_channel::<()>();
+    tokio::task::spawn_blocking(move || {
+        while rx.recv().is_ok() {
+            let _ = btx.send(());
+        }
+    });
+    tokio::spawn(async move {
+        let _debouncer = debouncer;
+        while brx.recv().await.is_some() {
+            match build_runtime_state(&config_path) {
+                Ok(new_state) => {
+                    *state.write().await = new_state;
+                    tracing::info!("config/auth change applied (hot-reload)");
+                }
+                Err(e) => tracing::warn!("hot-reload rebuild failed: {e}"),
+            }
+        }
+    });
+    Ok(())
 }
 
 /// Build an upstream [`ProviderClient`] for every configured provider.
@@ -38,11 +186,13 @@ pub struct AppState {
 /// Returns an error if any provider client fails to build.
 pub fn build_clients(config: &Config) -> Result<HashMap<String, ProviderClient>, UpstreamError> {
     let passthrough = config.server.passthrough_keys;
+    let auth = crate::auth::read_auth().unwrap_or_default();
     let mut map = HashMap::new();
     for provider in &config.providers {
+        let auth_key = auth.get(&provider.name).map(|e| e.key.clone());
         map.insert(
             provider.name.clone(),
-            ProviderClient::new(provider, passthrough)?,
+            ProviderClient::new(provider, passthrough, auth_key)?,
         );
     }
     Ok(map)
@@ -71,7 +221,7 @@ async fn health() -> &'static str {
 /// Validate the client's key against the configured API keys and return the
 /// presented key (used for passthrough). If no keys are configured, any client
 /// is allowed and the presented key (if any) is still captured.
-fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<Option<String>, ApiError> {
+fn authenticate(state: &RuntimeState, headers: &HeaderMap) -> Result<Option<String>, ApiError> {
     let presented = extract_client_key(headers);
     if state.config.server.api_keys.is_empty() {
         return Ok(presented);
@@ -151,19 +301,28 @@ fn passthrough_stream(resp: reqwest::Response) -> Response {
 }
 
 fn resolve_model(
-    state: &AppState,
+    state: &RuntimeState,
     body: &Value,
 ) -> Result<(Arc<crate::config::Provider>, String), ApiError> {
-    let model = body
-        .get("model")
-        .and_then(Value::as_str)
-        .ok_or_else(|| ApiError::bad_request("missing required field 'model'"))?;
-    let resolved = state.router.resolve_model(model).map_err(ApiError::from)?;
+    // When a default model is selected (via MCP `models(select)`), it overrides
+    // whatever model the harness requested, so all traffic routes to it.
+    let requested = match state.config.defaults.model.clone() {
+        Some(model) => model,
+        None => body
+            .get("model")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .ok_or_else(|| ApiError::bad_request("missing required field 'model'"))?,
+    };
+    let resolved = state
+        .router
+        .resolve_model(&requested)
+        .map_err(ApiError::from)?;
     Ok((resolved.provider, resolved.upstream_model))
 }
 
 fn client_for(
-    state: &AppState,
+    state: &RuntimeState,
     provider: &crate::config::Provider,
 ) -> Result<ProviderClient, ApiError> {
     state.clients.get(&provider.name).cloned().ok_or_else(|| {
@@ -180,6 +339,7 @@ async fn messages_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let state = state.snapshot().await;
     let client_key = match authenticate(&state, &headers) {
         Ok(k) => k,
         Err(e) => return error_response(&e, true),
@@ -191,7 +351,7 @@ async fn messages_handler(
 }
 
 async fn handle_messages(
-    state: &AppState,
+    state: &RuntimeState,
     body: &Bytes,
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
@@ -248,6 +408,7 @@ async fn chat_completions_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let state = state.snapshot().await;
     let client_key = match authenticate(&state, &headers) {
         Ok(k) => k,
         Err(e) => return error_response(&e, false),
@@ -259,7 +420,7 @@ async fn chat_completions_handler(
 }
 
 async fn handle_chat_completions(
-    state: &AppState,
+    state: &RuntimeState,
     body: &Bytes,
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
@@ -316,6 +477,7 @@ async fn responses_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let state = state.snapshot().await;
     let client_key = match authenticate(&state, &headers) {
         Ok(k) => k,
         Err(e) => return error_response(&e, false),
@@ -327,7 +489,7 @@ async fn responses_handler(
 }
 
 async fn handle_responses(
-    state: &AppState,
+    state: &RuntimeState,
     body: &Bytes,
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
@@ -384,6 +546,7 @@ async fn handle_responses(
 // ---------------------------------------------------------------------------
 
 async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
+    let state = state.snapshot().await;
     let models = state.router.list_models();
     if headers.contains_key("anthropic-version") {
         let data: Vec<Value> = models
@@ -414,6 +577,7 @@ async fn count_tokens_handler(
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
+    let state = state.snapshot().await;
     if let Err(e) = authenticate(&state, &headers) {
         return error_response(&e, true);
     }
@@ -472,7 +636,7 @@ mod tests {
             routes: Vec::new(),
             defaults: crate::config::Defaults::default(),
         };
-        let state = AppState {
+        let state = RuntimeState {
             config: Arc::new(cfg),
             router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
             clients: Arc::new(HashMap::new()),
@@ -494,7 +658,7 @@ mod tests {
     #[test]
     fn no_keys_means_open_access() {
         let cfg = Config::default();
-        let state = AppState {
+        let state = RuntimeState {
             config: Arc::new(cfg),
             router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
             clients: Arc::new(HashMap::new()),
@@ -509,5 +673,85 @@ mod tests {
             "messages": [{"role": "user", "content": "how are you today"}]
         });
         assert!(estimate_tokens(&body) > 0);
+    }
+
+    #[test]
+    fn rebuild_merges_catalog_with_overlay_and_reapplies() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is set")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "local-proxy-rebuild-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("config.yaml");
+        std::fs::write(
+            &path,
+            "providers:\n  - name: mylocal\n    base_url: http://127.0.0.1:9/v1\n    format: openai\n    models: [m]\n",
+        )
+        .expect("write config");
+
+        let first = build_runtime_state(&path).expect("first build");
+        assert!(first.config.providers.iter().any(|p| p.name == "mylocal"));
+        assert!(first.config.providers.iter().any(|p| p.name == "anthropic"));
+
+        // Simulate a hot-reload: the user edits the config file, adding a provider.
+        std::fs::write(
+            &path,
+            "providers:\n  - name: mylocal\n    base_url: http://127.0.0.1:9/v1\n    format: openai\n    models: [m]\n  - name: second\n    base_url: http://127.0.0.1:9/v1\n    format: openai\n    models: [m]\n",
+        )
+        .expect("rewrite config");
+        let second = build_runtime_state(&path).expect("rebuild");
+        assert!(second.config.providers.iter().any(|p| p.name == "second"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn default_model_overrides_harness_model_in_routing() {
+        let cfg = Arc::new(Config {
+            server: crate::config::Server::default(),
+            providers: vec![
+                crate::config::Provider {
+                    name: "openai".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    api_key_env: None,
+                    api_key: None,
+                    format: ProviderFormat::Openai,
+                    models: vec!["gpt-4o".to_string()],
+                },
+                crate::config::Provider {
+                    name: "anthropic".to_string(),
+                    base_url: "https://api.anthropic.com".to_string(),
+                    api_key_env: None,
+                    api_key: None,
+                    format: ProviderFormat::Anthropic,
+                    models: vec!["claude-sonnet-4-5".to_string()],
+                },
+            ],
+            routes: vec![crate::config::Route {
+                model: "gpt-4o".to_string(),
+                provider: "openai".to_string(),
+                prefix: false,
+                upstream_model: None,
+            }],
+            defaults: crate::config::Defaults {
+                provider: "openai".to_string(),
+                model: Some("gpt-4o".to_string()),
+            },
+        });
+        let state = RuntimeState {
+            config: cfg.clone(),
+            router: Arc::new(Router::new(cfg).unwrap()),
+            clients: Arc::new(HashMap::new()),
+        };
+
+        // The harness asks for an unknown model, but defaults.model forces gpt-4o.
+        let body = json!({"model": "claude-sonnet-9999"});
+        let (provider, upstream) = resolve_model(&state, &body).expect("resolves");
+        assert_eq!(provider.name, "openai");
+        assert_eq!(upstream, "gpt-4o");
     }
 }

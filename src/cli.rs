@@ -75,6 +75,27 @@ pub enum CliError {
         help("check the release exists and the network is reachable")
     )]
     Update(#[from] UpdateError),
+
+    /// A `connect`/`disconnect` operation failed.
+    #[error("{message}")]
+    #[diagnostic(code(cli::connect))]
+    Connect {
+        /// Human-readable description of the failure.
+        message: String,
+    },
+
+    /// The auth store could not be read or written.
+    #[error("auth store error: {0}")]
+    #[diagnostic(code(cli::auth), help("check that auth.json is valid JSON"))]
+    Auth(#[from] crate::auth::AuthError),
+
+    /// The runtime state (config/router/clients) could not be built or reloaded.
+    #[error("failed to build runtime state")]
+    #[diagnostic(
+        code(cli::runtime),
+        help("check the config file and the embedded catalog are valid")
+    )]
+    Runtime(#[from] crate::handlers::RuntimeError),
 }
 
 // ---------------------------------------------------------------------------
@@ -250,20 +271,15 @@ pub async fn serve(
     }
 
     init_tracing();
-    let config = Arc::new(load_config(&config_path)?);
+    let runtime = handlers::build_runtime_state(&config_path).map_err(CliError::from)?;
     tracing::info!(target: LOG_TARGET, path = %config_path.display(), "loaded config");
 
-    let router = Arc::new(Router::new(config.clone()).map_err(CliError::from)?);
-    let clients = Arc::new(handlers::build_clients(&config).map_err(CliError::from)?);
-    let state = AppState {
-        config,
-        router,
-        clients,
-    };
-
-    let host = host_flag.unwrap_or_else(|| state.config.server.host.clone());
-    let port = port_flag.unwrap_or(state.config.server.port);
+    let host = host_flag.unwrap_or_else(|| runtime.config.server.host.clone());
+    let port = port_flag.unwrap_or(runtime.config.server.port);
     let addr = format!("{host}:{port}");
+
+    let state = AppState::new(runtime);
+    handlers::spawn_watcher(config_path.clone(), &state).map_err(CliError::from)?;
     let app = handlers::app(state);
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -440,12 +456,176 @@ pub fn stop(config_path: PathBuf) -> miette::Result<()> {
 /// Returns an error if the config cannot be loaded or the router cannot be built.
 #[allow(clippy::needless_pass_by_value)]
 pub fn models(config_path: PathBuf) -> miette::Result<()> {
-    let config = Arc::new(load_config(&config_path)?);
+    let config = Arc::new(effective_config(&config_path)?);
     let router = Router::new(config).map_err(CliError::from)?;
     for m in router.list_models() {
         println!("{m}");
     }
     Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// connect / disconnect / providers
+// ---------------------------------------------------------------------------
+
+/// Build the effective config for `config_path` by merging the embedded catalog
+/// with the user's config overlay.
+#[allow(clippy::result_large_err)]
+fn effective_config(config_path: &Path) -> Result<Config, CliError> {
+    let overlay = if config_path.exists() {
+        Config::load(config_path).map_err(CliError::from)?
+    } else {
+        Config::default()
+    };
+    let base = crate::catalog::load().map_err(CliError::from)?;
+    Ok(crate::catalog::effective_config(base, overlay))
+}
+
+/// Validate that `provider` exists in the effective provider set (catalog or
+/// config), storing its API key in `auth.json`. Prompts hidden if no key given.
+/// Returns the success message.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the provider is unknown, the prompt fails, or the
+/// auth store cannot be written.
+#[allow(clippy::result_large_err)]
+pub fn connect_provider(
+    config_path: &Path,
+    provider: &str,
+    key: Option<String>,
+) -> Result<String, CliError> {
+    let effective = effective_config(config_path)?;
+    if !effective.providers.iter().any(|p| p.name == provider) {
+        return Err(CliError::Connect {
+            message: format!(
+                "provider '{provider}' nao existe no catalogo nem no config; \
+                 use `local-proxy providers` ou adicione-o no config"
+            ),
+        });
+    }
+    let key =
+        match key.filter(|k| !k.trim().is_empty()) {
+            Some(k) => k,
+            None => rpassword::prompt_password(format!("chave do provider {provider}: ")).map_err(
+                |e| CliError::Connect {
+                    message: format!("falha ao ler a chave: {e}"),
+                },
+            )?,
+        };
+    crate::auth::set_key(provider, key.trim()).map_err(CliError::from)?;
+    Ok(format!("chave do provider '{provider}' salva em auth.json"))
+}
+
+/// Remove the stored API key for `provider` from `auth.json`. Returns the
+/// result message.
+///
+/// # Errors
+///
+/// Returns [`CliError::Auth`] if the auth store cannot be written.
+#[allow(clippy::result_large_err)]
+pub fn disconnect_provider(config_path: &Path, provider: &str) -> Result<String, CliError> {
+    let _ = config_path;
+    let removed = crate::auth::remove_key(provider).map_err(CliError::from)?;
+    Ok(if removed {
+        format!("chave do provider '{provider}' removida")
+    } else {
+        format!("nenhuma chave salva para o provider '{provider}'")
+    })
+}
+
+/// Render the effective provider list (catalog ∪ config) with key status.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the catalog or config cannot be loaded.
+#[allow(clippy::result_large_err)]
+#[allow(clippy::format_push_string)]
+pub fn list_providers(config_path: &Path) -> Result<String, CliError> {
+    let effective = effective_config(config_path)?;
+    let auth = crate::auth::read_auth().unwrap_or_default();
+    let mut out = String::new();
+    for p in &effective.providers {
+        let has_key = auth.contains_key(&p.name);
+        let status = if has_key { "ok" } else { "-" };
+        out.push_str(&format!(
+            "{:<16} format={:<10} key={status}\n",
+            p.name, p.format
+        ));
+    }
+    Ok(out.trim_end().to_string())
+}
+
+/// Persist `defaults.model` in the config overlay so the model selection
+/// survives restarts. `None` clears the selection. Creates a default config
+/// file if none exists yet.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the config cannot be read, serialized, or written.
+#[allow(clippy::result_large_err)]
+pub fn set_default_model(config_path: &Path, model: Option<&str>) -> Result<(), CliError> {
+    if !config_path.exists() {
+        if let Some(parent) = config_path.parent() {
+            std::fs::create_dir_all(parent).map_err(CliError::from)?;
+        }
+        crate::config::create_default_config(config_path).map_err(CliError::from)?;
+    }
+    let mut config = Config::load(config_path).map_err(CliError::from)?;
+    config.defaults.model = model.map(str::to_string);
+    let yaml = serde_yaml::to_string(&config).map_err(|e| CliError::Connect {
+        message: format!("falha ao serializar config: {e}"),
+    })?;
+    let tmp = config_path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, yaml).map_err(CliError::from)?;
+    std::fs::rename(&tmp, config_path).map_err(CliError::from)?;
+    Ok(())
+}
+
+/// CLI entry for `connect`: store the API key for an existing provider.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the provider is unknown or the auth store fails.
+#[allow(clippy::needless_pass_by_value)]
+pub fn connect(config_path: PathBuf, provider: String, key: Option<String>) -> miette::Result<()> {
+    let msg = connect_provider(&config_path, &provider, key).map_err(miette::Report::from)?;
+    println!("{msg}");
+    Ok(())
+}
+
+/// CLI entry for `disconnect`: remove the stored API key for a provider.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the auth store cannot be written.
+#[allow(clippy::needless_pass_by_value)]
+pub fn disconnect(config_path: PathBuf, provider: String) -> miette::Result<()> {
+    let msg = disconnect_provider(&config_path, &provider).map_err(miette::Report::from)?;
+    println!("{msg}");
+    Ok(())
+}
+
+/// CLI entry for `providers`: print the effective provider list.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the catalog or config cannot be loaded.
+#[allow(clippy::needless_pass_by_value)]
+pub fn providers(config_path: PathBuf) -> miette::Result<()> {
+    let out = list_providers(&config_path).map_err(miette::Report::from)?;
+    println!("{out}");
+    Ok(())
+}
+
+/// Run the MCP stdio server exposing connect/disconnect/models/providers.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the MCP server cannot be started.
+#[allow(clippy::needless_pass_by_value)]
+pub async fn mcp(config_path: PathBuf) -> miette::Result<()> {
+    crate::mcp::run(config_path).await
 }
 
 /// Resolve the config path from an explicit flag, the environment, the current
@@ -889,6 +1069,28 @@ mod tests {
     #[test]
     fn config_dir_is_global() {
         assert_eq!(config_dir(), crate::config::global_config_dir());
+    }
+
+    #[test]
+    fn set_default_model_persists_and_clears() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is set")
+            .as_nanos();
+        let dir =
+            std::env::temp_dir().join(format!("local-proxy-select-{}-{stamp}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("config.yaml");
+
+        set_default_model(&path, Some("deepseek-v4-flash")).expect("persist model");
+        let config = Config::load(&path).expect("reload");
+        assert_eq!(config.defaults.model.as_deref(), Some("deepseek-v4-flash"));
+
+        set_default_model(&path, None).expect("clear model");
+        let config = Config::load(&path).expect("reload");
+        assert_eq!(config.defaults.model, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

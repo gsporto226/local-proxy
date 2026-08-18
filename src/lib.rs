@@ -7,6 +7,15 @@
 /// Command-line interface implementation.
 pub mod cli;
 
+/// Global API-key store.
+pub mod auth;
+
+/// Embedded provider catalog and config-overlay merging.
+pub mod catalog;
+
+/// MCP server exposing provider/key/model management.
+pub mod mcp;
+
 /// Configuration types and loading.
 pub mod config;
 

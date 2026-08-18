@@ -9,10 +9,14 @@ pub const ENV_CONFIG_PATH: &str = "LOCAL_PROXY_CONFIG";
 /// Default config file path used when no override is provided.
 pub const DEFAULT_CONFIG_PATH: &str = "config.yaml";
 
-/// Complete default configuration embedded in the binary, written on first run
-/// when no config file exists yet. Mirrors `config.example.yaml`.
+/// Default config embedded in the binary, written on first run when no config
+/// file exists yet.
+///
+/// Minimal by design: the provider catalog is embedded separately (see
+/// [`crate::catalog`]); this file only overrides server settings.
 pub const DEFAULT_CONFIG: &str = r"# local-proxy default configuration.
-# Copy this file to your config directory and edit it to taste.
+# The provider catalog is embedded in the binary; this file only adds or
+# overrides providers/routes/defaults from that catalog (see catalog.yaml).
 
 server:
   host: 127.0.0.1
@@ -20,43 +24,6 @@ server:
   api_keys:
     - sk-proxy
   passthrough_keys: false
-
-providers:
-  - name: anthropic
-    base_url: https://api.anthropic.com
-    api_key_env: ANTHROPIC_API_KEY
-    format: anthropic
-    models:
-      - claude-sonnet-4-5
-      - claude-opus-4-1
-  - name: openai
-    base_url: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
-    format: openai
-    models:
-      - gpt-4o
-  - name: zen
-    base_url: https://opencode.ai/zen
-    api_key_env: OPENCODE_ZEN_KEY
-    format: openai
-    models:
-      - deepseek-v4-flash-free
-      - claude-sonnet-4-5
-      - gpt-5.1
-
-routes:
-  - model: claude-sonnet
-    provider: anthropic
-    prefix: true
-    upstream_model: claude-sonnet-4-5
-  - model: gpt-4o
-    provider: openai
-  - model: deepseek-free
-    provider: zen
-    upstream_model: deepseek-v4-flash-free
-
-defaults:
-  provider: anthropic
 ";
 
 /// Wire format a provider's API expects (`Anthropic` vs `OpenAI`).
@@ -105,6 +72,9 @@ pub struct Provider {
     pub base_url: String,
     /// Environment variable that holds the provider's API key.
     pub api_key_env: Option<String>,
+    /// API key stored inline in the config (overrides `api_key_env` and the
+    /// auth store when present).
+    pub api_key: Option<String>,
     /// Wire format the provider expects.
     pub format: ProviderFormat,
     /// Native model IDs the provider can serve.
@@ -131,6 +101,9 @@ pub struct Route {
 pub struct Defaults {
     /// Provider used when no route matches.
     pub provider: String,
+    /// Active model that overrides the harness's requested model for routing
+    /// (set via MCP `models(select)`; persists across restarts).
+    pub model: Option<String>,
 }
 
 /// Top-level parsed configuration.
@@ -490,9 +463,10 @@ mod tests {
         assert_eq!(config.server.port, 8787);
         assert_eq!(config.server.api_keys, vec!["sk-proxy".to_string()]);
         assert!(!config.server.passthrough_keys);
-        assert_eq!(config.providers.len(), 3);
-        assert_eq!(config.routes.len(), 3);
-        assert_eq!(config.defaults.provider, "anthropic");
+        assert!(config.providers.is_empty());
+        assert!(config.routes.is_empty());
+        assert!(config.defaults.provider.is_empty());
+        assert_eq!(config.defaults.model, None);
     }
 
     #[test]
@@ -510,7 +484,7 @@ mod tests {
 
         let config = Config::load(&path).expect("loaded default config");
         assert_eq!(config.server.port, 8787);
-        assert_eq!(config.providers.len(), 3);
+        assert!(config.providers.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
     }
