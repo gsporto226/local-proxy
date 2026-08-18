@@ -31,7 +31,7 @@ jobs:
       - name: fmt (estrito)
         run: cargo fmt --all -- --check
 
-      - name: clippy (estrito: -D warnings + pedantic + nursery)
+      - name: "clippy (estrito: -D warnings + pedantic + nursery)"
         run: cargo clippy --all-targets --all-features -- -D warnings
 
       - name: unit tests
