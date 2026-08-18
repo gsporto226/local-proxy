@@ -1,13 +1,9 @@
 use std::path::PathBuf;
-use std::sync::Arc;
 
 use clap::{Parser, Subcommand};
+use tokio::runtime::Runtime;
 
-use local_proxy::config::{Config, DEFAULT_CONFIG_PATH};
-use local_proxy::handlers::{self, AppState};
-use local_proxy::router::Router;
-
-const LOG_TARGET: &str = "local_proxy";
+use local_proxy::cli;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -17,80 +13,83 @@ const LOG_TARGET: &str = "local_proxy";
 )]
 struct Cli {
     /// Path to config file (YAML or JSON); overrides LOCAL_PROXY_CONFIG
-    #[arg(long, value_name = "PATH")]
+    #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
-    /// Override server host
-    #[arg(long)]
-    host: Option<String>,
-    /// Override server port
-    #[arg(long)]
-    port: Option<u16>,
     #[command(subcommand)]
     command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
 enum Command {
-    /// Run the proxy server
+    /// Run the proxy server (foreground by default)
     Serve {
-        /// Path to config file (YAML or JSON); overrides LOCAL_PROXY_CONFIG
-        #[arg(long, value_name = "PATH")]
-        config: Option<PathBuf>,
         /// Override server host
         #[arg(long)]
         host: Option<String>,
         /// Override server port
         #[arg(long)]
         port: Option<u16>,
+        /// Run detached in the background
+        #[arg(long)]
+        background: bool,
     },
+    /// Start the proxy (if needed) and launch an Anthropic-compatible tool
+    Launch {
+        /// Tool: claude (default) | design
+        tool: Option<String>,
+        /// Model to route Claude to (sets ANTHROPIC_MODEL / _SMALL_FAST_MODEL)
+        #[arg(long)]
+        model: Option<String>,
+        /// Forward --yes to the tool
+        #[arg(long)]
+        yes: bool,
+        /// Print the env/command without running anything
+        #[arg(long)]
+        dry_run: bool,
+        /// Arguments passed through to the tool (after --)
+        #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
+        args: Vec<String>,
+    },
+    /// Show whether the background proxy is running
+    Status,
+    /// Stop the background proxy
+    Stop,
+    /// List routed models
+    Models,
+}
+
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    Runtime::new()
+        .expect("failed to build tokio runtime")
+        .block_on(fut)
 }
 
 fn main() -> Result<(), Box<dyn std::error::Error>> {
     let cli = Cli::parse();
+    let config = cli::resolve_config_path(cli.config);
     match cli.command {
-        Some(Command::Serve { config, host, port }) => run_serve(config, host, port),
-        None => run_serve(cli.config, cli.host, cli.port),
+        None => block_on(cli::serve(config, None, None, false)),
+        Some(Command::Serve {
+            host,
+            port,
+            background,
+        }) => block_on(cli::serve(config, host, port, background)),
+        Some(Command::Launch {
+            tool,
+            model,
+            yes,
+            dry_run,
+            args,
+        }) => cli::launch(
+            config,
+            tool.as_deref().unwrap_or("claude"),
+            model.as_deref(),
+            yes,
+            dry_run,
+            args,
+        ),
+        Some(Command::Status) => cli::status(config),
+        Some(Command::Stop) => cli::stop(config),
+        Some(Command::Models) => cli::models(config),
     }
-}
-
-#[tokio::main]
-async fn run_serve(
-    config_flag: Option<PathBuf>,
-    host_flag: Option<String>,
-    port_flag: Option<u16>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    init_tracing();
-
-    let path = config_flag
-        .or_else(Config::env_config_path)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
-    let config = Arc::new(Config::load(&path)?);
-    tracing::info!(target: LOG_TARGET, path = %path.display(), "loaded config");
-
-    let router = Arc::new(Router::new(config.clone())?);
-    tracing::info!(target: LOG_TARGET, routes = config.routes.len(), providers = config.providers.len(), "router ready");
-
-    let clients = Arc::new(handlers::build_clients(&config)?);
-    let state = AppState {
-        config,
-        router,
-        clients,
-    };
-
-    let host = host_flag.unwrap_or_else(|| state.config.server.host.clone());
-    let port = port_flag.unwrap_or(state.config.server.port);
-
-    let addr = format!("{host}:{port}");
-    let app = handlers::app(state);
-
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    tracing::info!(target: LOG_TARGET, %addr, "listening");
-    axum::serve(listener, app).await?;
-    Ok(())
-}
-
-fn init_tracing() {
-    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| format!("{LOG_TARGET}=info,tower_http=info").into());
-    tracing_subscriber::fmt().with_env_filter(filter).init();
 }
