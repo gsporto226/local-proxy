@@ -1021,15 +1021,15 @@ fn install_method(exe: &Path) -> InstallMethod {
 fn swap_binary(staged: &Path, exe: &Path) -> Result<(), UpdateError> {
     #[cfg(not(target_os = "windows"))]
     {
+        use std::os::unix::fs::PermissionsExt;
         std::fs::rename(staged, exe).map_err(|source| UpdateError::Replace {
             path: staged.display().to_string(),
             exe: exe.display().to_string(),
             command: manual_replace_command(staged, exe),
             source,
         })?;
-        use std::os::unix::fs::PermissionsExt;
         let _ = std::fs::set_permissions(exe, std::fs::Permissions::from_mode(0o755));
-        return Ok(());
+        Ok(())
     }
     #[cfg(target_os = "windows")]
     {
