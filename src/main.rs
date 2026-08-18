@@ -1,3 +1,6 @@
+//! `local-proxy` command-line interface: serve the proxy, launch compatible
+//! tools, and manage the background process.
+
 use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
@@ -12,7 +15,7 @@ use local_proxy::cli;
     about = "Local multi-provider translation proxy (OpenAI <-> Anthropic)"
 )]
 struct Cli {
-    /// Path to config file (YAML or JSON); overrides LOCAL_PROXY_CONFIG
+    /// Path to config file (YAML or JSON); overrides `LOCAL_PROXY_CONFIG`
     #[arg(long, global = true, value_name = "PATH")]
     config: Option<PathBuf>,
     #[command(subcommand)]
@@ -37,7 +40,7 @@ enum Command {
     Launch {
         /// Tool: claude (default) | design
         tool: Option<String>,
-        /// Model to route Claude to (sets ANTHROPIC_MODEL / _SMALL_FAST_MODEL)
+        /// Model to route Claude to (sets `ANTHROPIC_MODEL` / `_SMALL_FAST_MODEL`)
         #[arg(long)]
         model: Option<String>,
         /// Forward --yes to the tool

@@ -1,0 +1,55 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint-test:
+    name: lint + test (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: cargo cache
+        uses: Swatinem/rust-cache@v2
+
+      - name: fmt (estrito)
+        run: cargo fmt --all -- --check
+
+      - name: clippy (estrito: -D warnings + pedantic + nursery)
+        run: cargo clippy --all-targets --all-features -- -D warnings
+
+      - name: unit tests
+        run: cargo test --all-features
+
+      - name: bun toolchain
+        uses: oven-sh/setup-bun@v2
+
+      - name: e2e mock (Bun)
+        working-directory: e2e
+        run: |
+          bun install
+          bun test mock.test.ts
+
+  audit:
+    name: cargo-audit (segurança)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: rustsec/audit-check@master
+        with:
+          token: ${{ secrets.GITHUB_TOKEN }}

@@ -3,23 +3,34 @@ use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
 
+/// Environment variable that overrides the default config file path.
 pub const ENV_CONFIG_PATH: &str = "LOCAL_PROXY_CONFIG";
+
+/// Default config file path used when no override is provided.
 pub const DEFAULT_CONFIG_PATH: &str = "config.yaml";
 
+/// Wire format a provider's API expects (`Anthropic` vs `OpenAI`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderFormat {
+    /// `Anthropic` Messages API format.
     #[default]
     Anthropic,
+    /// `OpenAI` Chat Completions format.
     Openai,
 }
 
+/// Network and authentication settings for the proxy server.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Server {
+    /// Host interface to bind the server to.
     pub host: String,
+    /// TCP port to listen on.
     pub port: u16,
+    /// API keys accepted for client authentication.
     pub api_keys: Vec<String>,
+    /// Whether to forward the client's key to upstream providers.
     pub passthrough_keys: bool,
 }
 
@@ -34,55 +45,86 @@ impl Default for Server {
     }
 }
 
+/// An upstream provider (`Anthropic`, `OpenAI`, or another `OpenAI`-compatible host).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Provider {
+    /// Unique provider name used in routes and the CLI.
     pub name: String,
+    /// Base URL for the provider's API.
     pub base_url: String,
+    /// Environment variable that holds the provider's API key.
     pub api_key_env: Option<String>,
+    /// Wire format the provider expects.
     pub format: ProviderFormat,
+    /// Native model IDs the provider can serve.
     pub models: Vec<String>,
 }
 
+/// Maps a requested model to a provider (exact match or prefix).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Route {
+    /// Requested model name (or prefix when `prefix` is set).
     pub model: String,
+    /// Provider to route matching requests to.
     pub provider: String,
+    /// Treat `model` as a prefix rather than an exact match.
     pub prefix: bool,
+    /// Optional model name to send upstream instead of the requested one.
     pub upstream_model: Option<String>,
 }
 
+/// Fallback values used when a request doesn't match any route.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Defaults {
+    /// Provider used when no route matches.
     pub provider: String,
 }
 
+/// Top-level parsed configuration.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
 pub struct Config {
+    /// Server settings.
     pub server: Server,
+    /// Configured upstream providers.
     pub providers: Vec<Provider>,
+    /// Model-to-provider routing rules.
     pub routes: Vec<Route>,
+    /// Fallback defaults.
     pub defaults: Defaults,
 }
 
+/// Errors that can occur while loading or parsing configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
+    /// Failed to read the config file from disk.
     #[error("failed to read config file {path}: {source}")]
     Io {
+        /// Path of the file that could not be read.
         path: String,
+        /// Underlying I/O error.
         source: std::io::Error,
     },
+    /// Failed to parse the config contents.
     #[error("failed to parse config as {kind}: {source}")]
     Parse {
+        /// Format that was attempted ("JSON" or "YAML").
         kind: &'static str,
+        /// Underlying parse error.
         source: Box<dyn std::error::Error + Send + Sync>,
     },
 }
 
 impl Config {
+    /// Load configuration from the file at `path`, inferring the format from
+    /// its extension.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError`] if the file cannot be read or parsed.
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -97,6 +139,13 @@ impl Config {
         Self::from_str(&content, &ext)
     }
 
+    /// Parse configuration from `content`, using `ext` to select the parser
+    /// (`"json"` for JSON, anything else for YAML).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`ConfigError::Parse`] if `content` is not valid for the
+    /// detected format.
     pub fn from_str(content: &str, ext: &str) -> Result<Self, ConfigError> {
         match ext {
             "json" => serde_json::from_str(content).map_err(|source| ConfigError::Parse {
@@ -110,6 +159,9 @@ impl Config {
         }
     }
 
+    /// Resolve the config path from the [`ENV_CONFIG_PATH`] environment
+    /// variable, if set and non-empty.
+    #[must_use]
     pub fn env_config_path() -> Option<PathBuf> {
         std::env::var(ENV_CONFIG_PATH)
             .ok()

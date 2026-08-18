@@ -3,20 +3,34 @@ use std::sync::Arc;
 
 use crate::config::{Config, Provider};
 
+/// Errors produced while building or querying a [`Router`].
 #[derive(Debug, thiserror::Error)]
 pub enum RouterError {
+    /// A route referenced a provider that doesn't exist.
     #[error("provider not found: {provider}")]
-    ProviderNotFound { provider: String },
+    ProviderNotFound {
+        /// Name of the missing provider.
+        provider: String,
+    },
+    /// No route matched the requested model.
     #[error("model not found: {model}")]
-    ModelNotFound { model: String },
+    ModelNotFound {
+        /// Requested model that couldn't be resolved.
+        model: String,
+    },
 }
 
+/// A successfully resolved route to an upstream provider.
 #[derive(Debug)]
 pub struct ResolvedRoute {
+    /// The provider to forward the request to.
     pub provider: Arc<Provider>,
+    /// Model name to send to the upstream provider.
     pub upstream_model: String,
 }
 
+/// Resolves requested model names to upstream providers using configured
+/// routes, prefixes, and defaults.
 #[derive(Debug)]
 pub struct Router {
     config: Arc<Config>,
@@ -27,6 +41,12 @@ pub struct Router {
 }
 
 impl Router {
+    /// Build a [`Router`] from a shared configuration.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError::ProviderNotFound`] if any route references an
+    /// unknown provider.
     pub fn new(config: Arc<Config>) -> Result<Self, RouterError> {
         let mut providers = HashMap::new();
         for (i, provider) in config.providers.iter().enumerate() {
@@ -62,9 +82,15 @@ impl Router {
         })
     }
 
+    /// Resolve `model` to the provider and upstream model that should serve it.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError::ModelNotFound`] if no route, provider, or default
+    /// matches `model`.
     pub fn resolve_model(&self, model: &str) -> Result<ResolvedRoute, RouterError> {
         if let Some(&route_idx) = self.exact.get(model) {
-            return self.resolve_route(route_idx, model);
+            return Ok(self.resolve_route(route_idx, model));
         }
 
         if let Some((provider_name, upstream)) = model.split_once('/') {
@@ -80,14 +106,12 @@ impl Router {
         for &route_idx in &self.prefixes {
             let route = &self.config.routes[route_idx];
             let len = route.model.len();
-            if model.starts_with(&route.model)
-                && best.map(|(best_len, _)| len > best_len).unwrap_or(true)
-            {
+            if model.starts_with(&route.model) && best.is_none_or(|(best_len, _)| len > best_len) {
                 best = Some((len, route_idx));
             }
         }
         if let Some((_, route_idx)) = best {
-            return self.resolve_route(route_idx, model);
+            return Ok(self.resolve_route(route_idx, model));
         }
 
         for provider in &self.config.providers {
@@ -113,6 +137,7 @@ impl Router {
 
     /// Catalog of models a client may request: exact route models plus each
     /// provider's native model list.
+    #[must_use]
     pub fn list_models(&self) -> Vec<String> {
         let mut models: Vec<String> = Vec::new();
         for route in &self.config.routes {
@@ -130,16 +155,16 @@ impl Router {
         models
     }
 
-    fn resolve_route(&self, route_idx: usize, model: &str) -> Result<ResolvedRoute, RouterError> {
+    fn resolve_route(&self, route_idx: usize, model: &str) -> ResolvedRoute {
         let route = &self.config.routes[route_idx];
         let provider_idx = self.providers[&route.provider];
-        Ok(ResolvedRoute {
+        ResolvedRoute {
             provider: Arc::new(self.config.providers[provider_idx].clone()),
             upstream_model: route
                 .upstream_model
                 .clone()
                 .unwrap_or_else(|| model.to_string()),
-        })
+        }
     }
 }
 

@@ -16,8 +16,7 @@ pub type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> +
 fn now_ts() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 fn new_id(prefix: &str) -> String {
@@ -26,7 +25,7 @@ fn new_id(prefix: &str) -> String {
 }
 
 /// Convert a machine-produced JSON payload into an SSE `Event`. Anthropic and
-/// Responses events carry their name in `type`; OpenAI chat chunks carry no
+/// Responses events carry their name in `type`; `OpenAI` chat chunks carry no
 /// event name; a string payload becomes a raw `data:` line (`[DONE]`).
 fn to_event(value: Value) -> Event {
     if let Value::String(s) = &value {
@@ -111,10 +110,12 @@ struct ResponsesTool {
     output_index: u32,
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn anthropic_content_block_start(index: u32, block: Value) -> Value {
     json!({"type": "content_block_start", "index": index, "content_block": block})
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn anthropic_content_block_delta(index: u32, delta: Value) -> Value {
     json!({"type": "content_block_delta", "index": index, "delta": delta})
 }
@@ -147,6 +148,7 @@ fn anthropic_message_delta(stop_reason: &str, usage: &TokenUsage) -> Value {
     })
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn openai_chunk(
     id: &str,
     model: &str,
@@ -181,7 +183,7 @@ fn responses_created(id: &str, model: &str, created_at: u64) -> Value {
 
 /// Merge a partial usage payload (e.g. only `output_tokens` from an Anthropic
 /// `message_delta`) into the accumulated usage, preserving earlier fields.
-fn merge_usage(acc: &mut TokenUsage, part: TokenUsage) {
+const fn merge_usage(acc: &mut TokenUsage, part: TokenUsage) {
     if part.input > 0 {
         acc.input = part.input;
     }
@@ -193,10 +195,12 @@ fn merge_usage(acc: &mut TokenUsage, part: TokenUsage) {
     }
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn responses_output_item_added(output_index: u32, item: Value) -> Value {
     json!({"type": "response.output_item.added", "output_index": output_index, "item": item})
 }
 
+#[allow(clippy::needless_pass_by_value)]
 fn responses_output_item_done(output_index: u32, item: Value) -> Value {
     json!({"type": "response.output_item.done", "output_index": output_index, "item": item})
 }
@@ -271,10 +275,10 @@ impl OaMachine {
         self.pending_reasoning.clear();
     }
 
-    fn ensure_text_block(&mut self, events: &mut Vec<Value>) -> Option<u32> {
+    fn ensure_text_block(&mut self, events: &mut Vec<Value>) -> u32 {
         self.flush_reasoning(events);
         if let Some(index) = self.text {
-            return Some(index);
+            return index;
         }
         let index = self.next_block;
         self.next_block += 1;
@@ -283,13 +287,13 @@ impl OaMachine {
             json!({"type": "text", "text": ""}),
         ));
         self.text = Some(index);
-        Some(index)
+        index
     }
 
     fn map_stop_reason(&self) -> &'static str {
         match self.stop_reason.as_deref() {
-            Some("tool_calls") | Some("tool_call") => "tool_use",
-            Some("length") | Some("max_tokens") => "max_tokens",
+            Some("tool_calls" | "tool_call") => "tool_use",
+            Some("length" | "max_tokens") => "max_tokens",
             Some(other) if other != "stop" && other != "end_turn" => "end_turn",
             _ => {
                 if self.saw_tools || !self.tools.is_empty() {
@@ -303,6 +307,7 @@ impl OaMachine {
 }
 
 impl Machine for OaMachine {
+    #[allow(clippy::cast_possible_truncation)]
     fn process(&mut self, frame: &SseFrame) -> Vec<Value> {
         let mut events = Vec::new();
         self.start(&mut events);
@@ -329,13 +334,12 @@ impl Machine for OaMachine {
         }
 
         if let Some(t) = delta.get("content").and_then(Value::as_str) {
-            if let Some(index) = self.ensure_text_block(&mut events) {
-                if !t.is_empty() {
-                    events.push(anthropic_content_block_delta(
-                        index,
-                        json!({"type": "text_delta", "text": t}),
-                    ));
-                }
+            let index = self.ensure_text_block(&mut events);
+            if !t.is_empty() {
+                events.push(anthropic_content_block_delta(
+                    index,
+                    json!({"type": "text_delta", "text": t}),
+                ));
             }
         }
 
@@ -470,7 +474,7 @@ impl AoMachine {
     fn map_finish_reason(&self) -> String {
         match self.stop_reason.as_deref() {
             Some("tool_use") => "tool_calls".to_string(),
-            Some("max_tokens") | Some("max_tokens_reached") => "length".to_string(),
+            Some("max_tokens" | "max_tokens_reached") => "length".to_string(),
             Some(other) if other != "end_turn" && other != "stop_sequence" => other.to_string(),
             _ => {
                 if self.saw_tools || !self.tools.is_empty() {
@@ -484,6 +488,7 @@ impl AoMachine {
 }
 
 impl Machine for AoMachine {
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn process(&mut self, frame: &SseFrame) -> Vec<Value> {
         let mut events = Vec::new();
         if frame.is_done() {
@@ -620,14 +625,15 @@ impl Machine for AoMachine {
         self.first_chunk(&mut events);
 
         let finish = self.map_finish_reason();
-        let mut usage = None;
-        if self.usage.input > 0 || self.usage.output > 0 {
-            usage = Some(json!({
+        let usage = if self.usage.input > 0 || self.usage.output > 0 {
+            Some(json!({
                 "prompt_tokens": self.usage.input,
                 "completion_tokens": self.usage.output,
                 "total_tokens": self.usage.input + self.usage.output
-            }));
-        }
+            }))
+        } else {
+            None
+        };
         let mut chunk = json!({
             "id": self.id,
             "object": "chat.completion.chunk",
@@ -704,7 +710,7 @@ impl A2RMachine {
         })
     }
 
-    fn function_call_item(&self, tool: &ResponsesTool, status: &str) -> Value {
+    fn function_call_item(tool: &ResponsesTool, status: &str) -> Value {
         json!({
             "type": "function_call",
             "id": tool.item_id,
@@ -717,6 +723,7 @@ impl A2RMachine {
 }
 
 impl Machine for A2RMachine {
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
     fn process(&mut self, frame: &SseFrame) -> Vec<Value> {
         let mut events = Vec::new();
         if frame.is_done() {
@@ -876,7 +883,7 @@ impl Machine for A2RMachine {
                         "output_index": tool.output_index,
                         "arguments": tool.args
                     }));
-                    let item = self.function_call_item(&tool, "completed");
+                    let item = Self::function_call_item(&tool, "completed");
                     events.push(responses_output_item_done(tool.output_index, item.clone()));
                     self.items.push(item);
                 }
@@ -926,7 +933,7 @@ impl Machine for A2RMachine {
                     "output_index": tool.output_index,
                     "arguments": tool.args
                 }));
-                let item = self.function_call_item(&tool, "completed");
+                let item = Self::function_call_item(&tool, "completed");
                 events.push(responses_output_item_done(tool.output_index, item.clone()));
                 self.items.push(item);
             }
@@ -1012,7 +1019,7 @@ impl O2RMachine {
         })
     }
 
-    fn function_call_item(&self, tool: &ResponsesTool, status: &str) -> Value {
+    fn function_call_item(tool: &ResponsesTool, status: &str) -> Value {
         json!({
             "type": "function_call",
             "id": tool.item_id,
@@ -1069,20 +1076,21 @@ impl O2RMachine {
         }
     }
 
-    fn close_tool(&mut self, events: &mut Vec<Value>, tool: ResponsesTool) {
+    fn close_tool(&mut self, events: &mut Vec<Value>, tool: &ResponsesTool) {
         events.push(json!({
             "type": "response.function_call_arguments.done",
             "item_id": tool.item_id,
             "output_index": tool.output_index,
             "arguments": tool.args
         }));
-        let item = self.function_call_item(&tool, "completed");
+        let item = Self::function_call_item(tool, "completed");
         events.push(responses_output_item_done(tool.output_index, item.clone()));
         self.items.push(item);
     }
 }
 
 impl Machine for O2RMachine {
+    #[allow(clippy::cast_possible_truncation)]
     fn process(&mut self, frame: &SseFrame) -> Vec<Value> {
         let mut events = Vec::new();
         if frame.is_done() {
@@ -1185,7 +1193,7 @@ impl Machine for O2RMachine {
         indices.sort_unstable();
         for idx in indices {
             if let Some(tool) = self.tools.remove(&idx) {
-                self.close_tool(&mut events, tool);
+                self.close_tool(&mut events, &tool);
             }
         }
         events.push(json!({
@@ -1209,22 +1217,26 @@ impl Machine for O2RMachine {
 // public entry points
 // ---------------------------------------------------------------------------
 
-/// OpenAI chat-completions upstream -> Anthropic Messages SSE stream.
+/// `OpenAI` chat-completions upstream -> Anthropic Messages SSE stream.
+#[must_use]
 pub fn anthropic_from_openai(resp: reqwest::Response, model: String) -> UpstreamStream {
     build(resp, OaMachine::new(model))
 }
 
-/// Anthropic Messages upstream -> OpenAI chat-completions SSE stream.
+/// Anthropic Messages upstream -> `OpenAI` chat-completions SSE stream.
+#[must_use]
 pub fn openai_from_anthropic(resp: reqwest::Response, model: String) -> UpstreamStream {
     build(resp, AoMachine::new(model))
 }
 
-/// Anthropic Messages upstream -> OpenAI Responses SSE stream.
+/// Anthropic Messages upstream -> `OpenAI` Responses SSE stream.
+#[must_use]
 pub fn responses_from_anthropic(resp: reqwest::Response, model: String) -> UpstreamStream {
     build(resp, A2RMachine::new(model))
 }
 
-/// OpenAI chat-completions upstream -> OpenAI Responses SSE stream.
+/// `OpenAI` chat-completions upstream -> `OpenAI` Responses SSE stream.
+#[must_use]
 pub fn responses_from_openai(resp: reqwest::Response, model: String) -> UpstreamStream {
     build(resp, O2RMachine::new(model))
 }
@@ -1237,6 +1249,7 @@ pub fn responses_from_openai(resp: reqwest::Response, model: String) -> Upstream
 mod tests {
     use super::*;
 
+    #[allow(clippy::needless_pass_by_value)]
     fn frame(data: Value) -> SseFrame {
         SseFrame {
             event: None,
@@ -1244,6 +1257,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn oai_chunk(delta: Value, finish: Option<&str>) -> SseFrame {
         frame(json!({
             "id": "cmpl_1",
@@ -1254,6 +1268,7 @@ mod tests {
         }))
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn anthro(ty: &str, extra: Value) -> SseFrame {
         let mut v = json!({"type": ty});
         if let Some(o) = extra.as_object() {
@@ -1262,6 +1277,7 @@ mod tests {
         frame(v)
     }
 
+    #[allow(clippy::needless_pass_by_value)]
     fn run(mut m: impl Machine, frames: Vec<SseFrame>) -> Vec<Value> {
         let mut out = Vec::new();
         for f in &frames {

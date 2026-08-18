@@ -6,24 +6,30 @@ use futures_util::{Stream, StreamExt};
 /// A single parsed SSE frame: optional event name and data payload.
 #[derive(Debug, Clone)]
 pub struct SseFrame {
+    /// Optional SSE `event:` name, if present in the frame.
     pub event: Option<String>,
+    /// The frame's `data:` payload.
     pub data: String,
 }
 
 impl SseFrame {
     /// Parse the data payload as JSON, tolerating failures.
+    #[must_use]
     pub fn json(&self) -> Option<serde_json::Value> {
         serde_json::from_str(self.data.trim()).ok()
     }
 
     /// The `[DONE]` sentinel used by OpenAI-style streams.
+    #[must_use]
     pub fn is_done(&self) -> bool {
         self.data.trim() == "[DONE]"
     }
 }
 
+/// Errors that can occur while reading the upstream SSE stream.
 #[derive(Debug, thiserror::Error)]
 pub enum SseError {
+    /// The upstream stream failed to produce further bytes.
     #[error("failed reading upstream stream: {0}")]
     Read(reqwest::Error),
 }

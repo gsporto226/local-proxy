@@ -7,16 +7,22 @@ use crate::translate::TranslateError;
 use crate::upstream::UpstreamError;
 
 /// An error surfaced to a client, carrying a status code and a kind string
-/// compatible with both the OpenAI and Anthropic error shapes.
+/// compatible with both the `OpenAI` and `Anthropic` error shapes.
 #[derive(Debug, Clone)]
 pub struct ApiError {
+    /// The error kind string, e.g. `invalid_request_error`.
     pub kind: String,
+    /// The HTTP status code to return to the client.
     pub status: u16,
+    /// Human-readable description of the error.
     pub message: String,
+    /// Optional raw upstream error body, preserved for inspection.
     pub upstream_body: Option<Value>,
 }
 
 impl ApiError {
+    /// Create a new [`ApiError`] with the given HTTP status, kind, and message.
+    #[must_use]
     pub fn new(status: u16, kind: impl Into<String>, message: impl Into<String>) -> Self {
         Self {
             kind: kind.into(),
@@ -26,28 +32,39 @@ impl ApiError {
         }
     }
 
+    /// Attach a raw upstream error body to this error.
+    #[must_use]
     pub fn with_upstream_body(mut self, body: Value) -> Self {
         self.upstream_body = Some(body);
         self
     }
 
+    /// Create a `400` `invalid_request_error`.
+    #[must_use]
     pub fn bad_request(message: impl Into<String>) -> Self {
         Self::new(400, "invalid_request_error", message)
     }
 
+    /// Create a `401` `authentication_error`.
+    #[must_use]
     pub fn unauthorized(message: impl Into<String>) -> Self {
         Self::new(401, "authentication_error", message)
     }
 
+    /// Create a `404` `not_found_error`.
+    #[must_use]
     pub fn not_found(message: impl Into<String>) -> Self {
         Self::new(404, "not_found_error", message)
     }
 
+    /// Create a `500` `api_error`.
+    #[must_use]
     pub fn internal(message: impl Into<String>) -> Self {
         Self::new(500, "api_error", message)
     }
 
     /// Anthropic error shape: `{"type":"error","error":{"type","message"}}`.
+    #[must_use]
     pub fn to_anthropic_error(&self) -> Value {
         json!({
             "type": "error",
@@ -55,7 +72,8 @@ impl ApiError {
         })
     }
 
-    /// OpenAI error shape: `{"error":{"message","type","code"}}`.
+    /// `OpenAI` error shape: `{"error":{"message","type","code"}}`.
+    #[must_use]
     pub fn to_openai_error(&self) -> Value {
         json!({
             "error": {
@@ -67,7 +85,8 @@ impl ApiError {
     }
 
     /// Tolerantly parse an upstream error body in either the Anthropic shape
-    /// (`{"type":"error","error":{...}}`) or the OpenAI shape (`{"error":{...}}`).
+    /// (`{"type":"error","error":{...}}`) or the `OpenAI` shape (`{"error":{...}}`).
+    #[must_use]
     pub fn from_upstream(status: u16, body: Value) -> Self {
         let mut kind = default_kind_for_status(status).to_string();
         let mut message = format!("upstream error (status {status})");
@@ -95,7 +114,7 @@ impl ApiError {
     }
 }
 
-fn default_kind_for_status(status: u16) -> &'static str {
+const fn default_kind_for_status(status: u16) -> &'static str {
     match status {
         400 => "invalid_request_error",
         401 => "authentication_error",

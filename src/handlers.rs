@@ -20,13 +20,22 @@ use crate::streams::UpstreamStream;
 use crate::translate;
 use crate::upstream::{send_and_read, ProviderClient, UpstreamError};
 
+/// Shared application state threaded through the axum handlers.
 #[derive(Clone)]
 pub struct AppState {
+    /// The loaded server configuration.
     pub config: Arc<Config>,
+    /// The model/router resolution logic.
     pub router: Arc<Router>,
+    /// The built upstream clients, keyed by provider name.
     pub clients: Arc<HashMap<String, ProviderClient>>,
 }
 
+/// Build an upstream [`ProviderClient`] for every configured provider.
+///
+/// # Errors
+///
+/// Returns an error if any provider client fails to build.
 pub fn build_clients(config: &Config) -> Result<HashMap<String, ProviderClient>, UpstreamError> {
     let passthrough = config.server.passthrough_keys;
     let mut map = HashMap::new();
@@ -39,6 +48,7 @@ pub fn build_clients(config: &Config) -> Result<HashMap<String, ProviderClient>,
     Ok(map)
 }
 
+/// Build the axum [`AxumRouter`] wiring up all routes with the given state.
 pub fn app(state: AppState) -> AxumRouter {
     AxumRouter::new()
         .route("/health", get(health))

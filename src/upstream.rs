@@ -7,20 +7,41 @@ use crate::config::{Provider, ProviderFormat};
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Errors that can occur while building clients or talking to upstreams.
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
+    /// The provider requires an API key but its env var is unset or empty.
     #[error("missing API key for provider {provider}: set env var {env}")]
-    MissingApiKey { provider: String, env: String },
+    MissingApiKey {
+        /// Name of the provider missing a key.
+        provider: String,
+        /// Environment variable that should hold the key.
+        env: String,
+    },
+    /// Failed to build the underlying HTTP client.
     #[error("failed to build HTTP client: {source}")]
-    ClientBuild { source: reqwest::Error },
+    ClientBuild {
+        /// Underlying client construction error.
+        source: reqwest::Error,
+    },
+    /// A header value could not be constructed.
     #[error("invalid upstream header: {detail}")]
-    InvalidHeader { detail: String },
+    InvalidHeader {
+        /// Human-readable description of the invalid header.
+        detail: String,
+    },
+    /// An upstream request failed.
     #[error("upstream request to {url} failed: {source}")]
-    Request { url: String, source: reqwest::Error },
+    Request {
+        /// URL that was requested.
+        url: String,
+        /// Underlying request error.
+        source: reqwest::Error,
+    },
 }
 
 /// A per-provider HTTP client that knows how to authenticate against the
-/// upstream (Anthropic or OpenAI) and honors the passthrough-keys policy.
+/// upstream (Anthropic or `OpenAI`) and honors the passthrough-keys policy.
 #[derive(Debug, Clone)]
 pub struct ProviderClient {
     name: String,
@@ -32,9 +53,15 @@ pub struct ProviderClient {
 }
 
 impl ProviderClient {
+    /// Build a client for `provider` honoring the given `passthrough` policy.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpstreamError::ClientBuild`] if the HTTP client cannot be
+    /// created.
     pub fn new(provider: &Provider, passthrough: bool) -> Result<Self, UpstreamError> {
         let http = reqwest::Client::builder()
-            .timeout(Duration::from_secs(600))
+            .timeout(Duration::from_mins(10))
             .build()
             .map_err(|source| UpstreamError::ClientBuild { source })?;
         Ok(Self {
@@ -47,16 +74,21 @@ impl ProviderClient {
         })
     }
 
+    /// The provider's name.
+    #[must_use]
     pub fn name(&self) -> &str {
         &self.name
     }
 
-    pub fn format(&self) -> ProviderFormat {
+    /// The provider's wire format.
+    #[must_use]
+    pub const fn format(&self) -> ProviderFormat {
         self.format
     }
 
     /// Default endpoint path for this provider's format.
-    pub fn default_path(&self) -> &'static str {
+    #[must_use]
+    pub const fn default_path(&self) -> &'static str {
         match self.format {
             ProviderFormat::Anthropic => "/v1/messages",
             ProviderFormat::Openai => "/v1/chat/completions",
@@ -64,16 +96,16 @@ impl ProviderClient {
     }
 
     fn configured_key(&self) -> Result<Option<String>, UpstreamError> {
-        match &self.api_key_env {
-            Some(env) => match std::env::var(env) {
+        self.api_key_env.as_deref().map_or_else(
+            || Ok(None),
+            |env| match std::env::var(env) {
                 Ok(key) if !key.is_empty() => Ok(Some(key)),
                 _ => Err(UpstreamError::MissingApiKey {
                     provider: self.name.clone(),
-                    env: env.clone(),
+                    env: env.to_string(),
                 }),
             },
-            None => Ok(None),
-        }
+        )
     }
 
     fn effective_key(&self, client_key: Option<&str>) -> Result<Option<String>, UpstreamError> {
@@ -93,6 +125,12 @@ impl ProviderClient {
 
     /// POST `body` to `path` (defaulting to this provider's endpoint) with the
     /// correct auth headers. Returns the raw response for the caller to read.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpstreamError::MissingApiKey`] if no API key is available,
+    /// [`UpstreamError::InvalidHeader`] if a header cannot be built, or
+    /// [`UpstreamError::Request`] if the HTTP request fails.
     pub async fn chat_request(
         &self,
         path: &str,

@@ -1,13 +1,23 @@
 use serde_json::{json, Value};
 
+/// Errors that occur while translating requests/responses between provider
+/// wire formats.
 #[derive(Debug, thiserror::Error)]
 pub enum TranslateError {
+    /// The request body is not a JSON object.
     #[error("request body is not a JSON object")]
     NotObject,
+    /// A required field is missing from the payload.
     #[error("missing required field: {0}")]
     MissingField(&'static str),
+    /// A field carries an invalid value.
     #[error("invalid value for {field}: {detail}")]
-    Invalid { field: &'static str, detail: String },
+    Invalid {
+        /// The offending field name.
+        field: &'static str,
+        /// A human-readable description of the invalid value.
+        detail: String,
+    },
 }
 
 const DEFAULT_MAX_TOKENS: u64 = 4096;
@@ -52,7 +62,7 @@ fn content_to_text(content: Value) -> String {
     }
 }
 
-/// Build the `content` value for an OpenAI user message. Pure-text parts become
+/// Build the `content` value for an `OpenAI` user message. Pure-text parts become
 /// a plain string (most compatible); anything with images stays an array.
 fn openai_user_message(parts: Vec<Value>) -> Value {
     if parts.is_empty() {
@@ -89,8 +99,7 @@ fn arguments_to_string(args: Value) -> String {
 fn now_ts() -> u64 {
     std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0)
+        .map_or(0, |d| d.as_secs())
 }
 
 /// Recursively remove `cache_control` keys (Anthropic-only) from a value tree.
@@ -177,6 +186,13 @@ fn take_reasoning_effort(out: &mut Value) -> Option<String> {
 // anthropic request -> openai request
 // ---------------------------------------------------------------------------
 
+/// Translate an Anthropic Messages request body into an `OpenAI`
+/// chat-completions request body.
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object, or
+/// [`TranslateError::Invalid`] when a field has an unexpected shape.
 pub fn anthropic_to_openai_request(body: Value) -> Result<Value, TranslateError> {
     let mut out = strip_cache_control(body);
     if out.as_object().is_none() {
@@ -280,7 +296,7 @@ fn convert_anthropic_message(msg: &Value, out: &mut Vec<Value>) -> Result<(), Tr
                             let v = openai_user_message(std::mem::take(&mut current_text));
                             out.push(json!({"role": "user", "content": v}));
                         }
-                        out.push(anthropic_tool_result_to_openai(&block)?);
+                        out.push(anthropic_tool_result_to_openai(&block));
                     }
                     _ => {}
                 }
@@ -374,14 +390,14 @@ fn anthropic_image_to_openai(block: &Value) -> Result<Value, TranslateError> {
     Ok(json!({"type": "image_url", "image_url": {"url": url}}))
 }
 
-fn anthropic_tool_result_to_openai(block: &Value) -> Result<Value, TranslateError> {
+fn anthropic_tool_result_to_openai(block: &Value) -> Value {
     let id = block
         .get("tool_call_id")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
     let text = content_to_text(block.get("content").cloned().unwrap_or(Value::Null));
-    Ok(json!({"role": "tool", "tool_call_id": id, "content": text}))
+    json!({"role": "tool", "tool_call_id": id, "content": text})
 }
 
 fn anthropic_tools_to_openai(tools: &Value) -> Result<Value, TranslateError> {
@@ -404,7 +420,7 @@ fn anthropic_tools_to_openai(tools: &Value) -> Result<Value, TranslateError> {
         let input_schema = tool
             .get("input_schema")
             .cloned()
-            .unwrap_or(json!({"type": "object", "properties": {}}));
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
         out.push(json!({
             "type": "function",
             "function": {
@@ -437,6 +453,13 @@ fn anthropic_tool_choice_to_openai(tc: &Value) -> Value {
 // openai request -> anthropic request
 // ---------------------------------------------------------------------------
 
+/// Translate an `OpenAI` chat-completions request body into an Anthropic
+/// Messages request body.
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object, or
+/// [`TranslateError::Invalid`] when a field has an unexpected shape.
 pub fn openai_to_anthropic_request(body: Value) -> Result<Value, TranslateError> {
     let mut out = body;
     if out.as_object().is_none() {
@@ -471,9 +494,9 @@ pub fn openai_to_anthropic_request(body: Value) -> Result<Value, TranslateError>
                         }
                     }
                 }
-                "user" => anthropic_messages.push(openai_user_to_anthropic(m)?),
-                "assistant" => anthropic_messages.push(openai_assistant_to_anthropic(m)?),
-                "tool" => anthropic_messages.push(openai_tool_to_anthropic(m)?),
+                "user" => anthropic_messages.push(openai_user_to_anthropic(m)),
+                "assistant" => anthropic_messages.push(openai_assistant_to_anthropic(m)),
+                "tool" => anthropic_messages.push(openai_tool_to_anthropic(m)),
                 _ => {}
             }
         }
@@ -510,7 +533,7 @@ pub fn openai_to_anthropic_request(body: Value) -> Result<Value, TranslateError>
     Ok(out)
 }
 
-fn openai_user_to_anthropic(m: &Value) -> Result<Value, TranslateError> {
+fn openai_user_to_anthropic(m: &Value) -> Value {
     let content = m.get("content").cloned().unwrap_or(Value::Null);
     let mut blocks = Vec::new();
     match content {
@@ -519,7 +542,7 @@ fn openai_user_to_anthropic(m: &Value) -> Result<Value, TranslateError> {
             for b in arr {
                 match b.get("type").and_then(Value::as_str) {
                     Some("text") => blocks.push(b),
-                    Some("image_url") => blocks.push(openai_image_to_anthropic(&b)?),
+                    Some("image_url") => blocks.push(openai_image_to_anthropic(&b)),
                     _ => {}
                 }
             }
@@ -529,29 +552,30 @@ fn openai_user_to_anthropic(m: &Value) -> Result<Value, TranslateError> {
     if blocks.is_empty() {
         blocks.push(json!({"type": "text", "text": ""}));
     }
-    Ok(json!({"role": "user", "content": blocks}))
+    json!({"role": "user", "content": blocks})
 }
 
-fn openai_image_to_anthropic(block: &Value) -> Result<Value, TranslateError> {
+fn openai_image_to_anthropic(block: &Value) -> Value {
     let url = block
         .get("image_url")
         .and_then(|u| u.get("url"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
-    if let Some(rest) = url.strip_prefix("data:") {
-        let (meta, data) = rest.split_once(',').unwrap_or((rest, ""));
-        let media_type = meta.trim_end_matches(";base64").to_string();
-        Ok(json!({
-            "type": "image",
-            "source": {"type": "base64", "media_type": media_type, "data": data}
-        }))
-    } else {
-        Ok(json!({"type": "image", "source": {"type": "url", "url": url}}))
-    }
+    url.strip_prefix("data:").map_or_else(
+        || json!({"type": "image", "source": {"type": "url", "url": url.clone()}}),
+        |rest| {
+            let (meta, data) = rest.split_once(',').unwrap_or((rest, ""));
+            let media_type = meta.trim_end_matches(";base64").to_string();
+            json!({
+                "type": "image",
+                "source": {"type": "base64", "media_type": media_type, "data": data}
+            })
+        },
+    )
 }
 
-fn openai_assistant_to_anthropic(m: &Value) -> Result<Value, TranslateError> {
+fn openai_assistant_to_anthropic(m: &Value) -> Value {
     let content = m.get("content").cloned().unwrap_or(Value::Null);
     let mut blocks: Vec<Value> = Vec::new();
     match content {
@@ -592,20 +616,20 @@ fn openai_assistant_to_anthropic(m: &Value) -> Result<Value, TranslateError> {
             );
         }
     }
-    Ok(json!({"role": "assistant", "content": blocks}))
+    json!({"role": "assistant", "content": blocks})
 }
 
-fn openai_tool_to_anthropic(m: &Value) -> Result<Value, TranslateError> {
+fn openai_tool_to_anthropic(m: &Value) -> Value {
     let id = m
         .get("tool_call_id")
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
     let text = content_to_text(m.get("content").cloned().unwrap_or(Value::Null));
-    Ok(json!({
+    json!({
         "role": "user",
         "content": [{"type": "tool_result", "tool_use_id": id, "content": text}]
-    }))
+    })
 }
 
 fn openai_tools_to_anthropic(tools: &Value) -> Result<Value, TranslateError> {
@@ -632,7 +656,7 @@ fn openai_tools_to_anthropic(tools: &Value) -> Result<Value, TranslateError> {
         let mut parameters = func
             .get("parameters")
             .cloned()
-            .unwrap_or(json!({"type": "object", "properties": {}}));
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
         if !parameters.is_object() {
             parameters = json!({"type": "object", "properties": {}});
         }
@@ -669,16 +693,30 @@ fn openai_tool_choice_to_anthropic(tc: &Value) -> Value {
 // responses request -> openai/anthropic request
 // ---------------------------------------------------------------------------
 
+/// Translate a Responses API request body into an `OpenAI` chat-completions
+/// request body.
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object, or
+/// [`TranslateError::Invalid`] when a field has an unexpected shape.
 pub fn responses_to_openai_request(body: Value) -> Result<Value, TranslateError> {
     responses_to_chat(body, false)
 }
 
+/// Translate a Responses API request body into an Anthropic Messages request
+/// body, keeping built-in tools (e.g. `web_search`) as synthetic functions.
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object, or
+/// [`TranslateError::Invalid`] when a field has an unexpected shape.
 pub fn responses_to_anthropic_request(body: Value) -> Result<Value, TranslateError> {
     let chat = responses_to_chat(body, true)?;
     openai_to_anthropic_request(chat)
 }
 
-/// Convert a Responses API request to an OpenAI chat-completions request.
+/// Convert a Responses API request to an `OpenAI` chat-completions request.
 /// When `keep_builtin_tools` is set, `web_search`/`web_fetch` are kept as
 /// synthetic function tools (for providers that cannot handle them natively,
 /// e.g. Anthropic).
@@ -707,7 +745,7 @@ fn responses_to_chat(body: Value, keep_builtin_tools: bool) -> Result<Value, Tra
             detail: "expected array".to_string(),
         })?;
         for item in arr {
-            convert_responses_item_to_chat(item, &mut messages)?;
+            convert_responses_item_to_chat(item, &mut messages);
         }
     }
     if !messages.is_empty() {
@@ -727,10 +765,7 @@ fn responses_to_chat(body: Value, keep_builtin_tools: bool) -> Result<Value, Tra
     Ok(out)
 }
 
-fn convert_responses_item_to_chat(
-    item: &Value,
-    out: &mut Vec<Value>,
-) -> Result<(), TranslateError> {
+fn convert_responses_item_to_chat(item: &Value, out: &mut Vec<Value>) {
     let itype = item
         .get("type")
         .and_then(Value::as_str)
@@ -745,7 +780,7 @@ fn convert_responses_item_to_chat(
                 Value::Array(arr) => {
                     for b in arr {
                         match b.get("type").and_then(Value::as_str) {
-                            Some("input_text") | Some("output_text") => {
+                            Some("input_text" | "output_text") => {
                                 blocks.push(json!({"type": "text", "text": b.get("text").cloned().unwrap_or(Value::Null)}));
                             }
                             Some("input_image") => {
@@ -828,7 +863,6 @@ fn convert_responses_item_to_chat(
         }
         _ => {}
     }
-    Ok(())
 }
 
 fn responses_tools_to_chat(
@@ -856,13 +890,13 @@ fn responses_tools_to_chat(
                 let parameters = tool
                     .get("parameters")
                     .cloned()
-                    .unwrap_or(json!({"type": "object", "properties": {}}));
+                    .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
                 out.push(json!({
                     "type": "function",
                     "function": {"name": name, "description": description, "parameters": parameters}
                 }));
             }
-            Some("web_search") | Some("web_fetch") if keep_builtin_tools => {
+            Some("web_search" | "web_fetch") if keep_builtin_tools => {
                 out.push(json!({
                     "type": "function",
                     "function": {
@@ -882,6 +916,13 @@ fn responses_tools_to_chat(
 // response conversions
 // ---------------------------------------------------------------------------
 
+/// Translate an Anthropic Messages response body into an `OpenAI`
+/// chat-completions response body.
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object.
+#[allow(clippy::needless_pass_by_value)]
 pub fn anthropic_to_openai_response(body: Value, model: &str) -> Result<Value, TranslateError> {
     let obj = body.as_object().ok_or(TranslateError::NotObject)?;
     let id = obj
@@ -963,6 +1004,13 @@ pub fn anthropic_to_openai_response(body: Value, model: &str) -> Result<Value, T
     }))
 }
 
+/// Translate an `OpenAI` chat-completions response body into an Anthropic
+/// Messages response body.
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object.
+#[allow(clippy::needless_pass_by_value)]
 pub fn openai_to_anthropic_response(body: Value, model: &str) -> Result<Value, TranslateError> {
     let obj = body.as_object().ok_or(TranslateError::NotObject)?;
     let id = obj
@@ -1040,6 +1088,13 @@ pub fn openai_to_anthropic_response(body: Value, model: &str) -> Result<Value, T
     }))
 }
 
+/// Translate an Anthropic Messages response body into a Responses API
+/// response body.
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object.
+#[allow(clippy::needless_pass_by_value)]
 pub fn anthropic_to_responses_response(body: Value, model: &str) -> Result<Value, TranslateError> {
     let obj = body.as_object().ok_or(TranslateError::NotObject)?;
     let id = obj
@@ -1102,6 +1157,13 @@ pub fn anthropic_to_responses_response(body: Value, model: &str) -> Result<Value
     }))
 }
 
+/// Translate an `OpenAI` chat-completions response body into a Responses API
+/// response body.
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object.
+#[allow(clippy::needless_pass_by_value)]
 pub fn openai_to_responses_response(body: Value, model: &str) -> Result<Value, TranslateError> {
     let obj = body.as_object().ok_or(TranslateError::NotObject)?;
     let id = obj
@@ -1193,14 +1255,19 @@ pub fn openai_to_responses_response(body: Value, model: &str) -> Result<Value, T
 // token usage
 // ---------------------------------------------------------------------------
 
+/// Aggregate token counts for a single request/response exchange.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct TokenUsage {
+    /// Number of input (prompt) tokens.
     pub input: u64,
+    /// Number of output (completion) tokens.
     pub output: u64,
+    /// Number of reasoning tokens, when reported by the upstream.
     pub reasoning: u64,
 }
 
-/// Tolerantly parse usage from any upstream shape (Anthropic, OpenAI, Responses).
+/// Tolerantly parse usage from any upstream shape (Anthropic, `OpenAI`, Responses).
+#[must_use]
 pub fn parse_usage(value: &Value) -> TokenUsage {
     let mut usage = TokenUsage::default();
     if let Some(obj) = value.as_object() {
@@ -1224,10 +1291,14 @@ fn num(v: Option<&Value>) -> Option<u64> {
     v.and_then(Value::as_u64)
 }
 
+/// Serialize [`TokenUsage`] into an Anthropic-style usage object.
+#[must_use]
 pub fn anthropic_usage(u: &TokenUsage) -> Value {
     json!({"input_tokens": u.input, "output_tokens": u.output})
 }
 
+/// Serialize [`TokenUsage`] into an `OpenAI`-style usage object.
+#[must_use]
 pub fn openai_usage(u: &TokenUsage) -> Value {
     let mut details = json!({});
     if u.reasoning > 0 {
@@ -1241,6 +1312,8 @@ pub fn openai_usage(u: &TokenUsage) -> Value {
     })
 }
 
+/// Serialize [`TokenUsage`] into a Responses-API-style usage object.
+#[must_use]
 pub fn responses_usage(u: &TokenUsage) -> Value {
     let mut out_details = json!({});
     if u.reasoning > 0 {
@@ -1260,7 +1333,8 @@ pub fn responses_usage(u: &TokenUsage) -> Value {
 // ---------------------------------------------------------------------------
 
 /// Strip fields that strict Anthropic upstreams reject: thinking/reasoning
-/// effort knobs and cache_control markers.
+/// effort knobs and `cache_control` markers.
+#[must_use]
 pub fn normalize_anthropic_request(body: &Value) -> Value {
     let mut out = strip_cache_control(body.clone());
     for key in [

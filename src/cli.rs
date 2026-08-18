@@ -18,6 +18,8 @@ const LOG_TARGET: &str = "local_proxy";
 // runtime files (~/.config/local-proxy/)
 // ---------------------------------------------------------------------------
 
+/// The runtime directory (`~/.config/local-proxy/`), honoring `LOCAL_PROXY_HOME`.
+#[must_use]
 pub fn config_dir() -> PathBuf {
     let base = std::env::var_os("LOCAL_PROXY_HOME")
         .map(PathBuf::from)
@@ -27,29 +29,43 @@ pub fn config_dir() -> PathBuf {
     base.join(".config").join("local-proxy")
 }
 
+/// Path to the file holding the proxy's process ID.
+#[must_use]
 pub fn pid_file() -> PathBuf {
     config_dir().join("pid")
 }
 
+/// Path to the proxy's log file.
+#[must_use]
 pub fn log_file() -> PathBuf {
     config_dir().join("local-proxy.log")
 }
 
+/// Write the given process ID to the pid file, creating the runtime dir if needed.
+///
+/// # Errors
+///
+/// Returns an error if the runtime directory cannot be created or the pid file
+/// cannot be written.
 pub fn write_pid(pid: u32) -> io::Result<()> {
     std::fs::create_dir_all(config_dir())?;
     std::fs::write(pid_file(), pid.to_string())
 }
 
+/// Remove the pid file, ignoring errors if it does not exist.
 pub fn remove_pid() {
     let _ = std::fs::remove_file(pid_file());
 }
 
+/// Read the stored process ID, if any.
+#[must_use]
 pub fn read_pid() -> Option<u32> {
     std::fs::read_to_string(pid_file())
         .ok()
         .and_then(|s| s.trim().parse().ok())
 }
 
+/// Best-effort kill of the given process ID.
 pub fn stop_process(pid: u32) {
     #[cfg(windows)]
     let _ = Command::new("taskkill")
@@ -60,6 +76,7 @@ pub fn stop_process(pid: u32) {
 }
 
 /// Is something accepting TCP connections at host:port (proxy likely up)?
+#[must_use]
 pub fn is_serving(host: &str, port: u16) -> bool {
     let addr = format!("{host}:{port}");
     if let Ok(mut addrs) = addr.to_socket_addrs() {
@@ -71,6 +88,11 @@ pub fn is_serving(host: &str, port: u16) -> bool {
 }
 
 /// Spawn this same binary detached (background) with the given args.
+///
+/// # Errors
+///
+/// Returns an error if the current executable, runtime directory, or log file
+/// cannot be set up, or if the process cannot be spawned.
 pub fn spawn_background(args: &[String]) -> io::Result<std::process::Child> {
     let exe = std::env::current_exe()?;
     std::fs::create_dir_all(config_dir())?;
@@ -105,6 +127,13 @@ pub fn spawn_background(args: &[String]) -> io::Result<std::process::Child> {
 // serve
 // ---------------------------------------------------------------------------
 
+/// Start the proxy server, either detached in the background or in the
+/// foreground, binding to the configured host and port.
+///
+/// # Errors
+///
+/// Returns an error if the config cannot be loaded, the router or clients
+/// cannot be built, the listener cannot bind, or serving fails.
 pub async fn serve(
     config_path: PathBuf,
     host_flag: Option<String>,
@@ -171,6 +200,7 @@ fn init_tracing() {
 // ---------------------------------------------------------------------------
 
 /// The env vars that make an Anthropic-compatible tool point at this proxy.
+#[must_use]
 pub fn launch_environment(config: &Config, model: Option<&str>) -> Vec<(String, String)> {
     let base = format!("http://{}:{}", config.server.host, config.server.port);
     let auth = config
@@ -198,6 +228,14 @@ fn tool_command_name(tool: &str) -> &'static str {
     }
 }
 
+/// Launch the given CLI tool against this proxy, starting the proxy in the
+/// background first if it is not already serving.
+///
+/// # Errors
+///
+/// Returns an error if the config cannot be loaded, the proxy cannot be
+/// started, or the tool cannot be spawned.
+#[allow(clippy::needless_pass_by_value)]
 pub fn launch(
     config_path: PathBuf,
     tool: &str,
@@ -264,6 +302,12 @@ pub fn launch(
 // status / stop / models
 // ---------------------------------------------------------------------------
 
+/// Print whether the proxy is currently running.
+///
+/// # Errors
+///
+/// Returns an error if the config cannot be loaded.
+#[allow(clippy::needless_pass_by_value)]
 pub fn status(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let config = Config::load(&config_path)?;
     let running = is_serving(&config.server.host, config.server.port);
@@ -279,25 +323,35 @@ pub fn status(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Stop the running proxy, killing the recorded process.
+///
+/// # Errors
+///
+/// Returns an error only if the config must be loaded to check reachability
+/// and that load fails.
+#[allow(clippy::needless_pass_by_value)]
 pub fn stop(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    match read_pid() {
-        Some(pid) => {
-            stop_process(pid);
-            remove_pid();
-            println!("stopped (pid {pid})");
-        }
-        None => {
-            let config = Config::load(&config_path)?;
-            if is_serving(&config.server.host, config.server.port) {
-                println!("proxy is reachable but no pid file was found; not stopped");
-            } else {
-                println!("not running");
-            }
+    if let Some(pid) = read_pid() {
+        stop_process(pid);
+        remove_pid();
+        println!("stopped (pid {pid})");
+    } else {
+        let config = Config::load(&config_path)?;
+        if is_serving(&config.server.host, config.server.port) {
+            println!("proxy is reachable but no pid file was found; not stopped");
+        } else {
+            println!("not running");
         }
     }
     Ok(())
 }
 
+/// Print the list of models the proxy can route to.
+///
+/// # Errors
+///
+/// Returns an error if the config cannot be loaded or the router cannot be built.
+#[allow(clippy::needless_pass_by_value)]
 pub fn models(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     let config = Arc::new(Config::load(&config_path)?);
     let router = Router::new(config)?;
@@ -307,6 +361,8 @@ pub fn models(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
     Ok(())
 }
 
+/// Resolve the config path from an explicit flag, the environment, or the default.
+#[must_use]
 pub fn resolve_config_path(flag: Option<PathBuf>) -> PathBuf {
     flag.or_else(Config::env_config_path)
         .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
@@ -319,7 +375,7 @@ pub fn resolve_config_path(flag: Option<PathBuf>) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::Server;
+    use crate::config::{Defaults, Server};
 
     fn config_with(keys: Vec<String>) -> Config {
         Config {
@@ -331,7 +387,7 @@ mod tests {
             },
             providers: Vec::new(),
             routes: Vec::new(),
-            defaults: Default::default(),
+            defaults: Defaults::default(),
         }
     }
 
