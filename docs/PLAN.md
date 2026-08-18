@@ -31,8 +31,14 @@ Streaming: todos os `POST` suportam `stream: true` via SSE, com tradução **eve
 ## Config (aceita JSON)
 
 A config principal vive no diretório de config do usuário: `%APPDATA%\local-proxy\config.yaml`
-(Windows) ou `~/.config/local-proxy/config.yaml` (Unix). Os arquivos de runtime (pid + log) ficam
-no mesmo diretório.
+(Windows) ou `~/.config/local-proxy/config.yaml` (Unix). Os arquivos de runtime (pid + log +
+`auth.json`) ficam no mesmo diretório.
+
+**Catálogo embutido + overlay:** o binário embute um catálogo de providers (`src/catalog.yaml`,
+via `include_str!`) com todos os suportados (anthropic, openai, opencode-go, zen, groq, xai, google,
+deepseek, openrouter). A config do usuário é um **overlay**: provider com mesmo nome sobrescreve o do
+catálogo; nome novo adiciona; rotas e `defaults` da config vencem. O `DEFAULT_CONFIG` é mínimo
+(`server:` apenas).
 
 **Resolução (precedência):**
 1. Flag explícita `--config <path>`.
@@ -50,29 +56,49 @@ server:
   api_keys: [sk-proxy]        # auth opcional (X-API-Key / Bearer); launcher usa a primeira
   passthrough_keys: false      # true = repassa a key do cliente ao upstream
 
+# Overlay: sobrescreve "openai" do catálogo / adiciona "zen"
 providers:
-  - name: anthropic
-    base_url: https://api.anthropic.com
-    api_key_env: ANTHROPIC_API_KEY
-    format: anthropic
-    models: [claude-sonnet-4-5]
-  - name: openai
-    base_url: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
+  - name: zen
+    base_url: https://opencode.ai/zen
+    api_key_env: OPENCODE_ZEN_KEY
     format: openai
-    models: [gpt-4o]
+    models: [deepseek-v4-flash-free]
 
 routes:
-  - model: claude-sonnet            # prefix: true casa claude-sonnet-4-5 etc.
-    provider: opencode
-    prefix: true
-    upstream_model: kimi-k2.6
-  - model: gpt-4o
-    provider: openai
+  - model: deepseek-free       # prefix: true casa deepseek-free-4-5 etc.
+    provider: zen
+    upstream_model: deepseek-v4-flash-free
 
 defaults:
-  provider: anthropic               # fallback final (nome do modelo passa inalterado)
+  provider: anthropic          # fallback final (nome do modelo passa inalterado)
+  model: null                  # modelo ativo (persistido via MCP models(select)); "" = não usar
 ```
+
+## Auth (`auth.json`)
+
+Chaves ficam em `auth.json` no config dir global, formato do opencode:
+`{ "<provider>": { "type": "api", "key": "..." } }`, com escrita atômica (temp+rename).
+`connect <provider> [key]` valida que o provider existe (catálogo ∪ config) e só grava a chave
+(prompt oculto via `rpassword`); `disconnect` remove.
+Resolução da chave por request: `api_key` inline → `auth.json[provider]` → `api_key_env`.
+
+## Hot-reload (file watcher)
+
+`AppState` guarda `RuntimeState { config (merged), router, clients }` em `Arc<RwLock<...>>`; handlers
+leem um snapshot por request (`state.snapshot().await`). `serve` spawna um watcher
+(`notify` + `notify-debouncer-full`, debounce 300ms) no config dir + pai do `config_path`; em mudança
+de `config.yaml`/`auth.json`, reconstrói o estado via `build_runtime_state` (catalog merge + router +
+clients) e atualiza a lock — **sem reiniciar**. `connect`/`select` do MCP dependem disso para aplicar
+em runtime.
+
+## MCP (`local-proxy mcp`, rmcp)
+
+Servidor MCP **stdio** (`rmcp` 3.x, `#[tool_router(server_handler)]`) com tools:
+- `connect(provider, key)` / `disconnect(provider)` — mesma lógica do CLI.
+- `providers()` — providers efetivos + key status.
+- `models([select])` — lista modelos efetivos; com `select` valida e persiste `defaults.model` no
+  config. Com `defaults.model` setado, `resolve_model` **ignora o modelo do harness** e roteia pelo
+  selecionado; `select: ""` limpa.
 
 ## Roteamento (`src/router.rs`) — precedência
 
@@ -154,7 +180,9 @@ Truncar `tool_result` a 120k chars ao reenviar (Anthropic impõe limite).
   `ANTHROPIC_SMALL_FAST_MODEL` se `--model`, executa `claude args`.
 - `launch design [-- args...]` — idem p/ Claude Design (`ANTHROPIC_BASE_URL` + auth).
 - `status` / `stop` — pid file.
-- `models` — lista modelos roteados.
+- `models` — lista modelos roteados (efetivos).
+- `connect <provider> [key]` / `disconnect <provider>` / `providers` — auth store (`auth.json`).
+- `mcp` — servidor MCP stdio (rmcp).
 - `update [--check] [--force] [--repo owner/repo] [--no-verify]` — baixa o binário mais recente do
   último release do GitHub (padrão `gsporto226/local-proxy` ou `$env:LOCAL_PROXY_REPO`), verifica
   SHA256 (`sha2`) e faz *stage* como `<bin>.new` ao lado do executável em uso, imprimindo o comando
@@ -166,15 +194,18 @@ Truncar `tool_result` a 120k chars ao reenviar (Anthropic impõe limite).
 ```
 src/
 ├── main.rs        CLI + boot (erros com miette, códigos config::/cli::)
-├── config.rs      Config/Provider/Route, load YAML/JSON — global, auto-criado
-├── cli.rs         serve/launch/status/stop/models/update + erros miette
+├── config.rs      Config/Provider/Route/Defaults (YAML/JSON) — overlay, auto-created
+├── catalog.rs     catálogo embutido (catalog.yaml) + merge catálogo↔config
+├── auth.rs        auth.json (keys) + escrita atômica
+├── cli.rs         serve/launch/status/stop/models/connect/disconnect/providers/mcp/update
 ├── router.rs      resolve_model → (Provider, upstream_model)
-├── upstream.rs    chamada HTTP + streaming por formato
+├── upstream.rs    chamada HTTP + resolução de chave (inline > auth > env)
 ├── translate.rs   requests/responses A↔O↔Responses
 ├── sse.rs         parser de frames SSE
 ├── streams.rs     máquinas de estado de streaming (3 direções)
+├── mcp.rs         servidor MCP stdio (rmcp): connect/disconnect/providers/models(select)
 ├── error.rs       ApiError + shape por formato
-└── handlers.rs    axum handlers + auth + /v1/models + count_tokens
+└── handlers.rs    axum handlers + RuntimeState (RwLock) + watcher hot-reload + /v1/models + count_tokens
 ```
 
 ## Fases (kanban)
@@ -184,6 +215,11 @@ src/
 3. **003 Streaming**: SSE + máquinas de estado nas 3 direções
 4. **004 CLI launcher**: serve bg + launch claude/design + status/stop
 5. **005 Testes + docs (QA)**: unit, integração e2e (mock upstream axum), README, config.example.yaml
+6. **006 Catálogo embutido + overlay**: catalog.yaml/catalog.rs + merge + DEFAULT_CONFIG mínimo
+7. **007 Auth + connect**: auth.json, connect/disconnect/providers, resolução inline>auth>env
+8. **008 Hot-reload**: RuntimeState em RwLock + file watcher (notify) sem reinício
+9. **009 MCP + select**: servidor rmcp stdio + models(select) persistido + override de roteamento
+10. **010 QA**: unit novos + e2e + docs + gate AGENTS.md
 
 ## Fora de escopo (v1)
 
