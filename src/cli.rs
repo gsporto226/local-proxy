@@ -3,10 +3,13 @@
 
 use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
+
+use miette::Diagnostic;
+use thiserror::Error;
 
 use crate::config::{Config, DEFAULT_CONFIG_PATH};
 use crate::handlers::{self, AppState};
@@ -15,18 +18,67 @@ use crate::router::Router;
 const LOG_TARGET: &str = "local_proxy";
 
 // ---------------------------------------------------------------------------
-// runtime files (~/.config/local-proxy/)
+// errors
 // ---------------------------------------------------------------------------
 
-/// The runtime directory (`~/.config/local-proxy/`), honoring `LOCAL_PROXY_HOME`.
+/// Errors surfaced by the CLI, formatted richly via miette.
+#[derive(Debug, Error, Diagnostic)]
+pub enum CliError {
+    /// Configuration could not be loaded or parsed.
+    #[error("failed to load configuration")]
+    #[diagnostic(
+        code(cli::config),
+        help("check that the config file exists and is valid YAML/JSON")
+    )]
+    Config(#[from] crate::config::ConfigError),
+
+    /// The router could not be built from the configuration.
+    #[error("failed to build router")]
+    #[diagnostic(
+        code(cli::router),
+        help("every route must reference a configured provider")
+    )]
+    Router(#[from] crate::router::RouterError),
+
+    /// The upstream HTTP clients could not be built.
+    #[error("failed to build upstream HTTP clients")]
+    #[diagnostic(
+        code(cli::clients),
+        help("check that every provider has a valid base_url and API key env var")
+    )]
+    Clients(#[from] crate::upstream::UpstreamError),
+
+    /// An operating-system level I/O operation failed.
+    #[error("I/O error: {0}")]
+    #[diagnostic(code(cli::io))]
+    Io(#[from] std::io::Error),
+
+    /// The HTTP server could not start or serve.
+    #[error("failed to serve HTTP: {0}")]
+    #[diagnostic(code(cli::serve))]
+    Serve(#[from] axum::Error),
+
+    /// An external CLI tool could not be spawned.
+    #[error("{message}")]
+    #[diagnostic(
+        code(cli::tool),
+        help("ensure the CLI tool is installed and on PATH")
+    )]
+    Tool {
+        /// Human-readable description of the failure.
+        message: String,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// runtime files (global per-user config dir)
+// ---------------------------------------------------------------------------
+
+/// The runtime directory (the global per-user config dir), shared by config,
+/// pid, and log files.
 #[must_use]
 pub fn config_dir() -> PathBuf {
-    let base = std::env::var_os("LOCAL_PROXY_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("USERPROFILE").map(PathBuf::from))
-        .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
-        .unwrap_or_else(|| PathBuf::from("."));
-    base.join(".config").join("local-proxy")
+    crate::config::global_config_dir()
 }
 
 /// Path to the file holding the proxy's process ID.
@@ -124,6 +176,33 @@ pub fn spawn_background(args: &[String]) -> io::Result<std::process::Child> {
 }
 
 // ---------------------------------------------------------------------------
+// config loading
+// ---------------------------------------------------------------------------
+
+/// Load configuration for the CLI, auto-creating the default global config on
+/// first run.
+///
+/// If `config_path` is the global default and it does not exist yet, a default
+/// config is written there and a message is printed so the user can edit it.
+/// Explicit flag/env/cwd paths are never auto-created; their load errors are
+/// surfaced as-is.
+///
+/// # Errors
+///
+/// Returns a [`CliError::Config`] if the config cannot be created or loaded.
+#[allow(clippy::result_large_err)]
+fn load_config(config_path: &Path) -> Result<Config, CliError> {
+    if config_path == crate::config::global_config_path() && !config_path.exists() {
+        crate::config::create_default_config(config_path).map_err(CliError::from)?;
+        println!(
+            "criado config default em {} — edite e rode de novo",
+            config_path.display()
+        );
+    }
+    Config::load(config_path).map_err(CliError::from)
+}
+
+// ---------------------------------------------------------------------------
 // serve
 // ---------------------------------------------------------------------------
 
@@ -139,7 +218,7 @@ pub async fn serve(
     host_flag: Option<String>,
     port_flag: Option<u16>,
     background: bool,
-) -> Result<(), Box<dyn std::error::Error>> {
+) -> miette::Result<()> {
     if background {
         let mut args = vec![
             "serve".to_string(),
@@ -154,7 +233,7 @@ pub async fn serve(
             args.push("--port".to_string());
             args.push(p.to_string());
         }
-        let child = spawn_background(&args)?;
+        let child = spawn_background(&args).map_err(CliError::from)?;
         println!(
             "started in background (pid {}), log: {}",
             child.id(),
@@ -164,11 +243,11 @@ pub async fn serve(
     }
 
     init_tracing();
-    let config = Arc::new(Config::load(&config_path)?);
+    let config = Arc::new(load_config(&config_path)?);
     tracing::info!(target: LOG_TARGET, path = %config_path.display(), "loaded config");
 
-    let router = Arc::new(Router::new(config.clone())?);
-    let clients = Arc::new(handlers::build_clients(&config)?);
+    let router = Arc::new(Router::new(config.clone()).map_err(CliError::from)?);
+    let clients = Arc::new(handlers::build_clients(&config).map_err(CliError::from)?);
     let state = AppState {
         config,
         router,
@@ -180,12 +259,14 @@ pub async fn serve(
     let addr = format!("{host}:{port}");
     let app = handlers::app(state);
 
-    let listener = tokio::net::TcpListener::bind(&addr).await?;
-    write_pid(std::process::id())?;
+    let listener = tokio::net::TcpListener::bind(&addr)
+        .await
+        .map_err(CliError::from)?;
+    write_pid(std::process::id()).map_err(CliError::from)?;
     tracing::info!(target: LOG_TARGET, %addr, "listening");
     let result = axum::serve(listener, app).await;
     remove_pid();
-    result?;
+    result.map_err(CliError::from)?;
     Ok(())
 }
 
@@ -243,8 +324,8 @@ pub fn launch(
     yes: bool,
     dry_run: bool,
     args: Vec<String>,
-) -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::load(&config_path)?;
+) -> miette::Result<()> {
+    let config = load_config(&config_path)?;
     let host = config.server.host.clone();
     let port = config.server.port;
     let tool_cmd = tool_command_name(tool);
@@ -254,7 +335,8 @@ pub fn launch(
             "serve".to_string(),
             "--config".to_string(),
             config_path.display().to_string(),
-        ])?;
+        ])
+        .map_err(CliError::from)?;
         println!("proxy started in background (pid {})", bg.id());
         for _ in 0..50 {
             if is_serving(&host, port) {
@@ -290,10 +372,10 @@ pub fn launch(
         cmd.arg("--yes");
     }
     cmd.args(&args);
-    let status = cmd.status().map_err(|e| {
-        Box::<dyn std::error::Error>::from(format!(
+    let status = cmd.status().map_err(|e| CliError::Tool {
+        message: format!(
             "failed to spawn '{tool_cmd}' (is it installed and on PATH?): {e}"
-        ))
+        ),
     })?;
     std::process::exit(status.code().unwrap_or(1));
 }
@@ -308,8 +390,8 @@ pub fn launch(
 ///
 /// Returns an error if the config cannot be loaded.
 #[allow(clippy::needless_pass_by_value)]
-pub fn status(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let config = Config::load(&config_path)?;
+pub fn status(config_path: PathBuf) -> miette::Result<()> {
+    let config = load_config(&config_path)?;
     let running = is_serving(&config.server.host, config.server.port);
     match read_pid() {
         Some(pid) if running => println!(
@@ -330,13 +412,13 @@ pub fn status(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 /// Returns an error only if the config must be loaded to check reachability
 /// and that load fails.
 #[allow(clippy::needless_pass_by_value)]
-pub fn stop(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
+pub fn stop(config_path: PathBuf) -> miette::Result<()> {
     if let Some(pid) = read_pid() {
         stop_process(pid);
         remove_pid();
         println!("stopped (pid {pid})");
     } else {
-        let config = Config::load(&config_path)?;
+        let config = load_config(&config_path)?;
         if is_serving(&config.server.host, config.server.port) {
             println!("proxy is reachable but no pid file was found; not stopped");
         } else {
@@ -352,20 +434,38 @@ pub fn stop(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
 ///
 /// Returns an error if the config cannot be loaded or the router cannot be built.
 #[allow(clippy::needless_pass_by_value)]
-pub fn models(config_path: PathBuf) -> Result<(), Box<dyn std::error::Error>> {
-    let config = Arc::new(Config::load(&config_path)?);
-    let router = Router::new(config)?;
+pub fn models(config_path: PathBuf) -> miette::Result<()> {
+    let config = Arc::new(load_config(&config_path)?);
+    let router = Router::new(config).map_err(CliError::from)?;
     for m in router.list_models() {
         println!("{m}");
     }
     Ok(())
 }
 
-/// Resolve the config path from an explicit flag, the environment, or the default.
+/// Resolve the config path from an explicit flag, the environment, the current
+/// working directory, or the global default.
+///
+/// Precedence: an explicit `--config` flag, then `LOCAL_PROXY_CONFIG`, then a
+/// `config.yaml`/`config.json` in the current working directory (only if one
+/// exists), then the global per-user default. Flag/env paths are returned as-is
+/// without checking existence; only the working-directory candidates are
+/// existence-checked.
 #[must_use]
 pub fn resolve_config_path(flag: Option<PathBuf>) -> PathBuf {
-    flag.or_else(Config::env_config_path)
-        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH))
+    if let Some(path) = flag {
+        return path;
+    }
+    if let Some(path) = Config::env_config_path() {
+        return path;
+    }
+    for name in [DEFAULT_CONFIG_PATH, "config.json"] {
+        let candidate = PathBuf::from(name);
+        if candidate.exists() {
+            return std::env::current_dir().map_or(candidate, |dir| dir.join(name));
+        }
+    }
+    crate::config::global_config_path()
 }
 
 // ---------------------------------------------------------------------------
@@ -425,5 +525,38 @@ mod tests {
     fn runtime_paths_live_under_config_dir() {
         assert!(pid_file().to_string_lossy().contains("local-proxy"));
         assert!(log_file().to_string_lossy().contains("local-proxy"));
+    }
+
+    #[test]
+    fn config_dir_is_global() {
+        assert_eq!(config_dir(), crate::config::global_config_dir());
+    }
+
+    #[test]
+    fn resolve_config_path_uses_cwd_yaml_when_present() {
+        let prev = std::env::current_dir().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("config.yaml"), "server: {}\n").unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = resolve_config_path(None);
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(result, tmp.path().join("config.yaml"));
+    }
+
+    #[test]
+    fn resolve_config_path_defaults_to_global_when_no_cwd_file() {
+        let prev = std::env::current_dir().unwrap();
+        std::env::remove_var("LOCAL_PROXY_CONFIG");
+        let tmp = tempfile::tempdir().unwrap();
+        std::env::set_current_dir(tmp.path()).unwrap();
+        let result = resolve_config_path(None);
+        std::env::set_current_dir(prev).unwrap();
+        assert_eq!(result, crate::config::global_config_path());
+    }
+
+    #[test]
+    fn resolve_config_path_explicit_flag_wins() {
+        let explicit = PathBuf::from("/explicit/custom.yaml");
+        assert_eq!(resolve_config_path(Some(explicit.clone())), explicit);
     }
 }

@@ -1,6 +1,6 @@
 # PENDING / status de trabalho
 
-Estado atual do proxy `local-proxy`. Última atualização: 2026-08-17.
+Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
 
 ## ✅ TODAS AS TASKS CONCLUÍDAS (kanban: backend 001-004, qa 005 — todas `done`)
 
@@ -17,6 +17,19 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-17.
 - `bun test e2e/mock.test.ts`: 17 testes determinísticos verdes.
 - `bun test e2e/live-zen.test.ts`: 6 testes contra opencode-zen real — **environmental skip** enquanto o
   modelo free estiver em `FreeUsageLimitError` (rate limit); validam de verdade quando a quota permitir.
+
+### Nova rodada — config global, default embutido e erros com miette
+- Config principal agora vive no diretório de config do usuário (`%APPDATA%\local-proxy\config.yaml`
+  no Windows, `~/.config/local-proxy/config.yaml` no Unix); pid + log ficam no mesmo diretório.
+- Resolução por precedência: `--config` → `LOCAL_PROXY_CONFIG` → `config.yaml`/`config.json` no cwd
+  (override project-local, só se existir) → global default.
+- Default global auto-criado a partir de um config embutido, com mensagem indicando onde foi criado
+  e para editar e rodar de novo.
+- Erros de CLI reportados com **miette** (códigos `config::io`, `config::parse`, `cli::...`,
+  contexto-fonte em parse YAML/JSON). O shape `ApiError` para o cliente HTTP (Anthropic/OpenAI)
+  permanece inalterado.
+- Verificação pendente: `cargo test`, `cargo clippy --all-targets -- -D warnings` e a suíte e2e
+  (`bun test e2e/mock.test.ts`, `bun test e2e/live-zen.test.ts`) após a mudança.
 
 ### Entregas
 - Proxy completo (endpoints, tradução A↔O↔Responses, streaming, erros, auth, count_tokens, /v1/models).

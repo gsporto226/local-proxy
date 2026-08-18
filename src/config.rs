@@ -9,6 +9,56 @@ pub const ENV_CONFIG_PATH: &str = "LOCAL_PROXY_CONFIG";
 /// Default config file path used when no override is provided.
 pub const DEFAULT_CONFIG_PATH: &str = "config.yaml";
 
+/// Complete default configuration embedded in the binary, written on first run
+/// when no config file exists yet. Mirrors `config.example.yaml`.
+pub const DEFAULT_CONFIG: &str = r"# local-proxy default configuration.
+# Copy this file to your config directory and edit it to taste.
+
+server:
+  host: 127.0.0.1
+  port: 8787
+  api_keys:
+    - sk-proxy
+  passthrough_keys: false
+
+providers:
+  - name: anthropic
+    base_url: https://api.anthropic.com
+    api_key_env: ANTHROPIC_API_KEY
+    format: anthropic
+    models:
+      - claude-sonnet-4-5
+      - claude-opus-4-1
+  - name: openai
+    base_url: https://api.openai.com/v1
+    api_key_env: OPENAI_API_KEY
+    format: openai
+    models:
+      - gpt-4o
+  - name: zen
+    base_url: https://opencode.ai/zen
+    api_key_env: OPENCODE_ZEN_KEY
+    format: openai
+    models:
+      - deepseek-v4-flash-free
+      - claude-sonnet-4-5
+      - gpt-5.1
+
+routes:
+  - model: claude-sonnet
+    provider: anthropic
+    prefix: true
+    upstream_model: claude-sonnet-4-5
+  - model: gpt-4o
+    provider: openai
+  - model: deepseek-free
+    provider: zen
+    upstream_model: deepseek-v4-flash-free
+
+defaults:
+  provider: anthropic
+";
+
 /// Wire format a provider's API expects (`Anthropic` vs `OpenAI`).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -97,25 +147,87 @@ pub struct Config {
     pub defaults: Defaults,
 }
 
-/// Errors that can occur while loading or parsing configuration.
-#[derive(Debug, thiserror::Error)]
+/// Errors that can occur while loading, parsing, or creating configuration.
+#[derive(Debug, thiserror::Error, miette::Diagnostic)]
 pub enum ConfigError {
     /// Failed to read the config file from disk.
     #[error("failed to read config file {path}: {source}")]
+    #[diagnostic(code(config::io))]
     Io {
         /// Path of the file that could not be read.
         path: String,
         /// Underlying I/O error.
+        #[source]
         source: std::io::Error,
     },
     /// Failed to parse the config contents.
     #[error("failed to parse config as {kind}: {source}")]
+    #[diagnostic(code(config::parse))]
+    #[diagnostic(help("fix the highlighted portion of the config and try again"))]
     Parse {
         /// Format that was attempted ("JSON" or "YAML").
         kind: &'static str,
+        /// Name used to label the source (file path, or `<config>`).
+        name: String,
+        /// Full config contents, attached so the diagnostic can render context.
+        #[source_code]
+        content: miette::NamedSource<String>,
+        /// Byte span of the offending location in `content`.
+        #[label("parse error here")]
+        span: miette::SourceSpan,
         /// Underlying parse error.
+        #[source]
         source: Box<dyn std::error::Error + Send + Sync>,
     },
+    /// Failed to create the default config file.
+    #[error("failed to write default config to {path}: {source}")]
+    #[diagnostic(code(config::create))]
+    Create {
+        /// Path of the file that could not be written.
+        path: String,
+        /// Underlying I/O error.
+        #[source]
+        source: std::io::Error,
+    },
+}
+
+impl ConfigError {
+    /// Build a [`ConfigError::Parse`], computing the [`miette::SourceSpan`] from
+    /// a 1-indexed line/column location in `content`.
+    fn parse_error(
+        kind: &'static str,
+        name: &str,
+        content: &str,
+        line: usize,
+        column: usize,
+        source: Box<dyn std::error::Error + Send + Sync>,
+    ) -> Self {
+        let offset = byte_offset(content, line, column);
+        Self::Parse {
+            kind,
+            name: name.to_string(),
+            content: miette::NamedSource::new(name, content.to_string()),
+            span: miette::SourceSpan::new(offset.into(), 0),
+            source,
+        }
+    }
+}
+
+/// Compute the byte offset in `content` of the given 1-indexed `line`/`column`,
+/// clamping out-of-range values to the nearest valid position.
+#[must_use]
+fn byte_offset(content: &str, line: usize, column: usize) -> usize {
+    let line = line.saturating_sub(1);
+    let column = column.saturating_sub(1);
+    let mut start = 0usize;
+    for _ in 0..line {
+        match content[start..].find('\n') {
+            Some(i) => start += i + 1,
+            None => return content.len(),
+        }
+    }
+    let line_len = content[start..].find('\n').map_or(content.len() - start, |i| i);
+    start + column.min(line_len)
 }
 
 impl Config {
@@ -125,6 +237,7 @@ impl Config {
     /// # Errors
     ///
     /// Returns [`ConfigError`] if the file cannot be read or parsed.
+    #[allow(clippy::result_large_err)]
     pub fn load(path: impl AsRef<Path>) -> Result<Self, ConfigError> {
         let path = path.as_ref();
         let content = std::fs::read_to_string(path).map_err(|source| ConfigError::Io {
@@ -136,7 +249,7 @@ impl Config {
             .and_then(|e| e.to_str())
             .map(str::to_ascii_lowercase)
             .unwrap_or_default();
-        Self::from_str(&content, &ext)
+        Self::parse(&content, &ext, &path.display().to_string())
     }
 
     /// Parse configuration from `content`, using `ext` to select the parser
@@ -146,15 +259,31 @@ impl Config {
     ///
     /// Returns [`ConfigError::Parse`] if `content` is not valid for the
     /// detected format.
+    #[allow(clippy::result_large_err)]
     pub fn from_str(content: &str, ext: &str) -> Result<Self, ConfigError> {
+        Self::parse(content, ext, "<config>")
+    }
+
+    /// Parse `content` using the parser selected by `ext`, labelling any parse
+    /// error with `name`.
+    #[allow(clippy::result_large_err)]
+    fn parse(content: &str, ext: &str, name: &str) -> Result<Self, ConfigError> {
         match ext {
-            "json" => serde_json::from_str(content).map_err(|source| ConfigError::Parse {
-                kind: "JSON",
-                source: Box::new(source),
+            "json" => serde_json::from_str(content).map_err(|source| {
+                ConfigError::parse_error(
+                    "JSON",
+                    name,
+                    content,
+                    source.line(),
+                    source.column(),
+                    Box::new(source),
+                )
             }),
-            _ => serde_yaml::from_str(content).map_err(|source| ConfigError::Parse {
-                kind: "YAML",
-                source: Box::new(source),
+            _ => serde_yaml::from_str(content).map_err(|source| {
+                let (line, column) = source
+                    .location()
+                    .map_or((1, 1), |loc| (loc.line(), loc.column()));
+                ConfigError::parse_error("YAML", name, content, line, column, Box::new(source))
             }),
         }
     }
@@ -168,6 +297,61 @@ impl Config {
             .filter(|p| !p.is_empty())
             .map(PathBuf::from)
     }
+}
+
+/// Returns the per-user config directory for local-proxy.
+///
+/// Prefers `directories::ProjectDirs` (`.config_dir()`): on Windows this is
+/// `%APPDATA%\local-proxy`, on Unix `~/.config/local-proxy`. Falls back to the
+/// `APPDATA` (Windows) or `HOME`/`USERPROFILE` environment variables, and
+/// finally to a local `.config/local-proxy` directory. Never panics.
+#[must_use]
+pub fn global_config_dir() -> PathBuf {
+    if let Some(dirs) = directories::ProjectDirs::from("", "", "local-proxy") {
+        return dirs.config_dir().to_path_buf();
+    }
+
+    #[cfg(windows)]
+    {
+        if let Some(appdata) = std::env::var_os("APPDATA") {
+            return PathBuf::from(appdata).join("local-proxy");
+        }
+    }
+
+    if let Some(home) = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE")) {
+        return PathBuf::from(home).join(".config").join("local-proxy");
+    }
+
+    PathBuf::from(".").join(".config").join("local-proxy")
+}
+
+/// Returns the default global config file path, i.e.
+/// `global_config_dir()/config.yaml`.
+#[must_use]
+pub fn global_config_path() -> PathBuf {
+    global_config_dir().join("config.yaml")
+}
+
+/// Create `path` (and its parent directories) and write the embedded
+/// [`DEFAULT_CONFIG`] contents to it.
+///
+/// # Errors
+///
+/// Returns [`ConfigError::Create`] if the parent directories cannot be created
+/// or the file cannot be written.
+#[allow(clippy::result_large_err)]
+pub fn create_default_config(path: impl AsRef<Path>) -> Result<(), ConfigError> {
+    let path = path.as_ref();
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).map_err(|source| ConfigError::Create {
+            path: path.display().to_string(),
+            source,
+        })?;
+    }
+    std::fs::write(path, DEFAULT_CONFIG).map_err(|source| ConfigError::Create {
+        path: path.display().to_string(),
+        source,
+    })
 }
 
 impl fmt::Display for ProviderFormat {
@@ -285,5 +469,46 @@ mod tests {
             Some(Path::new("custom.yaml"))
         );
         std::env::remove_var(ENV_CONFIG_PATH);
+    }
+
+    #[test]
+    fn global_config_path_ends_with_config_yaml() {
+        let path = global_config_path();
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("config.yaml")
+        );
+    }
+
+    #[test]
+    fn default_config_parses() {
+        let config = Config::from_str(DEFAULT_CONFIG, "yaml").expect("default config parses");
+        assert_eq!(config.server.host, "127.0.0.1");
+        assert_eq!(config.server.port, 8787);
+        assert_eq!(config.server.api_keys, vec!["sk-proxy".to_string()]);
+        assert!(!config.server.passthrough_keys);
+        assert_eq!(config.providers.len(), 3);
+        assert_eq!(config.routes.len(), 3);
+        assert_eq!(config.defaults.provider, "anthropic");
+    }
+
+    #[test]
+    fn create_default_config_writes_parseable_file() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is set")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "local-proxy-create-default-{}-{stamp}",
+            std::process::id()
+        ));
+        let path = dir.join("config.yaml");
+        create_default_config(&path).expect("create default config");
+
+        let config = Config::load(&path).expect("loaded default config");
+        assert_eq!(config.server.port, 8787);
+        assert_eq!(config.providers.len(), 3);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

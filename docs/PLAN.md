@@ -28,7 +28,20 @@ Claude Code via OpenCode Go), generalizado para **múltiplos providers configur�
 
 Streaming: todos os `POST` suportam `stream: true` via SSE, com tradução **evento-a-evento**.
 
-## Config (`config.yaml`, aceita JSON)
+## Config (aceita JSON)
+
+A config principal vive no diretório de config do usuário: `%APPDATA%\local-proxy\config.yaml`
+(Windows) ou `~/.config/local-proxy/config.yaml` (Unix). Os arquivos de runtime (pid + log) ficam
+no mesmo diretório.
+
+**Resolução (precedência):**
+1. Flag explícita `--config <path>`.
+2. Env var `LOCAL_PROXY_CONFIG`.
+3. `config.yaml`/`config.json` no diretório de trabalho (override project-local, só se existir).
+4. Global default.
+
+**Auto-criação do default:** se o arquivo global não existir, o CLI o cria a partir de um default
+embutido e imprime uma mensagem dizendo onde foi criado e que basta editar e rodar de novo.
 
 ```yaml
 server:
@@ -132,7 +145,10 @@ Truncar `tool_result` a 120k chars ao reenviar (Anthropic impõe limite).
 ## CLI (`src/main.rs`, clap)
 
 - `serve [--config <path>] [--background]` — roda o proxy; `--background` spawna processo
-  desacoplado (pid/log em `~/.config/local-proxy/`).
+  desacoplado (pid/log no diretório de config global).
+- Erros de CLI reportados com **miette** (rico diagnóstico): códigos `config::io`, `config::parse`,
+  `cli::...`, contexto com o trecho-fonte em erros de parse YAML/JSON. O shape `ApiError`
+  (Anthropic/OpenAI) voltado ao cliente HTTP permanece inalterado.
 - `launch claude [--model X] [--yes] [-- args...]` — sobe serve, seta `ANTHROPIC_BASE_URL`,
   `ANTHROPIC_AUTH_TOKEN`/`ANTHROPIC_API_KEY` (proxy key ou "unused"), `ANTHROPIC_MODEL`/
   `ANTHROPIC_SMALL_FAST_MODEL` se `--model`, executa `claude args`.
@@ -144,8 +160,8 @@ Truncar `tool_result` a 120k chars ao reenviar (Anthropic impõe limite).
 
 ```
 src/
-├── main.rs        CLI + boot
-├── config.rs      Config/Provider/Route, load YAML/JSON
+├── main.rs        CLI + boot (erros com miette, códigos config::/cli::)
+├── config.rs      Config/Provider/Route, load YAML/JSON — global, auto-criado
 ├── router.rs      resolve_model → (Provider, upstream_model)
 ├── upstream.rs    chamada HTTP + streaming por formato
 ├── translate.rs   requests/responses A↔O↔Responses

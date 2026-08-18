@@ -26,8 +26,20 @@ cargo test          # 62 unit tests
 
 ## Config
 
-Copie `config.example.yaml` para `config.yaml` e ajuste. Providers aceitam `format: anthropic`
-ou `format: openai`; a chave de cada provider vem da env var indicada por `api_key_env`.
+A config principal vive no diretório de config do usuário:
+`%APPDATA%\local-proxy\config.yaml` (Windows) ou `~/.config/local-proxy/config.yaml` (Unix).
+Os arquivos de runtime (pid + log) ficam no mesmo diretório.
+
+Se esse arquivo global não existir, o CLI o cria a partir de um default embutido e imprime uma
+mensagem dizendo onde foi criado e que basta editar e rodar de novo. Providers aceitam
+`format: anthropic` ou `format: openai`; a chave de cada provider vem da env var indicada por
+`api_key_env`.
+
+Resolução de config (precedência):
+1. Flag explícita `--config <path>`.
+2. Env var `LOCAL_PROXY_CONFIG`.
+3. `config.yaml`/`config.json` no diretório de trabalho (override project-local, só se existir).
+4. Global default (o arquivo criado automaticamente).
 
 Exemplo com modelos **free** do [opencode-zen](https://opencode.ai/zen) (OpenAI-compatible):
 
@@ -44,11 +56,11 @@ routes:
     upstream_model: deepseek-v4-flash-free
 ```
 
-Rode:
+Rode (usa a config global; `--config` é só um override):
 
 ```powershell
 $env:OPENCODE_ZEN_KEY="sk-opencode-zen-..."
-cargo run -- serve --config config.yaml
+cargo run -- serve
 ```
 
 ## Usar com Claude Code
@@ -83,8 +95,8 @@ $env:OPENCODE_ZEN_KEY="sk-..."; bun test live-zen.test.ts   # live (best-effort)
 
 ```
 src/
-├── main.rs        CLI + boot
-├── config.rs      Config/Provider/Route (YAML/JSON)
+├── main.rs        CLI + boot (erros com miette, códigos config::/cli::)
+├── config.rs      Config/Provider/Route (YAML/JSON) — global, auto-created
 ├── router.rs      resolve_model → (provider, upstream_model)
 ├── upstream.rs    chamada HTTP + auth por formato
 ├── translate.rs   requests/responses A↔O↔Responses
