@@ -14,7 +14,7 @@ providers configuráveis, com tradução de erros e `count_tokens` real.
   `/v1/models`, `/health`.
 - Tradução request/response e **streaming SSE evento-a-evento** nas 3 direções.
 - **Catálogo de providers embutido** (`anthropic`, `openai`, `opencode-go`, `zen`, `groq`, `xai`,
-  `google`, `deepseek`, `openrouter`); o `config.yaml` só **adiciona** ou **sobrescreve**.
+  `google`, `deepseek`, `openrouter`, `neuralwatt`); o `config.yaml` só **adiciona** ou **sobrescreve**.
 - **Hot-reload**: edições no config e `connect`/MCP aplicam em runtime via file watcher, sem reinício.
 - **Auth store** (`auth.json`): chaves separadas do config, como o `/connect` do opencode.
 - **Servidor MCP** (`local-proxy mcp`) com tools `connect`/`disconnect`/`providers`/`models(select)`

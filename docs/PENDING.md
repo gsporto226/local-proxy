@@ -100,6 +100,15 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
 - Testes unit: headers anexados à request (servidor one-shot), override do `Authorization`, e parse
   YAML/round-trip do campo. **116** verdes; fmt/clippy limpos; e2e 16 verdes.
 
+### Nova rodada — provider neuralwatt
+- Catálogo: entrada `neuralwatt` (`base_url: https://api.neuralwatt.com/v1`, `api_key_env:
+  NEURALWATT_API_KEY`, `format: openai`) com os modelos expostos por `GET /v1/models`
+  (descoberta direto do endpoint público do provider): gemma-4-31b, glm-5.2 (e variantes fast/flex/
+  short), kimi-k2.7-code (fast/flex), qwen3.6-35b (fast), kimi-k3 (fast/flex), deepseek-v4-flash
+  (flex) e `deepseek-ai/DeepSeek-V4-Flash`.
+- Uso: `local-proxy connect neuralwatt` + `local-proxy model <id>` — sem código específico, tudo
+  reuso do formato `openai`.
+
 ### Estado de verificação (task 010)
 - `cargo test --all-features`: **116** unit tests verdes.
 - `cargo clippy --all-targets --all-features -- -D warnings`: limpo.

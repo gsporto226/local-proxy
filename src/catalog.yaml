@@ -76,6 +76,30 @@ providers:
       X-Title: local-proxy
     models:
       - openrouter/auto
+  - name: neuralwatt
+    base_url: https://api.neuralwatt.com/v1
+    api_key_env: NEURALWATT_API_KEY
+    format: openai
+    models:
+      - gemma-4-31b
+      - glm-5.2
+      - glm-5.2-fast
+      - glm-5.2-flex
+      - glm-5.2-short
+      - glm-5.2-short-fast
+      - glm-5.2-short-flex
+      - glm-5.2-short-fast-flex
+      - kimi-k2.7-code
+      - kimi-k2.7-code-fast
+      - kimi-k2.7-code-flex
+      - qwen3.6-35b
+      - qwen3.6-35b-fast
+      - kimi-k3
+      - kimi-k3-fast
+      - kimi-k3-flex
+      - deepseek-v4-flash
+      - deepseek-v4-flash-flex
+      - deepseek-ai/DeepSeek-V4-Flash
 
 routes:
   - model: claude-sonnet
