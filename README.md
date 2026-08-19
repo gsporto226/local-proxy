@@ -78,6 +78,24 @@ $env:OPENCODE_ZEN_KEY="sk-opencode-zen-..."
 cargo run -- serve
 ```
 
+### Headers por provider
+
+Qualquer provider pode enviar headers estáticos em toda request, definidos em `headers:`. Headers com o
+mesmo nome sobrescrevem o default de auth/formato. Exemplo — OpenRouter pede os headers de roteamento
+`HTTP-Referer` e `X-Title`; o catálogo embutido já os envia:
+
+```yaml
+providers:
+  - name: openrouter
+    base_url: https://openrouter.ai/api/v1
+    api_key_env: OPENROUTER_API_KEY
+    format: openai
+    headers:
+      HTTP-Referer: https://github.com/gsporto226/local-proxy
+      X-Title: local-proxy
+    models: [openrouter/auto]
+```
+
 ### Chaves: `connect` / `disconnect`
 
 As chaves ficam em `auth.json` (formato do opencode), nunca no `config.yaml`. `connect` só aceita
@@ -219,12 +237,12 @@ $env:OPENCODE_ZEN_KEY="sk-..."; bun test live-zen.test.ts   # live (best-effort)
 ```
 src/
 ├── main.rs        CLI + boot (erros com miette, códigos config::/cli::)
-├── config.rs      Config/Provider/Route/Defaults (YAML/JSON) — overlay, auto-created
+├── config.rs      Config/Provider/Route/Defaults (YAML/JSON) — overlay, auto-created, headers por provider
 ├── catalog.rs     catálogo embutido + merge catálogo↔config
 ├── auth.rs        auth.json (keys) + escrita atômica
 ├── cli.rs         serve/launch/status/stop/models/model/connect/disconnect/providers/stats/init/mcp/update
 ├── router.rs      resolve_model → (provider, upstream_model)
-├── upstream.rs    chamada HTTP + resolução de chave (inline > auth > env)
+├── upstream.rs    chamada HTTP + resolução de chave (inline > auth > env) + headers por provider
 ├── translate.rs   requests/responses A↔O↔Responses
 ├── sse.rs         parser de frames SSE
 ├── streams.rs     máquinas de estado de streaming (3 direções)

@@ -931,6 +931,7 @@ mod tests {
                     api_key: Some("sk".to_string()),
                     format: ProviderFormat::Openai,
                     models: vec!["gpt-4o".to_string()],
+                    headers: std::collections::HashMap::new(),
                 },
                 crate::config::Provider {
                     name: "anthropic".to_string(),
@@ -939,6 +940,7 @@ mod tests {
                     api_key: None,
                     format: ProviderFormat::Anthropic,
                     models: vec!["claude-sonnet-4-5".to_string()],
+                    headers: std::collections::HashMap::new(),
                 },
             ],
             routes: vec![crate::config::Route {
@@ -975,6 +977,7 @@ mod tests {
                 api_key: Some("sk".to_string()),
                 format: ProviderFormat::Openai,
                 models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
+                headers: std::collections::HashMap::new(),
             }],
             routes: Vec::new(),
             defaults: crate::config::Defaults {
@@ -1003,6 +1006,7 @@ mod tests {
                 api_key: None,
                 format: ProviderFormat::Openai,
                 models: vec!["gpt-4o".to_string()],
+                headers: std::collections::HashMap::new(),
             }],
             routes: Vec::new(),
             defaults: crate::config::Defaults {

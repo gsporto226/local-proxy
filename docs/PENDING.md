@@ -90,8 +90,18 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
 - `cargo test --all-features`: **113** unit tests verdes (5 novos de stats + 5 de usage SSE);
   fmt/clippy limpos; `bun test e2e/mock.test.ts` 16 verdes.
 
+### Nova rodada — headers por provider (OpenRouter)
+- `Provider.headers` (`HashMap` opcional, `#[serde(default)]`): headers estáticos enviados em toda
+  request do provider, sobrescrevendo o default de auth/formato quando o nome coincide.
+- `upstream::ProviderClient` guarda e aplica os headers em `chat_request` (injetados após o bloco de
+  auth, por isso vencem).
+- Catálogo: a entrada `openrouter` ganhou os headers recomendados `HTTP-Referer` e `X-Title`
+  (roteamento/custo/visibilidade no OpenRouter).
+- Testes unit: headers anexados à request (servidor one-shot), override do `Authorization`, e parse
+  YAML/round-trip do campo. **116** verdes; fmt/clippy limpos; e2e 16 verdes.
+
 ### Estado de verificação (task 010)
-- `cargo test --all-features`: **113** unit tests verdes.
+- `cargo test --all-features`: **116** unit tests verdes.
 - `cargo clippy --all-targets --all-features -- -D warnings`: limpo.
 - `cargo fmt --all -- --check`: limpo.
 - `bun test e2e/mock.test.ts`: **16** testes determinísticos verdes (suite reescrita para a semântica de

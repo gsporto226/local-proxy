@@ -4,7 +4,6 @@ use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
 use serde_json::Value;
 
 use crate::config::{Provider, ProviderFormat};
-
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Errors that can occur while building clients or talking to upstreams.
@@ -51,6 +50,7 @@ pub struct ProviderClient {
     auth_key: Option<String>,
     api_key_env: Option<String>,
     passthrough: bool,
+    headers: std::collections::HashMap<String, String>,
     http: reqwest::Client,
 }
 
@@ -79,6 +79,7 @@ impl ProviderClient {
             auth_key,
             api_key_env: provider.api_key_env.clone(),
             passthrough,
+            headers: provider.headers.clone(),
             http,
         })
     }
@@ -183,6 +184,16 @@ impl ProviderClient {
                 }
             }
         }
+        // Provider-configured static headers override the format/auth defaults.
+        for (name, value) in &self.headers {
+            let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) else {
+                continue;
+            };
+            headers.insert(name, value);
+        }
 
         let resp = self
             .http
@@ -237,6 +248,7 @@ mod tests {
             api_key: None,
             format,
             models: Vec::new(),
+            headers: std::collections::HashMap::new(),
         }
     }
 
@@ -318,6 +330,118 @@ mod tests {
         let client = ProviderClient::new(&p, false, None).unwrap();
         assert_eq!(client.configured_key().unwrap().as_deref(), Some("env-key"));
 
+        std::env::remove_var("LOCAL_PROXY_TEST_KEY");
+    }
+
+    /// Spin up a one-shot HTTP server that records the request headers it
+    /// receives and returns them in the response body as JSON. Returns
+    /// `(base_url, received_headers)`.
+    async fn header_capture_server() -> (String, tokio::sync::oneshot::Receiver<HeaderMap>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        use tokio::net::TcpListener;
+
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let _ = sock.read(&mut buf).await;
+            // parse the head: split headers from body on \r\n\r\n
+            let head_end = buf
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .unwrap_or(buf.len());
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let mut headers = HeaderMap::new();
+            for line in head.lines().skip(1) {
+                if let Some((k, v)) = line.split_once(':') {
+                    if let (Ok(k), Ok(v)) = (
+                        reqwest::header::HeaderName::from_bytes(k.trim().as_bytes()),
+                        HeaderValue::from_str(v.trim()),
+                    ) {
+                        headers.append(k, v);
+                    }
+                }
+            }
+            let _ = tx.send(headers);
+            let body = b"{}";
+            let _ = sock
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = sock.write_all(body).await;
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_headers_are_attached_to_request() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        std::env::set_var("LOCAL_PROXY_TEST_KEY", "key");
+
+        let (base, rx) = header_capture_server().await;
+        let mut p = provider(ProviderFormat::Openai);
+        p.base_url = base.clone();
+        p.headers = std::collections::HashMap::from([
+            (
+                "HTTP-Referer".to_string(),
+                "https://example.com".to_string(),
+            ),
+            ("X-Title".to_string(), "local-proxy".to_string()),
+        ]);
+        let client = ProviderClient::new(&p, false, None).unwrap();
+        client
+            .chat_request("/v1/chat/completions", json!({}), None)
+            .await
+            .unwrap();
+
+        let received = rx.await.unwrap();
+        assert_eq!(
+            received.get("http-referer").and_then(|v| v.to_str().ok()),
+            Some("https://example.com")
+        );
+        assert_eq!(
+            received.get("x-title").and_then(|v| v.to_str().ok()),
+            Some("local-proxy")
+        );
+        assert_eq!(
+            received.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer key")
+        );
+        std::env::remove_var("LOCAL_PROXY_TEST_KEY");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn provider_headers_override_auth_default() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        std::env::set_var("LOCAL_PROXY_TEST_KEY", "key");
+
+        let (base, rx) = header_capture_server().await;
+        let mut p = provider(ProviderFormat::Openai);
+        p.base_url = base.clone();
+        p.headers = std::collections::HashMap::from([(
+            "Authorization".to_string(),
+            "Bearer custom".to_string(),
+        )]);
+        let client = ProviderClient::new(&p, false, None).unwrap();
+        client
+            .chat_request("/v1/chat/completions", json!({}), None)
+            .await
+            .unwrap();
+
+        let received = rx.await.unwrap();
+        assert_eq!(
+            received.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer custom")
+        );
         std::env::remove_var("LOCAL_PROXY_TEST_KEY");
     }
 }

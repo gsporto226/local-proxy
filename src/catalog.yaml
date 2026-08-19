@@ -71,6 +71,9 @@ providers:
     base_url: https://openrouter.ai/api/v1
     api_key_env: OPENROUTER_API_KEY
     format: openai
+    headers:
+      HTTP-Referer: https://github.com/gsporto226/local-proxy
+      X-Title: local-proxy
     models:
       - openrouter/auto
 

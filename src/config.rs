@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -79,6 +80,10 @@ pub struct Provider {
     pub format: ProviderFormat,
     /// Native model IDs the provider can serve.
     pub models: Vec<String>,
+    /// Optional static HTTP headers sent with every request to this provider.
+    /// Headers with the same name override the format/auth defaults.
+    #[serde(default)]
+    pub headers: HashMap<String, String>,
 }
 
 /// Maps a requested model to a provider (exact match or prefix).
@@ -488,5 +493,39 @@ mod tests {
         assert!(config.providers.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_headers_deserialize_from_yaml_and_round_trip() {
+        let config = Config::from_str(
+            r"providers:
+  - name: openrouter
+    base_url: https://openrouter.ai/api/v1
+    format: openai
+    headers:
+      HTTP-Referer: https://github.com/gsporto226/local-proxy
+      X-Title: local-proxy
+    models: [openrouter/auto]
+",
+            "yaml",
+        )
+        .expect("yaml parses");
+        let p = &config.providers[0];
+        assert_eq!(
+            p.headers.get("HTTP-Referer").map(String::as_str),
+            Some("https://github.com/gsporto226/local-proxy")
+        );
+        assert_eq!(
+            p.headers.get("X-Title").map(String::as_str),
+            Some("local-proxy")
+        );
+
+        // a provider without headers defaults to an empty map
+        let bare = Config::from_str(
+            "providers:\n  - name: x\n    base_url: http://x\n    format: openai\n",
+            "yaml",
+        )
+        .expect("yaml parses");
+        assert!(bare.providers[0].headers.is_empty());
     }
 }
