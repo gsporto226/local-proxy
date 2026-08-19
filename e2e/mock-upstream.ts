@@ -109,12 +109,17 @@ export function yamlList(values: string[]): string {
 
 export function mockConfig(
   mockBase: string,
-  opts: { apiKeys?: string[] } = {},
+  opts: { apiKeys?: string[]; activeModel?: string } = {},
 ): string {
   const apiKeys =
     opts.apiKeys && opts.apiKeys.length
       ? `  api_keys:\n${opts.apiKeys.map((k) => `    - ${k}`).join("\n")}`
       : "  api_keys: []";
+  // Inline api_key makes every provider "connected" (has a resolvable key) so
+  // the proxy can route to it under the active-model semantics.
+  const active = opts.activeModel
+    ? `  active_model: ${opts.activeModel}\n`
+    : "";
   return `
 server:
   host: 127.0.0.1
@@ -125,9 +130,11 @@ ${apiKeys}
 providers:
   - name: mock_openai
     base_url: ${mockBase}
+    api_key: test-key
     format: openai
   - name: mock_anthropic
     base_url: ${mockBase}
+    api_key: test-key
     format: anthropic
 
 routes:
@@ -143,5 +150,5 @@ routes:
 
 defaults:
   provider: ""
-`;
+${active}`;
 }
