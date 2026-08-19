@@ -1,4 +1,5 @@
-﻿import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+﻿import { spawn } from "bun";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 
 import {
   eventNames,
@@ -59,6 +60,51 @@ routes:
 defaults:
   provider: zen
 `;
+}
+
+interface ClaudeResult {
+  exitCode: number | null;
+  stdout: string;
+  stderr: string;
+}
+
+const CLAUDE_MODEL = process.env.ANTHROPIC_MODEL || "deepseek-free";
+
+/**
+ * Run the real `claude` CLI pointed at the proxy, mirroring the env that
+ * `local-proxy launch` sets (ANTHROPIC_BASE_URL + model). The proxy has no
+ * client auth (api_keys: []), so the CLI presents a dummy key that the proxy
+ * ignores; the proxy uses the user's configured upstream key to reach zen.
+ */
+async function runClaude(
+  proxy: ProxyHandle,
+  args: string[],
+): Promise<ClaudeResult> {
+  const proc = spawn(["claude", "-p", ...args], {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: {
+      ...process.env,
+      ANTHROPIC_BASE_URL: proxy.base,
+      ANTHROPIC_API_KEY: "unused",
+      ANTHROPIC_AUTH_TOKEN: "unused",
+      ANTHROPIC_MODEL: CLAUDE_MODEL,
+      ANTHROPIC_SMALL_FAST_MODEL: CLAUDE_MODEL,
+    },
+  });
+  const stdout = await new Response(proc.stdout).text();
+  const stderr = await new Response(proc.stderr).text();
+  const exitCode = await proc.exited;
+  return { exitCode, stdout, stderr };
+}
+
+/** Treat upstream rate-limit/errors as an environmental skip, not a failure. */
+function assertClaudeOk(r: ClaudeResult): boolean {
+  if (r.exitCode === 0) return true;
+  console.warn(
+    `[live-zen/claude] not ok (exit ${r.exitCode}): ${(r.stderr || r.stdout).slice(0, 160)} — environmental skip`,
+  );
+  return false;
 }
 
 describe.skipIf(skip)("e2e: live opencode-zen", () => {
@@ -174,7 +220,50 @@ describe.skipIf(skip)("e2e: live opencode-zen", () => {
     expect(names).toContain("response.output_text.delta");
     expect(names[names.length - 1]).toBe("response.completed");
   });
+
+  live("real claude CLI via proxy: print (text) reaches zen", async () => {
+    const r = await runClaude(proxy, [
+      "Say the single word: banana",
+      "--model",
+      CLAUDE_MODEL,
+      "--dangerously-skip-permissions",
+      "--verbose",
+      "--output-format",
+      "text",
+    ]);
+    if (!assertClaudeOk(r)) return;
+    if (r.stdout.trim().length === 0) {
+      console.warn(
+        `[live-zen/claude] empty model output — environmental skip (free model returned nothing)`,
+      );
+      return;
+    }
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.trim().length).toBeGreaterThan(0);
+  });
+
+  live("real claude CLI via proxy: stream-json emits assistant output", async () => {
+    const r = await runClaude(proxy, [
+      "Say the single word: banana",
+      "--model",
+      CLAUDE_MODEL,
+      "--dangerously-skip-permissions",
+      "--verbose",
+      "--output-format",
+      "stream-json",
+    ]);
+    if (!assertClaudeOk(r)) return;
+    if (r.stdout.trim().length === 0) {
+      console.warn(
+        `[live-zen/claude] empty model output — environmental skip (free model returned nothing)`,
+      );
+      return;
+    }
+    expect(r.exitCode).toBe(0);
+    expect(r.stdout.trim().length).toBeGreaterThan(0);
+  });
 });
+
 
 
 

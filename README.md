@@ -186,7 +186,10 @@ O `serve` aceita `--check-update` para avisar no log quando há versão mais rec
   sobe o binário + um upstream mock e valida tradução/streaming/auth/erros via HTTP real.
 - **e2e live (opencode-zen)**: `$env:OPENCODE_ZEN_KEY=...; bun test e2e/live-zen.test.ts` —
   valida contra o provider real. O upstream free pode limitar por uso (`FreeUsageLimitError`); nesse
-  caso os testes reportam *environmental skip* (não são falha do proxy).
+  caso os testes reportam *environmental skip* (não são falha do proxy). Inclui também dois testes
+  que sobem o **CLI `claude` real** apontado ao proxy (`ANTHROPIC_BASE_URL`, sem auth de cliente — o
+  proxy usa a chave configurada do usuário), validando o caminho completo Anthropic → tradução → zen
+  com o binário de verdade (`--output-format text` e `stream-json`).
 
 ```powershell
 # na pasta e2e/

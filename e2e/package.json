@@ -6,6 +6,7 @@
     "pretest": "cargo build --manifest-path ../Cargo.toml",
     "test": "bun test",
     "test:mock": "bun test e2e/mock.test.ts",
-    "test:live": "bun test e2e/live-zen.test.ts"
+    "test:live": "bun test e2e/live-zen.test.ts",
+    "test:user": "bun test e2e/live-user.test.ts"
   }
 }
