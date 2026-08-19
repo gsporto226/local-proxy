@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use axum::body::{Body, Bytes};
 use axum::extract::State;
@@ -20,6 +20,7 @@ use tokio::sync::RwLock;
 use crate::config::{Config, ConfigError, ProviderFormat};
 use crate::error::ApiError;
 use crate::router::{Router, RouterError};
+use crate::stats::{self, StatLine};
 use crate::streams;
 use crate::streams::UpstreamStream;
 use crate::translate;
@@ -336,6 +337,47 @@ fn client_for(
     })
 }
 
+/// Best-effort local statistics capture for one handled request.
+///
+/// Extracts token usage from the upstream (already consumed) body where
+/// possible, records the row against the local stats database, and ignores any
+/// failure. The provider/model are the resolved upstream ones.
+/// Best-effort local statistics capture for one handled request.
+///
+/// Extracts token usage from the upstream (already consumed) body where
+/// possible, records the row against the local stats database, and ignores any
+/// failure. The provider/model are the resolved upstream ones.
+#[allow(clippy::needless_pass_by_value)]
+fn capture(
+    endpoint: &'static str,
+    provider: &str,
+    model: &str,
+    streamed: bool,
+    status: u16,
+    upstream_body: Option<&Value>,
+    started: &Instant,
+) {
+    let mut tokens = crate::translate::TokenUsage::default();
+    if let Some(body) = upstream_body {
+        if let Some(u) = body.get("usage") {
+            tokens = crate::translate::parse_usage(u);
+        }
+    }
+    stats::record(
+        *started,
+        StatLine {
+            endpoint,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            input_tokens: tokens.input,
+            output_tokens: tokens.output,
+            streamed,
+            status,
+            error: status >= 400,
+        },
+    );
+}
+
 // ---------------------------------------------------------------------------
 // /v1/messages (Anthropic client)
 // ---------------------------------------------------------------------------
@@ -361,6 +403,7 @@ async fn handle_messages(
     body: &Bytes,
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
+    let started = Instant::now();
     let mut body = parse_body(body)?;
     let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state)?;
@@ -382,9 +425,27 @@ async fn handle_messages(
     let status = resp.status().as_u16();
     if status >= 400 {
         let (status, rbody) = send_and_read(resp).await;
+        capture(
+            "/v1/messages",
+            &provider.name,
+            &upstream_model,
+            streaming,
+            status,
+            Some(&rbody),
+            &started,
+        );
         return Err(ApiError::from_upstream(status, rbody));
     }
     if streaming {
+        capture(
+            "/v1/messages",
+            &provider.name,
+            &upstream_model,
+            true,
+            status,
+            None,
+            &started,
+        );
         return match provider.format {
             ProviderFormat::Anthropic => Ok(passthrough_stream(resp)),
             ProviderFormat::Openai => Ok(sse_response(streams::anthropic_from_openai(
@@ -396,8 +457,28 @@ async fn handle_messages(
 
     let rbody = resp.json::<Value>().await.unwrap_or(Value::Null);
     match provider.format {
-        ProviderFormat::Anthropic => Ok(json_response(StatusCode::OK, rbody)),
+        ProviderFormat::Anthropic => {
+            capture(
+                "/v1/messages",
+                &provider.name,
+                &upstream_model,
+                false,
+                status,
+                Some(&rbody),
+                &started,
+            );
+            Ok(json_response(StatusCode::OK, rbody))
+        }
         ProviderFormat::Openai => {
+            capture(
+                "/v1/messages",
+                &provider.name,
+                &upstream_model,
+                false,
+                status,
+                Some(&rbody),
+                &started,
+            );
             let translated = translate::openai_to_anthropic_response(rbody, &upstream_model)
                 .map_err(ApiError::from)?;
             Ok(json_response(StatusCode::OK, translated))
@@ -430,6 +511,7 @@ async fn handle_chat_completions(
     body: &Bytes,
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
+    let started = Instant::now();
     let mut body = parse_body(body)?;
     let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state)?;
@@ -451,9 +533,27 @@ async fn handle_chat_completions(
     let status = resp.status().as_u16();
     if status >= 400 {
         let (status, rbody) = send_and_read(resp).await;
+        capture(
+            "/v1/chat/completions",
+            &provider.name,
+            &upstream_model,
+            streaming,
+            status,
+            Some(&rbody),
+            &started,
+        );
         return Err(ApiError::from_upstream(status, rbody));
     }
     if streaming {
+        capture(
+            "/v1/chat/completions",
+            &provider.name,
+            &upstream_model,
+            true,
+            status,
+            None,
+            &started,
+        );
         return match provider.format {
             ProviderFormat::Openai => Ok(passthrough_stream(resp)),
             ProviderFormat::Anthropic => Ok(sse_response(streams::openai_from_anthropic(
@@ -465,8 +565,28 @@ async fn handle_chat_completions(
 
     let rbody = resp.json::<Value>().await.unwrap_or(Value::Null);
     match provider.format {
-        ProviderFormat::Openai => Ok(json_response(StatusCode::OK, rbody)),
+        ProviderFormat::Openai => {
+            capture(
+                "/v1/chat/completions",
+                &provider.name,
+                &upstream_model,
+                false,
+                status,
+                Some(&rbody),
+                &started,
+            );
+            Ok(json_response(StatusCode::OK, rbody))
+        }
         ProviderFormat::Anthropic => {
+            capture(
+                "/v1/chat/completions",
+                &provider.name,
+                &upstream_model,
+                false,
+                status,
+                Some(&rbody),
+                &started,
+            );
             let translated = translate::anthropic_to_openai_response(rbody, &upstream_model)
                 .map_err(ApiError::from)?;
             Ok(json_response(StatusCode::OK, translated))
@@ -499,6 +619,7 @@ async fn handle_responses(
     body: &Bytes,
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
+    let started = Instant::now();
     let mut body = parse_body(body)?;
     let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state)?;
@@ -520,9 +641,27 @@ async fn handle_responses(
     let status = resp.status().as_u16();
     if status >= 400 {
         let (status, rbody) = send_and_read(resp).await;
+        capture(
+            "/v1/responses",
+            &provider.name,
+            &upstream_model,
+            streaming,
+            status,
+            Some(&rbody),
+            &started,
+        );
         return Err(ApiError::from_upstream(status, rbody));
     }
     if streaming {
+        capture(
+            "/v1/responses",
+            &provider.name,
+            &upstream_model,
+            true,
+            status,
+            None,
+            &started,
+        );
         return match provider.format {
             ProviderFormat::Openai => Ok(sse_response(streams::responses_from_openai(
                 resp,
@@ -536,6 +675,15 @@ async fn handle_responses(
     }
 
     let rbody = resp.json::<Value>().await.unwrap_or(Value::Null);
+    capture(
+        "/v1/responses",
+        &provider.name,
+        &upstream_model,
+        false,
+        status,
+        Some(&rbody),
+        &started,
+    );
     let translated = match provider.format {
         ProviderFormat::Openai => translate::openai_to_responses_response(rbody, &upstream_model)
             .map_err(ApiError::from)?,

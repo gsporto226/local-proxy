@@ -65,15 +65,27 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
   um provider conectado, senão erro.
 - Campo renomeado: `defaults.model` → `defaults.active_model` (persistido via `model`/MCP
   `models(select)`).
-- Novos comandos CLI: `model [<model>]` e `model clear` (mesma lógica do MCP `models(select)`).
+- Novos comandos CLI: `model [<model>]`, `model clear` (mesma lógica do MCP `models(select)`).
 - MCP `models`/`select` agora **delegam ao CLI** (`model`/`models`) — paridade total de comportamento
   entre MCP e CLI (mesma validação e mensagens; `models()` lista só modelos de providers conectados).
 - `init [--yes]`: detecta harnesses (opencode/claude) e registra o servidor MCP do local-proxy nos
   configs deles (`opencode.json`/`.claude.json`; preserva chaves, backup em `<path>.bak`); só MCP,
   sem setup de provider/modelo.
 
+### Nova rodada — estatísticas locais (`stats`)
+- `src/stats.rs`: banco `SQLite` local (`stats.db` no config dir global) registra cada request
+  (endpoint, provider, model, tokens in/out, latency, streaming, status, erro). Escrita **best-effort**:
+  falha é logada e nunca quebra o proxy.
+- Os 3 handlers (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`) capturam por caminho:
+  streaming grava só o fluxo (tokens não contabilizados); não-streaming captura o `usage` do upstream
+  quando presente; erro grava a requisição com `error=true` e o status real.
+- `local-proxy stats [--since day|week|month|all] [--json]`: resumo agregado (requests, tokens in/out,
+  latency total, taxa de erro) + breakdown por provider + 10 requests mais recentes; `--json` imprime o
+  mesmo relatório em JSON (`summary`/`providers`/`recent`).
+- `cargo test --all-features`: **108** unit tests verdes (5 novos de stats); fmt/clippy limpos.
+
 ### Estado de verificação (task 010)
-- `cargo test --all-features`: **103** unit tests verdes.
+- `cargo test --all-features`: **108** unit tests verdes.
 - `cargo clippy --all-targets --all-features -- -D warnings`: limpo.
 - `cargo fmt --all -- --check`: limpo.
 - `bun test e2e/mock.test.ts`: **16** testes determinísticos verdes (suite reescrita para a semântica de

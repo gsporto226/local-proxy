@@ -94,6 +94,14 @@ pub enum CliError {
         help("check the config file and the embedded catalog are valid")
     )]
     Runtime(#[from] crate::handlers::RuntimeError),
+
+    /// The local usage statistics could not be read.
+    #[error("failed to read usage statistics")]
+    #[diagnostic(
+        code(cli::stats),
+        help("the stats database is created automatically on the first proxied request")
+    )]
+    Stats(#[from] crate::stats::StatsError),
 }
 
 // ---------------------------------------------------------------------------
@@ -827,6 +835,152 @@ pub fn providers(config_path: PathBuf) -> miette::Result<()> {
     let out = list_providers(&config_path).map_err(miette::Report::from)?;
     println!("{out}");
     Ok(())
+}
+
+/// The recognized `--since` windows for `local-proxy stats`, in seconds.
+fn window_seconds(kind: &str) -> Option<i64> {
+    match kind {
+        "day" => Some(86_400),
+        "week" => Some(7 * 86_400),
+        "month" => Some(30 * 86_400),
+        _ => None,
+    }
+}
+
+/// Print aggregate usage statistics collected from upstream requests.
+///
+/// Renders a human summary (with a per-provider breakdown) by default, or the
+/// same data as JSON when `json` is set. When no stats have been recorded yet,
+/// prints a message and returns without error.
+///
+/// # Errors
+///
+/// Returns [`CliError::Stats`] if the stats database cannot be read.
+#[allow(clippy::needless_pass_by_value, clippy::cast_possible_wrap)]
+pub fn stats(config_path: PathBuf, since: String, json: bool) -> miette::Result<()> {
+    let _ = config_path;
+    // `window_seconds` returning `None` is only reachable for `all`, which the
+    // clap value parser guarantees is the sentinel for "no time filter".
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let window = crate::stats::TimeWindow {
+        since: window_seconds(&since).map(|s| now - s),
+    };
+
+    let summary = crate::stats::summary(window).map_err(CliError::from)?;
+    let by_provider = crate::stats::by_provider(window).map_err(CliError::from)?;
+    let recent = crate::stats::recent(window, 10).map_err(CliError::from)?;
+
+    let Some(summary) = summary else {
+        println!("nenhuma estatística registrada ainda (a primeira requisição proxy cria o banco)");
+        return Ok(());
+    };
+
+    let by_provider = by_provider.unwrap_or_default();
+    let recent = recent.unwrap_or_default();
+    if json {
+        render_stats_json(&summary, &by_provider, &recent);
+    } else {
+        render_stats_text(&summary, &by_provider, &recent);
+    }
+    Ok(())
+}
+
+/// Render the human-readable stats report.
+#[allow(clippy::format_push_string, clippy::cast_precision_loss)]
+fn render_stats_text(
+    summary: &crate::stats::RowSummary,
+    by_provider: &[crate::stats::ProviderStats],
+    recent: &[crate::stats::RequestRow],
+) {
+    println!("=== stats local-proxy ===");
+    let total_latency = summary.latency_ms as f64 / 1000.0;
+    let error_rate = if summary.requests == 0 {
+        0.0
+    } else {
+        summary.errors as f64 / summary.requests as f64 * 100.0
+    };
+    println!(
+        "requisições: {}  |  in: {}  out: {} tokens  |  latency: {total_latency:.1}s  |  erros: {:.1}%",
+        summary.requests,
+        summary.input_tokens,
+        summary.output_tokens,
+        error_rate
+    );
+    println!("--- por provider ---");
+    if by_provider.is_empty() {
+        println!("(nenhum)");
+    }
+    for p in by_provider {
+        println!(
+            "{:<16} reqs={:<5} in={} out={} lat={}ms",
+            p.provider, p.requests, p.input_tokens, p.output_tokens, p.latency_ms
+        );
+    }
+    println!("--- recentes ---");
+    if recent.is_empty() {
+        println!("(nenhum)");
+    }
+    for r in recent {
+        let stream = if r.streamed { "SSE " } else { "    " };
+        let err = if r.error { " ERROR" } else { "" };
+        println!(
+            "{:<12} {stream} {:>3} {:<4} {:<10} {err}",
+            r.endpoint, r.status, r.latency_ms, r.provider
+        );
+    }
+}
+
+/// Render the stats report as JSON.
+#[allow(clippy::format_push_string)]
+fn render_stats_json(
+    summary: &crate::stats::RowSummary,
+    by_provider: &[crate::stats::ProviderStats],
+    recent: &[crate::stats::RequestRow],
+) {
+    let summary_json = serde_json::json!({
+        "requests": summary.requests,
+        "input_tokens": summary.input_tokens,
+        "output_tokens": summary.output_tokens,
+        "total_latency_ms": summary.latency_ms,
+        "errors": summary.errors,
+    });
+    let providers_json: Vec<serde_json::Value> = by_provider
+        .iter()
+        .map(|p| {
+            serde_json::json!({
+                "provider": p.provider,
+                "requests": p.requests,
+                "input_tokens": p.input_tokens,
+                "output_tokens": p.output_tokens,
+                "total_latency_ms": p.latency_ms,
+            })
+        })
+        .collect();
+    let recent_json: Vec<serde_json::Value> = recent
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "ts": r.ts,
+                "endpoint": r.endpoint,
+                "provider": r.provider,
+                "model": r.model,
+                "input_tokens": r.input_tokens,
+                "output_tokens": r.output_tokens,
+                "streamed": r.streamed,
+                "status": r.status,
+                "latency_ms": r.latency_ms,
+                "error": r.error,
+            })
+        })
+        .collect();
+    let out = serde_json::json!({
+        "summary": summary_json,
+        "providers": providers_json,
+        "recent": recent_json,
+    });
+    println!("{out}");
 }
 
 /// Run the MCP stdio server exposing connect/disconnect/models/providers.

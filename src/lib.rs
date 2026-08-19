@@ -43,6 +43,9 @@ pub mod translate;
 /// Upstream HTTP clients and request helpers.
 pub mod upstream;
 
+/// Local usage statistics collected from upstream requests (SQLite store).
+pub mod stats;
+
 /// Global lock that serializes unit tests mutating process-global state (the
 /// current working directory and environment variables), preventing races
 /// between parallel test threads.

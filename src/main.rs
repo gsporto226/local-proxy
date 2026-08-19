@@ -81,6 +81,15 @@ enum Command {
     },
     /// List effective providers (catalog ∪ config) with key status
     Providers,
+    /// Show usage statistics recorded from upstream requests
+    Stats {
+        /// Time window: day (default) | week | month | all
+        #[arg(long)]
+        since: Option<String>,
+        /// Print the report as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Run the MCP stdio server (connect/disconnect/models/providers)
     Mcp,
     /// Register the local-proxy MCP server into detected harnesses (opencode/claude)
@@ -147,6 +156,10 @@ fn main() -> miette::Result<()> {
         Some(Command::Connect { provider, key }) => cli::connect(config, provider, key),
         Some(Command::Disconnect { provider }) => cli::disconnect(config, provider),
         Some(Command::Providers) => cli::providers(config),
+        Some(Command::Stats { since, json }) => {
+            let since = since.unwrap_or_else(|| "day".to_string());
+            cli::stats(config, since, json)
+        }
         Some(Command::Mcp) => block_on(cli::mcp(config)),
         Some(Command::Init { yes }) => cli::init(config, yes),
         Some(Command::Update {

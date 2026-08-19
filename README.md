@@ -22,6 +22,9 @@ providers configuráveis, com tradução de erros e `count_tokens` real.
 - Roteamento por modelo (rota exata → `provider/model` → prefixo → lista nativa → default).
 - Erros do upstream reformatados para o shape do cliente (Anthropic ou OpenAI).
 - Auth opcional (`X-API-Key` / `Authorization: Bearer`) e `passthrough_keys`.
+- **Estatísticas de uso** (`local-proxy stats`): banco local SQLite (`stats.db`) registra cada request
+  (endpoint, provider, model, tokens in/out, latency, streaming, status) e é consultado por janela
+  de tempo com resumo por provider e requests recentes.
 
 ## Build
 
@@ -178,6 +181,19 @@ local-proxy update --no-verify    # pula a verificação de SHA256
 O `serve` aceita `--check-update` para avisar no log quando há versão mais recente
 (desative com `$env:LOCAL_PROXY_DISABLE_AUTOUPDATE=1`).
 
+## Estatísticas de uso (`stats`)
+
+O proxy registra cada request proxied no banco local `stats.db` (no diretório de config global) —
+best-effort: uma falha de escrita é logada e nunca quebra o proxy. Tokens de **streaming** não são
+contabilizados (só o fluxo é observado); nos requests não-streaming, o `usage` do upstream (se vier)
+é registrado.
+
+```powershell
+local-proxy stats               # resumo do dia (requests, tokens in/out, latency, erros) + por provider + recentes
+local-proxy stats --since week  # dia | week | month | all
+local-proxy stats --json        # mesmo relatório em JSON (summary/providers/recent)
+```
+
 ## Testes
 
 - **Unit (Rust)**: `cargo test --all-features` — traduções, roteamento, erros, máquinas de streaming,
@@ -205,7 +221,7 @@ src/
 ├── config.rs      Config/Provider/Route/Defaults (YAML/JSON) — overlay, auto-created
 ├── catalog.rs     catálogo embutido + merge catálogo↔config
 ├── auth.rs        auth.json (keys) + escrita atômica
-├── cli.rs         serve/launch/status/stop/models/model/connect/disconnect/providers/init/mcp/update
+├── cli.rs         serve/launch/status/stop/models/model/connect/disconnect/providers/stats/init/mcp/update
 ├── router.rs      resolve_model → (provider, upstream_model)
 ├── upstream.rs    chamada HTTP + resolução de chave (inline > auth > env)
 ├── translate.rs   requests/responses A↔O↔Responses
@@ -213,6 +229,7 @@ src/
 ├── streams.rs     máquinas de estado de streaming (3 direções)
 ├── mcp.rs         servidor MCP stdio (connect/disconnect/providers/models(select))
 ├── error.rs       ApiError + shape por formato
+├── stats.rs       estatísticas locais (SQLite `stats.db`) + `local-proxy stats`
 └── handlers.rs    endpoints axum + RuntimeState hot-reload + /v1/models + count_tokens
 e2e/               suíte de testes em Bun (mock + live)
 ```
