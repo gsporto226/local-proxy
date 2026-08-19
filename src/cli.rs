@@ -908,15 +908,29 @@ fn render_stats_text(
         summary.output_tokens,
         error_rate
     );
+    let energy_kwh = summary.energy_kwh_um as f64 / 1_000_000.0;
+    let cost_usd = summary.cost_usd_um as f64 / 1_000_000.0;
+    if energy_kwh > 0.0 || cost_usd > 0.0 {
+        println!("energia: {energy_kwh:.6} kWh  |  custo: ${cost_usd:.6}");
+    }
     println!("--- por provider ---");
     if by_provider.is_empty() {
         println!("(nenhum)");
     }
     for p in by_provider {
-        println!(
-            "{:<16} reqs={:<5} in={} out={} lat={}ms",
-            p.provider, p.requests, p.input_tokens, p.output_tokens, p.latency_ms
-        );
+        let ekwh = p.energy_kwh_um as f64 / 1_000_000.0;
+        let cusd = p.cost_usd_um as f64 / 1_000_000.0;
+        if ekwh > 0.0 || cusd > 0.0 {
+            println!(
+                "{:<16} reqs={:<5} in={} out={} lat={}ms energia={ekwh:.6}kWh custo=${cusd:.6}",
+                p.provider, p.requests, p.input_tokens, p.output_tokens, p.latency_ms
+            );
+        } else {
+            println!(
+                "{:<16} reqs={:<5} in={} out={} lat={}ms",
+                p.provider, p.requests, p.input_tokens, p.output_tokens, p.latency_ms
+            );
+        }
     }
     println!("--- recentes ---");
     if recent.is_empty() {
@@ -925,15 +939,22 @@ fn render_stats_text(
     for r in recent {
         let stream = if r.streamed { "SSE " } else { "    " };
         let err = if r.error { " ERROR" } else { "" };
+        let mut extra = String::new();
+        if let Some(e) = r.energy_kwh_um {
+            extra.push_str(&format!(" {:.3e}kWh", e as f64 / 1_000_000.0));
+        }
+        if let Some(c) = r.cost_usd_um {
+            extra.push_str(&format!(" ${:.3e}", c as f64 / 1_000_000.0));
+        }
         println!(
-            "{:<12} {stream} {:>3} {:<4} {:<10} {err}",
+            "{:<12} {stream} {:>3} {:<4} {:<10}{extra}{err}",
             r.endpoint, r.status, r.latency_ms, r.provider
         );
     }
 }
 
 /// Render the stats report as JSON.
-#[allow(clippy::format_push_string)]
+#[allow(clippy::format_push_string, clippy::cast_precision_loss)]
 fn render_stats_json(
     summary: &crate::stats::RowSummary,
     by_provider: &[crate::stats::ProviderStats],
@@ -945,6 +966,8 @@ fn render_stats_json(
         "output_tokens": summary.output_tokens,
         "total_latency_ms": summary.latency_ms,
         "errors": summary.errors,
+        "energy_kwh": summary.energy_kwh_um as f64 / 1_000_000.0,
+        "cost_usd": summary.cost_usd_um as f64 / 1_000_000.0,
     });
     let providers_json: Vec<serde_json::Value> = by_provider
         .iter()
@@ -955,13 +978,15 @@ fn render_stats_json(
                 "input_tokens": p.input_tokens,
                 "output_tokens": p.output_tokens,
                 "total_latency_ms": p.latency_ms,
+                "energy_kwh": p.energy_kwh_um as f64 / 1_000_000.0,
+                "cost_usd": p.cost_usd_um as f64 / 1_000_000.0,
             })
         })
         .collect();
     let recent_json: Vec<serde_json::Value> = recent
         .iter()
         .map(|r| {
-            serde_json::json!({
+            let mut v = serde_json::json!({
                 "ts": r.ts,
                 "endpoint": r.endpoint,
                 "provider": r.provider,
@@ -972,7 +997,14 @@ fn render_stats_json(
                 "status": r.status,
                 "latency_ms": r.latency_ms,
                 "error": r.error,
-            })
+            });
+            if let Some(e) = r.energy_kwh_um {
+                v["energy_kwh_um"] = serde_json::json!(e);
+            }
+            if let Some(c) = r.cost_usd_um {
+                v["cost_usd_um"] = serde_json::json!(c);
+            }
+            v
         })
         .collect();
     let out = serde_json::json!({

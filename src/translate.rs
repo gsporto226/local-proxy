@@ -1266,6 +1266,82 @@ pub struct TokenUsage {
     pub reasoning: u64,
 }
 
+/// Energy and cost metadata reported by energy-priced providers (`NeuralWatt`).
+///
+/// Fields are optional because not every request produces them (e.g. when the
+/// GPU doesn't expose NVML metrics). Floats from upstream are kept as `f64`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct EnergyCost {
+    /// Total energy in joules, if reported.
+    pub energy_joules: Option<f64>,
+    /// Total energy in kilowatt-hours, if reported.
+    pub energy_kwh: Option<f64>,
+    /// Average power draw in watts during the request, if reported.
+    pub avg_power_watts: Option<f64>,
+    /// The request's monetary cost in USD.
+    pub request_cost_usd: Option<f64>,
+    /// Cache savings in USD.
+    pub cache_savings_usd: Option<f64>,
+}
+
+/// Parse a NeuralWatt-style top-level `energy` object.
+#[must_use]
+pub fn energy_from_value(value: &Value) -> Option<EnergyCost> {
+    let obj = value.get("energy")?.as_object()?;
+    let f = |k: &str| obj.get(k).and_then(Value::as_f64);
+    Some(EnergyCost {
+        energy_joules: f("energy_joules"),
+        energy_kwh: f("energy_kwh"),
+        avg_power_watts: f("avg_power_watts"),
+        request_cost_usd: None,
+        cache_savings_usd: None,
+    })
+}
+
+/// Parse a NeuralWatt-style top-level `cost` object.
+#[must_use]
+pub fn cost_from_value(value: &Value) -> Option<EnergyCost> {
+    let obj = value.get("cost")?.as_object()?;
+    let f = |k: &str| obj.get(k).and_then(Value::as_f64);
+    Some(EnergyCost {
+        energy_joules: None,
+        energy_kwh: None,
+        avg_power_watts: None,
+        request_cost_usd: f("request_cost_usd"),
+        cache_savings_usd: f("cache_savings_usd"),
+    })
+}
+
+/// Parse a `NeuralWatt` energy comment payload (a bare `energy` object, not
+/// wrapped in a top-level `energy` key), e.g. from an `SSE` comment.
+#[must_use]
+pub fn energy_from_payload(value: &Value) -> Option<EnergyCost> {
+    let obj = value.as_object()?;
+    let f = |k: &str| obj.get(k).and_then(Value::as_f64);
+    Some(EnergyCost {
+        energy_joules: f("energy_joules"),
+        energy_kwh: f("energy_kwh"),
+        avg_power_watts: f("avg_power_watts"),
+        request_cost_usd: None,
+        cache_savings_usd: None,
+    })
+}
+
+/// Parse a `NeuralWatt` cost comment payload (a bare `cost` object), e.g. from
+/// an `SSE` comment.
+#[must_use]
+pub fn cost_from_payload(value: &Value) -> Option<EnergyCost> {
+    let obj = value.as_object()?;
+    let f = |k: &str| obj.get(k).and_then(Value::as_f64);
+    Some(EnergyCost {
+        energy_joules: None,
+        energy_kwh: None,
+        avg_power_watts: None,
+        request_cost_usd: f("request_cost_usd"),
+        cache_savings_usd: f("cache_savings_usd"),
+    })
+}
+
 /// Tolerantly parse usage from any upstream shape (Anthropic, `OpenAI`, Responses).
 #[must_use]
 pub fn parse_usage(value: &Value) -> TokenUsage {
@@ -1849,6 +1925,41 @@ mod tests {
             usage_from_frame(&json!({"type": "message_stop"})),
             TokenUsage::default()
         );
+    }
+
+    #[test]
+    fn parses_top_level_energy_and_cost() {
+        // non-streaming: top-level `energy` and `cost` fields
+        let body = json!({
+            "choices": [],
+            "energy": {"energy_kwh": 1.5e-5, "energy_joules": 54.0, "avg_power_watts": 55.3},
+            "cost": {"request_cost_usd": 1.04e-5, "cache_savings_usd": 0.0}
+        });
+        let e = energy_from_value(&body).unwrap();
+        assert_eq!(e.energy_kwh, Some(1.5e-5));
+        assert_eq!(e.energy_joules, Some(54.0));
+        assert_eq!(e.avg_power_watts, Some(55.3));
+        let c = cost_from_value(&body).unwrap();
+        assert_eq!(c.request_cost_usd, Some(1.04e-5));
+        assert_eq!(c.cache_savings_usd, Some(0.0));
+    }
+
+    #[test]
+    fn parses_energy_cost_comment_payloads() {
+        // streaming: bare objects from SSE comments
+        let e = energy_from_payload(
+            &json!({"energy_joules": 4.99, "energy_kwh": 1.385e-6, "avg_power_watts": 55.3}),
+        )
+        .unwrap();
+        assert_eq!(e.energy_kwh, Some(1.385e-6));
+        assert_eq!(e.energy_joules, Some(4.99));
+        let c = cost_from_payload(&json!({"request_cost_usd": 1.04e-5, "cache_savings_usd": 0.0}))
+            .unwrap();
+        assert_eq!(c.request_cost_usd, Some(1.04e-5));
+
+        // no energy/cost key -> None
+        assert!(energy_from_value(&json!({"choices": []})).is_none());
+        assert!(cost_from_value(&json!({})).is_none());
     }
 
     #[test]

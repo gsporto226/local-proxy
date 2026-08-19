@@ -207,8 +207,13 @@ do `usage` do upstream: nos requests **não-streaming** (do corpo da resposta) e
 acumulando o `usage` dos frames SSE (chunks OpenAI, `message_start`/`message_delta` Anthropic e
 `response.completed` de Responses) — as requisições são registradas quando o fluxo termina.
 
+Providers com **preço por energia** (NeuralWatt) têm seus metadados de **energia e custo** capturados:
+em responses non-streaming pelos campos top-level `energy`/`cost`, e em streaming pelos **comentários
+SSE** (`: energy {...}` / `: cost {...}`). O relatório mostra totais de energia (kWh) e custo (USD)
+por janela e por provider quando presentes.
+
 ```powershell
-local-proxy stats               # resumo do dia (requests, tokens in/out, latency, erros) + por provider + recentes
+local-proxy stats               # resumo do dia (requests, tokens/energia/custo, latency, erros) + por provider + recentes
 local-proxy stats --since week  # dia | week | month | all
 local-proxy stats --json        # mesmo relatório em JSON (summary/providers/recent)
 ```

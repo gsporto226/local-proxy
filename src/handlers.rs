@@ -23,7 +23,7 @@ use crate::config::{Config, ConfigError, ProviderFormat};
 use crate::error::ApiError;
 use crate::router::{Router, RouterError};
 use crate::stats::{self, StatLine};
-use crate::streams::{self, StreamCapture, UpstreamStream};
+use crate::streams::{self, parse_energy_comment, StreamCapture, UpstreamStream};
 use crate::translate;
 use crate::upstream::{send_and_read, ProviderClient, UpstreamError};
 
@@ -300,7 +300,30 @@ struct ScannedClientStream {
     capture: Option<StreamCapture>,
     buf: String,
     usage: translate::TokenUsage,
+    energy: Option<translate::EnergyCost>,
+    cost: Option<translate::EnergyCost>,
     recorded: bool,
+}
+
+impl ScannedClientStream {
+    fn absorb(&mut self, frame: &crate::sse::SseFrame) {
+        if let Some(v) = frame.json() {
+            let part = translate::usage_from_frame(&v);
+            if part != translate::TokenUsage::default() {
+                translate::merge_usage(&mut self.usage, part);
+            }
+        }
+        for comment in &frame.comments {
+            if let Some((e, c)) = parse_energy_comment(comment) {
+                if e.is_some() {
+                    self.energy = e;
+                }
+                if c.is_some() {
+                    self.cost = c;
+                }
+            }
+        }
+    }
 }
 
 impl Stream for ScannedClientStream {
@@ -314,27 +337,19 @@ impl Stream for ScannedClientStream {
         match this.inner.as_mut().poll_next(cx) {
             std::task::Poll::Ready(Some(Ok(bytes))) => {
                 for frame in crate::sse::feed_frames(&mut this.buf, &bytes) {
-                    if let Some(v) = frame.json() {
-                        let part = translate::usage_from_frame(&v);
-                        if part != translate::TokenUsage::default() {
-                            translate::merge_usage(&mut this.usage, part);
-                        }
-                    }
+                    this.absorb(&frame);
                 }
                 std::task::Poll::Ready(Some(Ok(bytes)))
             }
             std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
             std::task::Poll::Ready(None) => {
                 if let Some(f) = crate::sse::flush_frames(&mut this.buf) {
-                    if let Some(v) = f.json() {
-                        let part = translate::usage_from_frame(&v);
-                        translate::merge_usage(&mut this.usage, part);
-                    }
+                    this.absorb(&f);
                 }
                 if !this.recorded {
                     this.recorded = true;
                     if let Some(c) = &this.capture {
-                        c.record(this.usage);
+                        c.record(this.usage, this.energy, this.cost);
                     }
                 }
                 std::task::Poll::Ready(None)
@@ -358,6 +373,8 @@ fn passthrough_stream(resp: reqwest::Response, capture: Option<StreamCapture>) -
             capture,
             buf: String::new(),
             usage: translate::TokenUsage::default(),
+            energy: None,
+            cost: None,
             recorded: false,
         }))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
@@ -404,7 +421,7 @@ fn client_for(
 /// Extracts token usage from the upstream (already consumed) body where
 /// possible, records the row against the local stats database, and ignores any
 /// failure. The provider/model are the resolved upstream ones. Streaming
-/// requests are recorded by [`StreamCapture`] once the SSE stream completes.
+/// requests are recorded by [`StreamCapture`] once the `SSE` stream completes.
 #[allow(clippy::needless_pass_by_value)]
 fn capture(
     endpoint: &'static str,
@@ -416,11 +433,15 @@ fn capture(
     started: &Instant,
 ) {
     let mut tokens = crate::translate::TokenUsage::default();
-    if let Some(body) = upstream_body {
+    let (energy, cost) = upstream_body.map_or((None, None), |body| {
         if let Some(u) = body.get("usage") {
             tokens = crate::translate::parse_usage(u);
         }
-    }
+        (
+            crate::translate::energy_from_value(body),
+            crate::translate::cost_from_value(body),
+        )
+    });
     stats::record(
         *started,
         StatLine {
@@ -432,6 +453,8 @@ fn capture(
             streamed,
             status,
             error: status >= 400,
+            energy,
+            cost,
         },
     );
 }

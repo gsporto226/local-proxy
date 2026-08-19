@@ -9,7 +9,7 @@ use serde_json::{json, Value};
 
 use crate::sse::{sse_frames, SseError, SseFrame};
 use crate::stats::{self, StatLine};
-use crate::translate::{parse_usage, responses_usage, TokenUsage};
+use crate::translate::{parse_usage, responses_usage, EnergyCost, TokenUsage};
 
 /// A stream of already-framed SSE `Event`s ready to be sent to the client.
 pub type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
@@ -47,8 +47,9 @@ impl StreamCapture {
         }
     }
 
-    /// Write the stats row with the final cumulative `usage`. Best-effort.
-    pub fn record(&self, usage: TokenUsage) {
+    /// Write the stats row with the final cumulative `usage`, plus any energy
+    /// and cost metadata observed in the stream (NeuralWatt-style). Best-effort.
+    pub fn record(&self, usage: TokenUsage, energy: Option<EnergyCost>, cost: Option<EnergyCost>) {
         stats::record(
             self.started,
             StatLine {
@@ -60,6 +61,8 @@ impl StreamCapture {
                 streamed: true,
                 status: self.status,
                 error: self.status >= 400,
+                energy,
+                cost,
             },
         );
     }
@@ -102,6 +105,23 @@ trait Machine: Send {
     fn usage(&self) -> TokenUsage;
 }
 
+/// Parse an `SSE` comment line carrying `NeuralWatt` metadata.
+///
+/// Comments look like `energy {...}` or `cost {...}`; the leading `:` and
+/// space are stripped by the `SSE` parser, so `comment` is `energy {...}`.
+#[must_use]
+pub fn parse_energy_comment(comment: &str) -> Option<(Option<EnergyCost>, Option<EnergyCost>)> {
+    let (kind, json) = comment.split_once(' ')?;
+    let Ok(value) = serde_json::from_str::<Value>(json.trim()) else {
+        return None;
+    };
+    match kind {
+        "energy" => Some((crate::translate::energy_from_payload(&value), None)),
+        "cost" => Some((None, crate::translate::cost_from_payload(&value))),
+        _ => None,
+    }
+}
+
 struct Driver<M: Machine> {
     frames: Pin<Box<dyn Stream<Item = Result<SseFrame, SseError>> + Send>>,
     machine: M,
@@ -110,6 +130,8 @@ struct Driver<M: Machine> {
     finalized: bool,
     capture: Option<StreamCapture>,
     reported: bool,
+    energy: Option<EnergyCost>,
+    cost: Option<EnergyCost>,
 }
 
 async fn drive<M: Machine>(mut st: Driver<M>) -> Option<(Result<Event, Infallible>, Driver<M>)> {
@@ -124,7 +146,7 @@ async fn drive<M: Machine>(mut st: Driver<M>) -> Option<(Result<Event, Infallibl
                 if !st.reported {
                     st.reported = true;
                     if let Some(c) = &st.capture {
-                        c.record(st.machine.usage());
+                        c.record(st.machine.usage(), st.energy, st.cost);
                     }
                 }
                 if st.pending.is_empty() {
@@ -135,7 +157,19 @@ async fn drive<M: Machine>(mut st: Driver<M>) -> Option<(Result<Event, Infallibl
             return None;
         }
         match st.frames.next().await {
-            Some(Ok(frame)) => st.pending = st.machine.process(&frame),
+            Some(Ok(frame)) => {
+                for comment in &frame.comments {
+                    if let Some((e, c)) = parse_energy_comment(comment) {
+                        if e.is_some() {
+                            st.energy = e;
+                        }
+                        if c.is_some() {
+                            st.cost = c;
+                        }
+                    }
+                }
+                st.pending = st.machine.process(&frame);
+            }
             Some(Err(_)) | None => st.done = true,
         }
     }
@@ -154,6 +188,8 @@ fn build<M: Machine + 'static>(
         finalized: false,
         capture,
         reported: false,
+        energy: None,
+        cost: None,
     };
     Box::pin(futures_util::stream::unfold(driver, drive))
 }
@@ -905,6 +941,7 @@ impl Machine for A2RMachine {
                                 self.process(&SseFrame {
                                     event: Some("content_block_start".to_string()),
                                     data: json!({"type": "content_block_start", "index": index, "content_block": {"type": "text", "text": ""}}).to_string(),
+                                    comments: Vec::new(),
                                 })
                                 .into_iter()
                                 .for_each(|e| events.push(e));
@@ -1366,6 +1403,7 @@ mod tests {
         SseFrame {
             event: None,
             data: data.to_string(),
+            comments: Vec::new(),
         }
     }
 
@@ -1454,6 +1492,28 @@ mod tests {
                 reasoning: 0
             }
         );
+    }
+
+    #[test]
+    fn parses_energy_and_cost_comments() {
+        let (e, c) =
+            parse_energy_comment("energy {\"energy_joules\": 4.99, \"energy_kwh\": 1.385e-6}")
+                .unwrap();
+        let e = e.unwrap();
+        assert_eq!(e.energy_kwh, Some(1.385e-6));
+        assert_eq!(e.energy_joules, Some(4.99));
+        assert!(c.is_none());
+
+        let (e2, c2) = parse_energy_comment(
+            "cost {\"request_cost_usd\": 1.04e-5, \"cache_savings_usd\": 0.0}",
+        )
+        .unwrap();
+        assert!(e2.is_none());
+        assert_eq!(c2.unwrap().request_cost_usd, Some(1.04e-5));
+
+        // unknown / malformed comments are ignored
+        assert!(parse_energy_comment("keep-alive").is_none());
+        assert!(parse_energy_comment("energy not-json").is_none());
     }
 
     // ---- OpenAI -> Anthropic (text) ----

@@ -45,6 +45,10 @@ pub struct StatLine {
     pub status: u16,
     /// Whether the request failed (non-2xx or upstream error).
     pub error: bool,
+    /// Energy metadata reported by the upstream, if any.
+    pub energy: Option<crate::translate::EnergyCost>,
+    /// Cost metadata reported by the upstream, if any.
+    pub cost: Option<crate::translate::EnergyCost>,
 }
 
 /// Errors opening or querying the local statistics database.
@@ -68,7 +72,8 @@ pub enum StatsError {
     },
 }
 
-/// Create the `requests` table if it does not exist yet.
+/// Create the `requests` table if it does not exist yet, migrating any older
+/// schema in place (adding missing columns).
 fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS requests (
@@ -82,11 +87,28 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             streamed INTEGER NOT NULL DEFAULT 0,
             status INTEGER NOT NULL,
             latency_ms INTEGER NOT NULL DEFAULT 0,
-            error INTEGER NOT NULL DEFAULT 0
+            error INTEGER NOT NULL DEFAULT 0,
+            energy_kwh_um INTEGER,
+            cost_usd_um INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
         CREATE INDEX IF NOT EXISTS idx_requests_provider ON requests(provider);",
-    )
+    )?;
+    // Lightweight migration for databases created before energy/cost existed.
+    let cols = ["energy_kwh_um", "cost_usd_um"];
+    for col in cols {
+        let exists: bool = conn
+            .query_row(
+                "SELECT 1 FROM pragma_table_info('requests') WHERE name = ?1",
+                [col],
+                |r| r.get(0),
+            )
+            .unwrap_or(false);
+        if !exists {
+            conn.execute_batch(&format!("ALTER TABLE requests ADD COLUMN {col} INTEGER"))?;
+        }
+    }
+    Ok(())
 }
 
 /// Record one proxy request in the local database, best-effort.
@@ -119,8 +141,8 @@ fn write_line(path: &PathBuf, stat: &StatLine, ts: i64, latency_ms: u64) -> Resu
     conn.execute(
         "INSERT INTO requests
             (ts, endpoint, provider, model, input_tokens, output_tokens,
-             streamed, status, latency_ms, error)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)",
+             streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
         rusqlite::params![
             ts,
             stat.endpoint,
@@ -132,10 +154,18 @@ fn write_line(path: &PathBuf, stat: &StatLine, ts: i64, latency_ms: u64) -> Resu
             i64::from(stat.status),
             latency_ms,
             i64::from(stat.error),
+            stat.energy.and_then(|e| e.energy_kwh).map(to_um),
+            stat.cost.and_then(|c| c.request_cost_usd).map(to_um),
         ],
     )
     .map_err(|source| StatsError::Query { source })?;
     Ok(())
+}
+
+/// Convert a float (e.g. kWh or USD) to fixed-point micro-units for `SQLite`
+/// INTEGER storage, rounding to nearest.
+fn to_um(v: f64) -> i64 {
+    (v * 1_000_000.0).round() as i64
 }
 
 /// A time window used to filter `stats` queries. `None` covers all time; a
@@ -159,6 +189,10 @@ pub struct RowSummary {
     pub latency_ms: u64,
     /// Number of errored requests.
     pub errors: u64,
+    /// Sum of energy in micro-kWh.
+    pub energy_kwh_um: u64,
+    /// Sum of cost in micro-USD.
+    pub cost_usd_um: u64,
 }
 
 /// Per-provider aggregate over the matching window.
@@ -174,6 +208,10 @@ pub struct ProviderStats {
     pub output_tokens: u64,
     /// Sum of latency, in milliseconds.
     pub latency_ms: u64,
+    /// Sum of energy in micro-kWh.
+    pub energy_kwh_um: u64,
+    /// Sum of cost in micro-USD.
+    pub cost_usd_um: u64,
 }
 
 /// One raw request row, used for the recent/detail view.
@@ -199,6 +237,10 @@ pub struct RequestRow {
     pub latency_ms: u64,
     /// Whether the request errored.
     pub error: bool,
+    /// Energy in micro-kWh, if reported.
+    pub energy_kwh_um: Option<u64>,
+    /// Cost in micro-USD, if reported.
+    pub cost_usd_um: Option<u64>,
 }
 
 /// Overall totals for the window, or `None` if the database does not exist yet.
@@ -230,7 +272,8 @@ pub fn summary_on(
     let mut stmt = conn
         .prepare(&format!(
             "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
-                    COALESCE(SUM(latency_ms),0), COALESCE(SUM(error),0)
+                    COALESCE(SUM(latency_ms),0), COALESCE(SUM(error),0),
+                    COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0)
              FROM requests {wsql}"
         ))
         .map_err(|source| StatsError::Query { source })?;
@@ -241,6 +284,8 @@ pub fn summary_on(
             output_tokens: r.get::<_, i64>(2)? as u64,
             latency_ms: r.get::<_, i64>(3)? as u64,
             errors: r.get::<_, i64>(4)? as u64,
+            energy_kwh_um: r.get::<_, i64>(5)? as u64,
+            cost_usd_um: r.get::<_, i64>(6)? as u64,
         })
     })
     .map_err(|source| StatsError::Query { source })
@@ -276,7 +321,8 @@ pub fn by_provider_on(
     let mut stmt = conn
         .prepare(&format!(
             "SELECT provider, COUNT(*), COALESCE(SUM(input_tokens),0),
-                    COALESCE(SUM(output_tokens),0), COALESCE(SUM(latency_ms),0)
+                    COALESCE(SUM(output_tokens),0), COALESCE(SUM(latency_ms),0),
+                    COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0)
              FROM requests {wsql}
              GROUP BY provider ORDER BY provider"
         ))
@@ -289,6 +335,8 @@ pub fn by_provider_on(
                 input_tokens: r.get::<_, i64>(2)? as u64,
                 output_tokens: r.get::<_, i64>(3)? as u64,
                 latency_ms: r.get::<_, i64>(4)? as u64,
+                energy_kwh_um: r.get::<_, i64>(5)? as u64,
+                cost_usd_um: r.get::<_, i64>(6)? as u64,
             })
         })
         .map_err(|source| StatsError::Query { source })?
@@ -328,7 +376,7 @@ pub fn recent_on(
     let (wsql, params) = where_clause(window);
     let sql = format!(
         "SELECT ts, endpoint, provider, model, input_tokens, output_tokens,
-                streamed, status, latency_ms, error
+                streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um
          FROM requests {wsql}
          ORDER BY ts DESC, id DESC LIMIT {limit}"
     );
@@ -348,6 +396,8 @@ pub fn recent_on(
                 status: r.get::<_, i64>(7)? as u16,
                 latency_ms: r.get::<_, i64>(8)? as u64,
                 error: r.get::<_, i64>(9)? != 0,
+                energy_kwh_um: r.get::<_, Option<i64>>(10)?.map(|v| v as u64),
+                cost_usd_um: r.get::<_, Option<i64>>(11)?.map(|v| v as u64),
             })
         })
         .map_err(|source| StatsError::Query { source })?
@@ -381,6 +431,29 @@ mod tests {
                  streamed, status, latency_ms, error)
              VALUES (?1,'/v1/messages',?2,'m',?3,?4,0,200,50,?5)",
             rusqlite::params![ts, provider, inp as i64, out as i64, i64::from(err)],
+        )
+        .unwrap();
+    }
+
+    fn insert_line(conn: &rusqlite::Connection, line: &StatLine) {
+        conn.execute(
+            "INSERT INTO requests
+                (ts, endpoint, provider, model, input_tokens, output_tokens,
+                 streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um)
+             VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+            rusqlite::params![
+                line.endpoint,
+                line.provider,
+                line.model,
+                line.input_tokens as i64,
+                line.output_tokens as i64,
+                i64::from(line.streamed),
+                i64::from(line.status),
+                50i64,
+                i64::from(line.error),
+                line.energy.and_then(|e| e.energy_kwh).map(to_um),
+                line.cost.and_then(|c| c.request_cost_usd).map(to_um),
+            ],
         )
         .unwrap();
     }
@@ -461,5 +534,84 @@ mod tests {
         assert_eq!(rows[0].ts, 300); // newest first
         assert_eq!(rows[1].ts, 200);
         assert_eq!(rows[0].provider, "anthropic");
+    }
+
+    #[test]
+    fn energy_and_cost_persist_and_aggregate() {
+        let conn = in_memory();
+        // a NeuralWatt-style row with energy and cost (micro-units)
+        let e = crate::translate::EnergyCost {
+            energy_joules: Some(54.0),
+            energy_kwh: Some(1.5e-5),
+            avg_power_watts: Some(55.3),
+            request_cost_usd: None,
+            cache_savings_usd: None,
+        };
+        let c = crate::translate::EnergyCost {
+            energy_joules: None,
+            energy_kwh: None,
+            avg_power_watts: None,
+            request_cost_usd: Some(1.04e-5),
+            cache_savings_usd: Some(0.0),
+        };
+        let line = StatLine {
+            endpoint: "/v1/messages",
+            provider: "neuralwatt".to_string(),
+            model: "glm-5.2".to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            streamed: false,
+            status: 200,
+            error: false,
+            energy: Some(e),
+            cost: Some(c),
+        };
+        insert_line(&conn, &line);
+
+        let s = summary_on(&conn, all()).unwrap();
+        // 1.5e-5 kWh -> 15 um; 1.04e-5 USD -> 10.4 -> 10 um (round)
+        assert_eq!(s.energy_kwh_um, 15);
+        assert_eq!(s.cost_usd_um, 10);
+
+        let rows = recent_on(&conn, all(), 1).unwrap();
+        assert_eq!(rows[0].energy_kwh_um, Some(15));
+        assert_eq!(rows[0].cost_usd_um, Some(10));
+    }
+
+    #[test]
+    fn legacy_schema_migrates_in_place() {
+        // a database created before energy/cost columns
+        let conn = rusqlite::Connection::open_in_memory().unwrap();
+        conn.execute_batch(
+            "CREATE TABLE requests (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                ts INTEGER NOT NULL,
+                endpoint TEXT NOT NULL,
+                provider TEXT NOT NULL,
+                model TEXT NOT NULL,
+                input_tokens INTEGER NOT NULL DEFAULT 0,
+                output_tokens INTEGER NOT NULL DEFAULT 0,
+                streamed INTEGER NOT NULL DEFAULT 0,
+                status INTEGER NOT NULL,
+                latency_ms INTEGER NOT NULL DEFAULT 0,
+                error INTEGER NOT NULL DEFAULT 0
+            );",
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO requests
+                (ts, endpoint, provider, model, input_tokens, output_tokens,
+                 streamed, status, latency_ms, error)
+             VALUES (1,'/v1/messages','anthropic','m',1,1,0,200,5,0)",
+            [],
+        )
+        .unwrap();
+
+        // ensure_schema should add the missing columns without losing rows
+        ensure_schema(&conn).unwrap();
+        let s = summary_on(&conn, all()).unwrap();
+        assert_eq!(s.requests, 1);
+        assert_eq!(s.input_tokens, 1);
+        assert_eq!(s.energy_kwh_um, 0);
     }
 }

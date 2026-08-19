@@ -10,6 +10,10 @@ pub struct SseFrame {
     pub event: Option<String>,
     /// The frame's `data:` payload.
     pub data: String,
+    /// `SSE` comment lines (starting with `:`), e.g. `NeuralWatt`'s
+    /// `: energy {...}` / `: cost {...}`. Comments carry no event semantics
+    /// but may hold provider-specific metadata.
+    pub comments: Vec<String>,
 }
 
 impl SseFrame {
@@ -107,6 +111,7 @@ pub fn flush_frames(buf: &mut String) -> Option<SseFrame> {
 fn parse_frame(text: &str) -> SseFrame {
     let mut event = None;
     let mut data = String::new();
+    let mut comments = Vec::new();
     for line in text.lines() {
         if let Some(rest) = line.strip_prefix("event:") {
             event = Some(rest.trim().to_string());
@@ -115,10 +120,16 @@ fn parse_frame(text: &str) -> SseFrame {
                 data.push('\n');
             }
             data.push_str(rest.trim_start());
+        } else if let Some(rest) = line.strip_prefix(':') {
+            comments.push(rest.trim_start().to_string());
         }
-        // comments (lines starting with ':') and unknown fields are ignored
+        // unknown fields are ignored
     }
-    SseFrame { event, data }
+    SseFrame {
+        event,
+        data,
+        comments,
+    }
 }
 
 #[cfg(test)]
@@ -130,6 +141,21 @@ mod tests {
         let f = parse_frame("event: message_start\ndata: {\"a\":1}");
         assert_eq!(f.event.as_deref(), Some("message_start"));
         assert_eq!(f.data, "{\"a\":1}");
+    }
+
+    #[test]
+    fn captures_comment_lines() {
+        let f = parse_frame(
+            "data: x\n: energy {\"energy_kwh\": 1.385e-06}\n: cost {\"r\": 1}\ndata: [DONE]",
+        );
+        assert_eq!(
+            f.comments,
+            vec![
+                "energy {\"energy_kwh\": 1.385e-06}".to_string(),
+                "cost {\"r\": 1}".to_string(),
+            ]
+        );
+        assert_eq!(f.data, "x\n[DONE]");
     }
 
     #[test]

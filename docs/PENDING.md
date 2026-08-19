@@ -109,8 +109,24 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
 - Uso: `local-proxy connect neuralwatt` + `local-proxy model <id>` — sem código específico, tudo
   reuso do formato `openai`.
 
+### Nova rodada — captura de energia e custo (NeuralWatt)
+- NeuralWatt usa **preço por energia** e devolve metadados de energia/custo em cada resposta:
+  **non-streaming** como campos top-level `energy`/`cost`; **streaming** como **comentários SSE**
+  (`: energy {...}` / `: cost {...}`) antes do `data: [DONE]` (invisíveis a clients padrão).
+- `sse::parse_frame` agora captura linhas de comentário em `SseFrame.comments` (antes eram descartadas).
+- `translate::{energy_from_value, cost_from_value, energy_from_payload, cost_from_payload}` parseiam
+  as shapes documentadas; `stat` guarda os campos mais relevantes.
+- `stats.rs`: colunas `energy_kwh_um` / `cost_usd_um` (micro-units fixos) + **migração in-place** de
+  schemas antigos (`ensure_schema` adiciona colunas ausentes via `pragma_table_info`).
+- Streaming: o `Driver` das máquinas e o `ScannedClientStream` do passthrough leem `frame.comments` e
+  registram energia/custo no fim do fluxo.
+- `local-proxy stats` (texto + `--json`): totais de energia (kWh) e custo (USD) por janela e por
+  provider; recentes mostram valor quando presente.
+- Testes: parse de comentários SSE, parse top-level/payload, round-trip + agregação no stats, e
+  migração de schema legado. **122** verdes; fmt/clippy limpos; e2e 16.
+
 ### Estado de verificação (task 010)
-- `cargo test --all-features`: **116** unit tests verdes.
+- `cargo test --all-features`: **122** unit tests verdes.
 - `cargo clippy --all-targets --all-features -- -D warnings`: limpo.
 - `cargo fmt --all -- --check`: limpo.
 - `bun test e2e/mock.test.ts`: **16** testes determinísticos verdes (suite reescrita para a semântica de
