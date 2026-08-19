@@ -101,9 +101,10 @@ pub struct Route {
 pub struct Defaults {
     /// Provider used when no route matches.
     pub provider: String,
-    /// Active model that overrides the harness's requested model for routing
-    /// (set via MCP `models(select)`; persists across restarts).
-    pub model: Option<String>,
+    /// Active model that the proxy routes all traffic through, ignoring the
+    /// model requested by the harness. Set via `local-proxy model` or MCP
+    /// `models(select)`; persists across restarts.
+    pub active_model: Option<String>,
 }
 
 /// Top-level parsed configuration.
@@ -466,7 +467,7 @@ mod tests {
         assert!(config.providers.is_empty());
         assert!(config.routes.is_empty());
         assert!(config.defaults.provider.is_empty());
-        assert_eq!(config.defaults.model, None);
+        assert_eq!(config.defaults.active_model, None);
     }
 
     #[test]

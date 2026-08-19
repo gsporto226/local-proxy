@@ -56,7 +56,7 @@ pub fn effective_config(base: Config, overlay: Config) -> Config {
         } else {
             overlay.defaults.provider.clone()
         },
-        model: overlay.defaults.model.or(base.defaults.model),
+        active_model: overlay.defaults.active_model.or(base.defaults.active_model),
     };
 
     Config {
@@ -175,15 +175,16 @@ defaults:
     #[test]
     fn overlay_default_model_kept_and_base_passthrough() {
         let base = catalog();
-        assert_eq!(base.defaults.model, None);
+        assert_eq!(base.defaults.active_model, None);
 
-        let overlay = Config::from_str("defaults:\n  model: gpt-4o\n", "yaml").expect("parses");
+        let overlay =
+            Config::from_str("defaults:\n  active_model: gpt-4o\n", "yaml").expect("parses");
         let merged = effective_config(base, overlay);
-        assert_eq!(merged.defaults.model.as_deref(), Some("gpt-4o"));
+        assert_eq!(merged.defaults.active_model.as_deref(), Some("gpt-4o"));
 
         let empty = Config::from_str("", "yaml").expect("parses");
         let merged = effective_config(catalog(), empty);
-        assert_eq!(merged.defaults.model, None);
+        assert_eq!(merged.defaults.active_model, None);
     }
 
     #[test]

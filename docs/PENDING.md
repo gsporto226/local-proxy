@@ -41,7 +41,7 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
 ### Nova rodada — MCP + select (009)
 - `local-proxy mcp`: servidor MCP stdio com `rmcp` 3.x; tools `connect`, `disconnect`, `providers`,
   `models([select])`.
-- `models(select)` valida e persiste `defaults.model` no config; com o campo setado o proxy **ignora
+- `models(select)` valida e persiste `defaults.active_model` no config; com o campo setado o proxy **ignora
   o modelo do harness** e roteia pelo selecionado (persiste entre reinícios; aplica em runtime via
   watcher).
 
@@ -57,10 +57,23 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
   `update::replace` mostra o comando manual.
 - `serve --check-update`: avisa no log se houver release mais nova (desativável com
   `$env:LOCAL_PROXY_DISABLE_AUTOUPDATE=1`).
-- `cargo test --all-features`: **95** unit tests verdes; fmt/clippy limpos.
+- `cargo test --all-features`: **103** unit tests verdes; fmt/clippy limpos.
+
+### Nova rodada — semântica de modelo + init
+- `models`/`model` agora só operam com **providers conectados** (chave resolvível). O proxy **nunca
+  usa o modelo pedido pelo harness** — roteia pelo modelo ativo: o selecionado, senão o primeiro de
+  um provider conectado, senão erro.
+- Campo renomeado: `defaults.model` → `defaults.active_model` (persistido via `model`/MCP
+  `models(select)`).
+- Novos comandos CLI: `model [<model>]` e `model clear` (mesma lógica do MCP `models(select)`).
+- MCP `models`/`select` agora **delegam ao CLI** (`model`/`models`) — paridade total de comportamento
+  entre MCP e CLI (mesma validação e mensagens; `models()` lista só modelos de providers conectados).
+- `init [--yes]`: detecta harnesses (opencode/claude) e registra o servidor MCP do local-proxy nos
+  configs deles (`opencode.json`/`.claude.json`; preserva chaves, backup em `<path>.bak`); só MCP,
+  sem setup de provider/modelo.
 
 ### Estado de verificação (task 010)
-- `cargo test --all-features`: **95** unit tests verdes.
+- `cargo test --all-features`: **103** unit tests verdes.
 - `cargo clippy --all-targets --all-features -- -D warnings`: limpo.
 - `cargo fmt --all -- --check`: limpo.
 - `bun test e2e/mock.test.ts`: **17** testes determinísticos verdes.
@@ -75,7 +88,7 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
 - Suíte e2e em Bun, README, config.example.yaml, docs/PLAN.md, docs/PENDING.md.
 
 ## Pendências futuras (não-bloqueantes / fora do escopo v1)
-- `models(select)` (persistir `defaults.model`) reescreve o config via serde — **comentários/formação
+- `models(select)` (persistir `defaults.active_model`) reescreve o config via serde — **comentários/formação
   manuais do config.yaml são perdidos** nessa escrita (aceito; documentado).
 - Tools MCP podem ser despachadas concorrentemente pelo cliente; `connect`+`disconnect` simultâneos
   podem raciar no `auth.json` (escrita atômica previne corrupção; possível lock no futuro).

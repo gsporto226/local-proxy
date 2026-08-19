@@ -7,8 +7,8 @@
 //! - `connect(provider, key)` — store an API key for an existing provider.
 //! - `disconnect(provider)` — remove a stored API key.
 //! - `providers()` — list effective providers (catalog ∪ config) + key status.
-//! - `models([select])` — list effective models; `select` persists the active
-//!   default model in the config (which overrides the harness's model).
+//! - `models([select])` — list models from connected providers; `select` persists
+//!   the active model in the config (which overrides the harness's model).
 
 use std::path::PathBuf;
 
@@ -83,37 +83,25 @@ impl LocalProxyServer {
             .map_err(|e| McpError::internal_error(e.to_string(), None))
     }
 
-    /// List effective models, or select one as the active default model.
+    /// List models from connected providers, or select one as the active model.
     #[tool(
-        description = "List effective models; pass `select` to persist the active default model (overrides the harness's model)"
+        description = "List models from connected providers; pass `select` to persist the active model (overrides the harness's model; empty string clears)"
     )]
     fn models(&self, Parameters(params): Parameters<ModelsParams>) -> Result<String, McpError> {
-        let state = crate::handlers::build_runtime_state(&self.config_path)
-            .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-        let models = state.router.list_models();
         match params.select.as_deref() {
-            Some("") => {
-                crate::cli::set_default_model(&self.config_path, None)
+            Some("") => crate::cli::model_result(&self.config_path, Some("clear"))
+                .map_err(|e| McpError::internal_error(e.to_string(), None)),
+            Some(selected) => crate::cli::model_result(&self.config_path, Some(selected))
+                .map_err(|e| McpError::internal_error(e.to_string(), None)),
+            None => {
+                let list = crate::cli::models_list(&self.config_path)
                     .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                Ok("selecao de modelo removida (defaults.model limpo)".to_string())
-            }
-            Some(selected) => {
-                if !models.iter().any(|m| m == selected) {
-                    return Err(McpError::internal_error(
-                        format!(
-                            "modelo '{selected}' nao existe; disponiveis: {}",
-                            models.join(", ")
-                        ),
-                        None,
-                    ));
+                if list.is_empty() {
+                    Ok("no providers are connected".to_string())
+                } else {
+                    Ok(list.join("\n"))
                 }
-                crate::cli::set_default_model(&self.config_path, Some(selected))
-                    .map_err(|e| McpError::internal_error(e.to_string(), None))?;
-                Ok(format!(
-                    "modelo '{selected}' selecionado (persistido no config; o proxy aplica em runtime)"
-                ))
             }
-            None => Ok(models.join("\n")),
         }
     }
 }

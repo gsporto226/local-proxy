@@ -22,6 +22,9 @@ pub mod config;
 /// Shared error types.
 pub mod error;
 
+/// Harness (opencode/claude) detection and MCP config registration.
+pub mod harness;
+
 /// Axum HTTP request handlers.
 pub mod handlers;
 

@@ -60,8 +60,13 @@ enum Command {
     Status,
     /// Stop the background proxy
     Stop,
-    /// List routed models
+    /// List models available from connected providers
     Models,
+    /// Get or set the active model (selected, else first available)
+    Model {
+        /// Model to set as active; omit to show current; "clear" to unset
+        model: Option<String>,
+    },
     /// Store the API key for an existing provider (catalog or config)
     Connect {
         /// Provider name (must exist in the catalog or config)
@@ -78,6 +83,12 @@ enum Command {
     Providers,
     /// Run the MCP stdio server (connect/disconnect/models/providers)
     Mcp,
+    /// Register the local-proxy MCP server into detected harnesses (opencode/claude)
+    Init {
+        /// Auto-accept all detected harnesses without prompting
+        #[arg(long, short)]
+        yes: bool,
+    },
     /// Check for a newer release and stage a manual update from GitHub Releases
     Update {
         /// GitHub owner/repo (overrides `LOCAL_PROXY_REPO`)
@@ -132,10 +143,12 @@ fn main() -> miette::Result<()> {
         Some(Command::Status) => cli::status(config),
         Some(Command::Stop) => cli::stop(config),
         Some(Command::Models) => cli::models(config),
+        Some(Command::Model { model }) => cli::model(config, model),
         Some(Command::Connect { provider, key }) => cli::connect(config, provider, key),
         Some(Command::Disconnect { provider }) => cli::disconnect(config, provider),
         Some(Command::Providers) => cli::providers(config),
         Some(Command::Mcp) => block_on(cli::mcp(config)),
+        Some(Command::Init { yes }) => cli::init(config, yes),
         Some(Command::Update {
             repo,
             check,

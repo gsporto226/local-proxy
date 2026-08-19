@@ -89,19 +89,34 @@ local-proxy disconnect opencode-go       # remove a chave
 
 Resolução da chave por request: `api_key` inline na config → `auth.json[provider]` → `api_key_env`.
 
-### Modelo ativo (`models(select)` via MCP)
+### Modelo ativo (`model` / `models(select)`)
 
-O servidor MCP permite **selecionar o modelo ativo**, persistido no config (`defaults.model`):
+O proxy **nunca usa o modelo pedido pelo harness** (ex.: `ANTHROPIC_MODEL` do Claude Code). Ele
+roteia pelo **modelo ativo**: o modelo explicitamente selecionado, senão o **primeiro modelo
+disponível de um provider conectado**, senão erro. Um provider está *conectado* quando tem uma chave
+resolvível (inline no config → `auth.json` → env var).
+
+Seleção e consulta são feitas pelo CLI **ou** pelo MCP — a mesma lógica (paridade total):
+
+```
+local-proxy model                        # modelo ativo (selecionado, senão o primeiro disponível, senão "none")
+local-proxy model deepseek-v4-flash      # valida contra providers conectados e define o modelo ativo
+local-proxy model clear                  # limpa a seleção (volta ao primeiro disponível)
+local-proxy models                       # lista modelos dos providers conectados
+```
+
+Via MCP (mesmo comportamento do CLI):
 
 ```
 mcp connect opencode-go <key>
-mcp models                            # lista modelos efetivos
-mcp models --select deepseek-v4-flash # define o modelo ativo
+mcp models                            # lista modelos dos providers conectados
+mcp models --select deepseek-v4-flash # define o modelo ativo (valida contra providers conectados)
+mcp models --select ""                # limpa a seleção
 ```
 
-Com `defaults.model` definido, o proxy **ignora o modelo pedido pelo harness** (ex.:
-`ANTHROPIC_MODEL` do Claude Code) e roteia tudo pelo modelo selecionado. O file watcher aplica a
-mudança **sem reiniciar** o proxy.
+A seleção é persistida em `defaults.active_model` (antes `defaults.model`) no config. Com o campo
+setado, o proxy **ignora o modelo pedido pelo harness** e roteia tudo pelo modelo ativo. O file
+watcher aplica a mudança **sem reiniciar** o proxy.
 
 ### Hot-reload
 
@@ -114,7 +129,23 @@ file watcher (debounce 300ms) — nada de reinício.
 local-proxy mcp    # servidor MCP stdio
 ```
 
-Tools: `connect(provider, key)`, `disconnect(provider)`, `providers()`, `models([select])`.
+Tools: `connect(provider, key)`, `disconnect(provider)`, `providers()`, `models([select])` — as
+tools de modelo/lista delegam exatamente ao CLI (`model`/`models`), então se comportam de forma
+idêntica.
+
+### Registrar o MCP nos harnesses (`init`)
+
+`local-proxy init` detecta os harnesses instalados (opencode e/ou Claude Code) e registra o servidor
+MCP do local-proxy nos configs deles (`~/.config/opencode/opencode.json` e `~/.claude.json`),
+preservando as chaves existentes e fazendo backup em `<path>.bak`:
+
+```powershell
+local-proxy init       # pergunta antes de configurar cada harness detectado
+local-proxy init --yes # aceita todos os harnesses detectados sem perguntar
+```
+
+O `init` **só** registra o MCP — não faz setup de provider nem de modelo (isso fica com
+`connect`/`model`).
 
 ## Usar com Claude Code
 
@@ -171,7 +202,7 @@ src/
 ├── config.rs      Config/Provider/Route/Defaults (YAML/JSON) — overlay, auto-created
 ├── catalog.rs     catálogo embutido + merge catálogo↔config
 ├── auth.rs        auth.json (keys) + escrita atômica
-├── cli.rs         serve/launch/status/stop/models/connect/disconnect/providers/mcp/update
+├── cli.rs         serve/launch/status/stop/models/model/connect/disconnect/providers/init/mcp/update
 ├── router.rs      resolve_model → (provider, upstream_model)
 ├── upstream.rs    chamada HTTP + resolução de chave (inline > auth > env)
 ├── translate.rs   requests/responses A↔O↔Responses

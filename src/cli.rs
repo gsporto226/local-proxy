@@ -5,7 +5,6 @@ use std::io;
 use std::net::{TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::sync::Arc;
 use std::time::Duration;
 
 use miette::Diagnostic;
@@ -15,7 +14,6 @@ use thiserror::Error;
 
 use crate::config::{Config, DEFAULT_CONFIG_PATH};
 use crate::handlers::{self, AppState};
-use crate::router::Router;
 
 const LOG_TARGET: &str = "local_proxy";
 
@@ -467,14 +465,73 @@ pub fn stop(config_path: PathBuf) -> miette::Result<()> {
 
 /// Print the list of models the proxy can route to.
 ///
+/// Models available from providers that have a resolvable key (are "connected"),
+/// in provider config order with duplicates removed.
+///
 /// # Errors
 ///
-/// Returns an error if the config cannot be loaded or the router cannot be built.
+/// Returns a [`CliError`] if the catalog or config cannot be loaded.
+#[allow(clippy::result_large_err)]
+pub fn connected_models(config_path: &Path) -> Result<Vec<String>, CliError> {
+    let config = effective_config(config_path)?;
+    let auth = crate::auth::read_auth().unwrap_or_default();
+    let mut models = Vec::new();
+    for provider in &config.providers {
+        if !crate::upstream::provider_has_key(
+            provider,
+            auth.get(&provider.name).map(|e| e.key.as_str()),
+        ) {
+            continue;
+        }
+        for model in &provider.models {
+            if !models.contains(model) {
+                models.push(model.clone());
+            }
+        }
+    }
+    Ok(models)
+}
+
+/// The first model available from a connected provider, or `None` if no
+/// provider has a resolvable key. Used as the default model when the user has
+/// not explicitly selected one.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the catalog or config cannot be loaded.
+#[allow(clippy::result_large_err)]
+pub fn first_available_model(config_path: &Path) -> Result<Option<String>, CliError> {
+    Ok(connected_models(config_path)?.into_iter().next())
+}
+
+/// List the models available from connected providers, deduplicated and in
+/// provider config order.
+///
+/// Returns an empty `Vec` when no provider has a resolvable key. This is the
+/// core list that both the CLI and MCP use.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the catalog or config cannot be loaded.
+#[allow(clippy::result_large_err)]
+pub fn models_list(config_path: &Path) -> Result<Vec<String>, CliError> {
+    connected_models(config_path)
+}
+
+/// Print the list of models available from connected providers, exiting with a
+/// non-zero status if none are connected.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the catalog or config cannot be loaded.
 #[allow(clippy::needless_pass_by_value)]
 pub fn models(config_path: PathBuf) -> miette::Result<()> {
-    let config = Arc::new(effective_config(&config_path)?);
-    let router = Router::new(config).map_err(CliError::from)?;
-    for m in router.list_models() {
+    let connected = models_list(&config_path).map_err(miette::Report::from)?;
+    if connected.is_empty() {
+        println!("no providers are connected");
+        std::process::exit(1);
+    }
+    for m in connected {
         println!("{m}");
     }
     Ok(())
@@ -572,7 +629,7 @@ pub fn list_providers(config_path: &Path) -> Result<String, CliError> {
     Ok(out.trim_end().to_string())
 }
 
-/// Persist `defaults.model` in the config overlay so the model selection
+/// Persist `defaults.active_model` in the config overlay so the model selection
 /// survives restarts. `None` clears the selection. Creates a default config
 /// file if none exists yet.
 ///
@@ -588,13 +645,77 @@ pub fn set_default_model(config_path: &Path, model: Option<&str>) -> Result<(), 
         crate::config::create_default_config(config_path).map_err(CliError::from)?;
     }
     let mut config = Config::load(config_path).map_err(CliError::from)?;
-    config.defaults.model = model.map(str::to_string);
+    config.defaults.active_model = model.map(str::to_string);
     let yaml = serde_yaml::to_string(&config).map_err(|e| CliError::Connect {
         message: format!("falha ao serializar config: {e}"),
     })?;
     let tmp = config_path.with_extension("yaml.tmp");
     std::fs::write(&tmp, yaml).map_err(CliError::from)?;
     std::fs::rename(&tmp, config_path).map_err(CliError::from)?;
+    Ok(())
+}
+
+/// Compute the message for `local-proxy model`: get, set, or clear the active
+/// model, returning the message the CLI prints and that MCP returns verbatim.
+///
+/// With no `model`, returns the effective active model (the selected one, else
+/// the first model available from a connected provider, else "none"). With a
+/// model name, validates it is available from a connected provider and persists
+/// it as the active model. `clear` clears the selection. When no provider is
+/// connected and a model is requested, returns `"no providers are connected"`.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the config cannot be loaded or written, or the
+/// requested model is not available from a connected provider.
+#[allow(clippy::result_large_err)]
+pub fn model_result(config_path: &Path, model: Option<&str>) -> Result<String, CliError> {
+    match model {
+        Some("clear") => {
+            set_default_model(config_path, None)?;
+            Ok("modelo ativo removido".to_string())
+        }
+        Some(selected) => {
+            let connected = connected_models(config_path)?;
+            if connected.is_empty() {
+                return Ok("no providers are connected".to_string());
+            }
+            if !connected.iter().any(|m| m == selected) {
+                return Err(CliError::Connect {
+                    message: format!(
+                        "model '{selected}' nao disponivel em um provider conectado; \
+                         disponiveis: {}",
+                        connected.join(", ")
+                    ),
+                });
+            }
+            set_default_model(config_path, Some(selected))?;
+            Ok(format!("modelo ativo: {selected}"))
+        }
+        None => {
+            let config = effective_config(config_path)?;
+            if let Some(m) = config.defaults.active_model {
+                Ok(m)
+            } else {
+                Ok(first_available_model(config_path)?.map_or_else(
+                    || "none".to_string(),
+                    |m| format!("{m} (nenhum selecionado; usando o primeiro disponivel)"),
+                ))
+            }
+        }
+    }
+}
+
+/// CLI entry for `model`: print the result of [`model_result`].
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the config cannot be loaded or written, or the
+/// requested model is not available from a connected provider.
+#[allow(clippy::needless_pass_by_value)]
+pub fn model(config_path: PathBuf, model: Option<String>) -> miette::Result<()> {
+    let msg = model_result(&config_path, model.as_deref()).map_err(miette::Report::from)?;
+    println!("{msg}");
     Ok(())
 }
 
@@ -607,6 +728,80 @@ pub fn set_default_model(config_path: &Path, model: Option<&str>) -> Result<(), 
 pub fn connect(config_path: PathBuf, provider: String, key: Option<String>) -> miette::Result<()> {
     let msg = connect_provider(&config_path, &provider, key).map_err(miette::Report::from)?;
     println!("{msg}");
+    Ok(())
+}
+
+/// CLI entry for `init`: register the local-proxy MCP server into each
+/// detected harness (opencode/claude) config file.
+///
+/// Detected harnesses are listed; unless `yes` is given, each one is confirmed
+/// via an interactive prompt (defaulting to accept). Only the MCP server
+/// registration is written — model selection and provider setup are untouched.
+/// Existing configs are preserved (merged) and backed up to `<path>.bak`.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if a prompt fails or a harness config cannot be read,
+/// merged, or written.
+#[allow(clippy::needless_pass_by_value)]
+pub fn init(config_path: PathBuf, yes: bool) -> miette::Result<()> {
+    let _ = config_path;
+    let detected = crate::harness::detect();
+    println!("=== configurando MCP local-proxy ===");
+    if detected.is_empty() {
+        println!("nenhum harness detectado (opencode/claude)");
+        return Ok(());
+    }
+    println!("harnesses detectados:");
+    for h in &detected {
+        println!("  - {}", h.name());
+    }
+
+    let mut accepted = Vec::new();
+    for h in detected {
+        let ok = if yes {
+            true
+        } else {
+            dialoguer::Confirm::new()
+                .with_prompt(format!(
+                    "Configurar {} para usar o local-proxy via MCP?",
+                    h.name()
+                ))
+                .default(true)
+                .interact()
+                .map_err(|e| CliError::Connect {
+                    message: format!("falha ao ler a resposta: {e}"),
+                })?
+        };
+        if ok {
+            accepted.push(h);
+        }
+    }
+
+    if accepted.is_empty() {
+        println!("nenhum harness configurado");
+        return Ok(());
+    }
+
+    for h in accepted {
+        let path = h.config_path();
+        let existing = if path.exists() {
+            std::fs::read_to_string(&path).map_err(CliError::from)?
+        } else {
+            String::new()
+        };
+        let merged =
+            crate::harness::merge_mcp_entry(&existing, h).map_err(|e| CliError::Connect {
+                message: format!("falha ao mesclar o config do {}: {e}", h.name()),
+            })?;
+        let written = crate::harness::write_with_backup(&path, &merged).map_err(CliError::from)?;
+        println!(
+            "{} configurado: {} (backup: {}.bak — para desfazer, restaure o backup)",
+            h.name(),
+            written.display(),
+            written.display()
+        );
+    }
     Ok(())
 }
 
@@ -1258,11 +1453,14 @@ mod tests {
 
         set_default_model(&path, Some("deepseek-v4-flash")).expect("persist model");
         let config = Config::load(&path).expect("reload");
-        assert_eq!(config.defaults.model.as_deref(), Some("deepseek-v4-flash"));
+        assert_eq!(
+            config.defaults.active_model.as_deref(),
+            Some("deepseek-v4-flash")
+        );
 
         set_default_model(&path, None).expect("clear model");
         let config = Config::load(&path).expect("reload");
-        assert_eq!(config.defaults.model, None);
+        assert_eq!(config.defaults.active_model, None);
 
         let _ = std::fs::remove_dir_all(&dir);
     }

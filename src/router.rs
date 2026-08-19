@@ -216,7 +216,7 @@ mod tests {
             ],
             defaults: Defaults {
                 provider: "anthropic".to_string(),
-                model: None,
+                active_model: None,
             },
         }
     }

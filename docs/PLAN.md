@@ -71,7 +71,7 @@ routes:
 
 defaults:
   provider: anthropic          # fallback final (nome do modelo passa inalterado)
-  model: null                  # modelo ativo (persistido via MCP models(select)); "" = não usar
+  active_model: null           # modelo ativo (persistido via `model`/MCP `models(select)`); define o roteamento
 ```
 
 ## Auth (`auth.json`)
@@ -96,9 +96,10 @@ em runtime.
 Servidor MCP **stdio** (`rmcp` 3.x, `#[tool_router(server_handler)]`) com tools:
 - `connect(provider, key)` / `disconnect(provider)` — mesma lógica do CLI.
 - `providers()` — providers efetivos + key status.
-- `models([select])` — lista modelos efetivos; com `select` valida e persiste `defaults.model` no
-  config. Com `defaults.model` setado, `resolve_model` **ignora o modelo do harness** e roteia pelo
-  selecionado; `select: ""` limpa.
+- `models([select])` — lista modelos dos **providers conectados**; com `select` valida contra
+  providers conectados e persiste `defaults.active_model` no config (mesma lógica do CLI `model`).
+  Com o campo setado, `resolve_model` **ignora o modelo do harness** e roteia pelo selecionado;
+  `select: ""` limpa. Tools de modelo/lista delegam ao CLI (`model`/`models`) — paridade total.
 
 ## Roteamento (`src/router.rs`) — precedência
 
@@ -180,8 +181,12 @@ Truncar `tool_result` a 120k chars ao reenviar (Anthropic impõe limite).
   `ANTHROPIC_SMALL_FAST_MODEL` se `--model`, executa `claude args`.
 - `launch design [-- args...]` — idem p/ Claude Design (`ANTHROPIC_BASE_URL` + auth).
 - `status` / `stop` — pid file.
-- `models` — lista modelos roteados (efetivos).
+- `models` — lista modelos dos providers conectados (chave resolvível); sai com código 1 se nenhum.
+- `model [<model>]` — mostra o modelo ativo (selecionado, senão o primeiro de um provider conectado,
+  senão `none`); com nome, valida contra providers conectados e persiste; `model clear` limpa.
 - `connect <provider> [key]` / `disconnect <provider>` / `providers` — auth store (`auth.json`).
+- `init [--yes]` — detecta harnesses (opencode/claude) e registra o servidor MCP do local-proxy nos
+  configs deles (preserva chaves existentes, backup em `<path>.bak`); só MCP, sem provider/modelo.
 - `mcp` — servidor MCP stdio (rmcp).
 - `update [--check] [--force] [--repo owner/repo] [--no-verify]` — baixa o binário mais recente do
   último release do GitHub (padrão `gsporto226/local-proxy` ou `$env:LOCAL_PROXY_REPO`), verifica
@@ -207,7 +212,7 @@ src/
 ├── translate.rs   requests/responses A↔O↔Responses
 ├── sse.rs         parser de frames SSE
 ├── streams.rs     máquinas de estado de streaming (3 direções)
-├── mcp.rs         servidor MCP stdio (rmcp): connect/disconnect/providers/models(select)
+├── mcp.rs         servidor MCP stdio (rmcp): connect/disconnect/providers/models(select) — tools delegam ao CLI (paridade)
 ├── error.rs       ApiError + shape por formato
 └── handlers.rs    axum handlers + RuntimeState (RwLock) + watcher hot-reload + /v1/models + count_tokens
 ```

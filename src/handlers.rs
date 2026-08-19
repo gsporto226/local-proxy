@@ -300,19 +300,25 @@ fn passthrough_stream(resp: reqwest::Response) -> Response {
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
-fn resolve_model(
-    state: &RuntimeState,
-    body: &Value,
-) -> Result<(Arc<crate::config::Provider>, String), ApiError> {
-    // When a default model is selected (via MCP `models(select)`), it overrides
-    // whatever model the harness requested, so all traffic routes to it.
-    let requested = match state.config.defaults.model.clone() {
-        Some(model) => model,
-        None => body
-            .get("model")
-            .and_then(Value::as_str)
-            .map(str::to_string)
-            .ok_or_else(|| ApiError::bad_request("missing required field 'model'"))?,
+fn resolve_model(state: &RuntimeState) -> Result<(Arc<crate::config::Provider>, String), ApiError> {
+    // The proxy never uses the model requested by the harness. It routes through
+    // the explicitly selected active model, or the first model available from a
+    // connected provider, or errors if no model is available.
+    let requested = if let Some(model) = state.config.defaults.active_model.clone() {
+        model
+    } else {
+        let first = state.config.providers.iter().find_map(|p| {
+            let connected = state
+                .clients
+                .get(&p.name)
+                .is_some_and(crate::upstream::ProviderClient::has_key);
+            connected.then(|| p.models.first().cloned()).flatten()
+        });
+        first.ok_or_else(|| {
+            ApiError::bad_request(
+                "no model available; connect a provider or run `local-proxy model <model>`",
+            )
+        })?
     };
     let resolved = state
         .router
@@ -357,7 +363,7 @@ async fn handle_messages(
 ) -> Result<Response, ApiError> {
     let mut body = parse_body(body)?;
     let streaming = wants_stream(&body);
-    let (provider, upstream_model) = resolve_model(state, &body)?;
+    let (provider, upstream_model) = resolve_model(state)?;
     body["model"] = json!(upstream_model);
     let client = client_for(state, &provider)?;
 
@@ -426,7 +432,7 @@ async fn handle_chat_completions(
 ) -> Result<Response, ApiError> {
     let mut body = parse_body(body)?;
     let streaming = wants_stream(&body);
-    let (provider, upstream_model) = resolve_model(state, &body)?;
+    let (provider, upstream_model) = resolve_model(state)?;
     body["model"] = json!(upstream_model);
     let client = client_for(state, &provider)?;
 
@@ -495,7 +501,7 @@ async fn handle_responses(
 ) -> Result<Response, ApiError> {
     let mut body = parse_body(body)?;
     let streaming = wants_stream(&body);
-    let (provider, upstream_model) = resolve_model(state, &body)?;
+    let (provider, upstream_model) = resolve_model(state)?;
     body["model"] = json!(upstream_model);
     let client = client_for(state, &provider)?;
 
@@ -710,7 +716,7 @@ mod tests {
     }
 
     #[test]
-    fn default_model_overrides_harness_model_in_routing() {
+    fn active_model_overrides_harness_model_in_routing() {
         let cfg = Arc::new(Config {
             server: crate::config::Server::default(),
             providers: vec![
@@ -718,7 +724,7 @@ mod tests {
                     name: "openai".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),
                     api_key_env: None,
-                    api_key: None,
+                    api_key: Some("sk".to_string()),
                     format: ProviderFormat::Openai,
                     models: vec!["gpt-4o".to_string()],
                 },
@@ -739,7 +745,7 @@ mod tests {
             }],
             defaults: crate::config::Defaults {
                 provider: "openai".to_string(),
-                model: Some("gpt-4o".to_string()),
+                active_model: Some("gpt-4o".to_string()),
             },
         });
         let state = RuntimeState {
@@ -748,10 +754,63 @@ mod tests {
             clients: Arc::new(HashMap::new()),
         };
 
-        // The harness asks for an unknown model, but defaults.model forces gpt-4o.
-        let body = json!({"model": "claude-sonnet-9999"});
-        let (provider, upstream) = resolve_model(&state, &body).expect("resolves");
+        // The harness asks for an unknown model, but active_model forces gpt-4o.
+        let (provider, upstream) = resolve_model(&state).expect("resolves");
         assert_eq!(provider.name, "openai");
         assert_eq!(upstream, "gpt-4o");
+    }
+
+    #[test]
+    fn no_active_model_uses_first_connected_model() {
+        let cfg = Arc::new(Config {
+            server: crate::config::Server::default(),
+            providers: vec![crate::config::Provider {
+                name: "openai".to_string(),
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key_env: None,
+                api_key: Some("sk".to_string()),
+                format: ProviderFormat::Openai,
+                models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
+            }],
+            routes: Vec::new(),
+            defaults: crate::config::Defaults {
+                provider: "openai".to_string(),
+                active_model: None,
+            },
+        });
+        let state = RuntimeState {
+            config: cfg.clone(),
+            router: Arc::new(Router::new(cfg.clone()).unwrap()),
+            clients: Arc::new(build_clients(&cfg).expect("clients")),
+        };
+        let (provider, upstream) = resolve_model(&state).expect("resolves");
+        assert_eq!(provider.name, "openai");
+        assert_eq!(upstream, "gpt-4o");
+    }
+
+    #[test]
+    fn no_model_available_errors() {
+        let cfg = Arc::new(Config {
+            server: crate::config::Server::default(),
+            providers: vec![crate::config::Provider {
+                name: "openai".to_string(),
+                base_url: "https://api.openai.com/v1".to_string(),
+                api_key_env: None,
+                api_key: None,
+                format: ProviderFormat::Openai,
+                models: vec!["gpt-4o".to_string()],
+            }],
+            routes: Vec::new(),
+            defaults: crate::config::Defaults {
+                provider: "openai".to_string(),
+                active_model: None,
+            },
+        });
+        let state = RuntimeState {
+            config: cfg.clone(),
+            router: Arc::new(Router::new(cfg).unwrap()),
+            clients: Arc::new(HashMap::new()),
+        };
+        assert!(resolve_model(&state).is_err());
     }
 }

@@ -95,6 +95,13 @@ impl ProviderClient {
         self.format
     }
 
+    /// Whether this client has a resolvable API key available (inline, auth
+    /// store, or `api_key_env` present in the environment).
+    #[must_use]
+    pub fn has_key(&self) -> bool {
+        self.configured_key().is_ok_and(|k| k.is_some())
+    }
+
     /// Default endpoint path for this provider's format.
     #[must_use]
     pub const fn default_path(&self) -> &'static str {
@@ -187,6 +194,26 @@ impl ProviderClient {
             .map_err(|source| UpstreamError::Request { url, source })?;
         Ok(resp)
     }
+}
+
+/// Whether `provider` has a resolvable API key available through the standard
+/// resolution chain (inline `api_key` → auth store → `api_key_env` present in
+/// the environment).
+///
+/// Mirrors [`ProviderClient::configured_key`] without building an HTTP client,
+/// so it can be used to decide "connected" providers.
+#[must_use]
+pub fn provider_has_key(provider: &Provider, auth_key: Option<&str>) -> bool {
+    if provider.api_key.as_deref().is_some_and(|k| !k.is_empty()) {
+        return true;
+    }
+    if auth_key.is_some_and(|k| !k.is_empty()) {
+        return true;
+    }
+    provider
+        .api_key_env
+        .as_deref()
+        .is_some_and(|env| std::env::var(env).is_ok_and(|k| !k.is_empty()))
 }
 
 /// Read a completed upstream response into `(status, json_body)`, tolerating a
