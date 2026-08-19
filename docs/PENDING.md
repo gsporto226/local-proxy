@@ -76,7 +76,8 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
 - `cargo test --all-features`: **103** unit tests verdes.
 - `cargo clippy --all-targets --all-features -- -D warnings`: limpo.
 - `cargo fmt --all -- --check`: limpo.
-- `bun test e2e/mock.test.ts`: **17** testes determinísticos verdes.
+- `bun test e2e/mock.test.ts`: **16** testes determinísticos verdes (suite reescrita para a semântica de
+  modelo ativo — cada cenário de roteamento usa o próprio `active_model`).
 - `bun test e2e/live-zen.test.ts`: 6 testes contra opencode-zen real — **environmental skip** enquanto o
   modelo free estiver em `FreeUsageLimitError` (rate limit); validam de verdade quando a quota permitir.
 
