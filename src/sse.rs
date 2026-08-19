@@ -82,6 +82,28 @@ fn take_frame(buf: &mut String) -> Option<SseFrame> {
     Some(parse_frame(&frame_text))
 }
 
+/// Feed raw SSE bytes into an accumulator buffer, normalizing CRLF, and return
+/// every complete frame that became available. Partial trailing data stays in
+/// `buf` for the next call.
+pub fn feed_frames(buf: &mut String, data: &[u8]) -> Vec<SseFrame> {
+    buf.push_str(&String::from_utf8_lossy(data));
+    *buf = buf.replace("\r\n", "\n");
+    let mut out = Vec::new();
+    while let Some(f) = take_frame(buf) {
+        out.push(f);
+    }
+    out
+}
+
+/// Flush any remaining (incomplete) buffered data as a final frame, or `None`
+/// when the buffer holds nothing meaningful. Use at end-of-stream.
+pub fn flush_frames(buf: &mut String) -> Option<SseFrame> {
+    if buf.trim().is_empty() {
+        return None;
+    }
+    Some(parse_frame(&std::mem::take(buf)))
+}
+
 fn parse_frame(text: &str) -> SseFrame {
     let mut event = None;
     let mut data = String::new();
@@ -135,6 +157,29 @@ mod tests {
         let f = take_frame(&mut buf).unwrap();
         assert_eq!(f.data, "a");
         assert_eq!(buf, "data: b");
+    }
+
+    #[test]
+    fn feed_frames_splits_across_chunks_and_flush_handles_tail() {
+        let mut buf = String::new();
+        // first chunk carries a full frame plus the start of the next
+        let f1 = feed_frames(&mut buf, b"event: a\ndata: {\"n\":1}\n\ndata: [D");
+        assert_eq!(f1.len(), 1);
+        assert_eq!(f1[0].event.as_deref(), Some("a"));
+        // the partial `data: [D...` is still buffered
+        assert!(!buf.is_empty());
+
+        // second chunk completes `[DONE]`
+        let f2 = feed_frames(&mut buf, b"ONE]\n\n");
+        assert_eq!(f2.len(), 1);
+        assert!(f2[0].is_done());
+        assert!(buf.is_empty());
+
+        // a dangling tail with no trailing blank line is flushed at EOF
+        let mut buf2 = String::new();
+        feed_frames(&mut buf2, b"data: x");
+        let tail = flush_frames(&mut buf2);
+        assert_eq!(tail.unwrap().data, "x");
     }
 
     #[tokio::test]

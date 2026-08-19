@@ -77,15 +77,21 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
   (endpoint, provider, model, tokens in/out, latency, streaming, status, erro). Escrita **best-effort**:
   falha é logada e nunca quebra o proxy.
 - Os 3 handlers (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`) capturam por caminho:
-  streaming grava só o fluxo (tokens não contabilizados); não-streaming captura o `usage` do upstream
-  quando presente; erro grava a requisição com `error=true` e o status real.
+  não-streaming registra no corpo da resposta (extrai o `usage` do upstream); erro grava com
+  `error=true` e o status real.
+- **Streaming**: cada requisição é registrada **quando o SSE termina**. As 3 direções traduzidas
+  acumulam o `usage` acumulado nas máquinas de estado (`streams::*_from_*` recebe um
+  `StreamCapture`; o driver registra no `finalize`). O **passthrough** de mesmo formato teia os bytes
+  originais para o cliente e escaneia os frames SSE (`sse::feed_frames`/`flush_frames`) extraindo o
+  `usage` (`translate::usage_from_frame` + `merge_usage` por campo, max).
 - `local-proxy stats [--since day|week|month|all] [--json]`: resumo agregado (requests, tokens in/out,
   latency total, taxa de erro) + breakdown por provider + 10 requests mais recentes; `--json` imprime o
   mesmo relatório em JSON (`summary`/`providers`/`recent`).
-- `cargo test --all-features`: **108** unit tests verdes (5 novos de stats); fmt/clippy limpos.
+- `cargo test --all-features`: **113** unit tests verdes (5 novos de stats + 5 de usage SSE);
+  fmt/clippy limpos; `bun test e2e/mock.test.ts` 16 verdes.
 
 ### Estado de verificação (task 010)
-- `cargo test --all-features`: **108** unit tests verdes.
+- `cargo test --all-features`: **113** unit tests verdes.
 - `cargo clippy --all-targets --all-features -- -D warnings`: limpo.
 - `cargo fmt --all -- --check`: limpo.
 - `bun test e2e/mock.test.ts`: **16** testes determinísticos verdes (suite reescrita para a semântica de

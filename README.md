@@ -184,9 +184,10 @@ O `serve` aceita `--check-update` para avisar no log quando há versão mais rec
 ## Estatísticas de uso (`stats`)
 
 O proxy registra cada request proxied no banco local `stats.db` (no diretório de config global) —
-best-effort: uma falha de escrita é logada e nunca quebra o proxy. Tokens de **streaming** não são
-contabilizados (só o fluxo é observado); nos requests não-streaming, o `usage` do upstream (se vier)
-é registrado.
+best-effort: uma falha de escrita é logada e nunca quebra o proxy. Tokens são contabilizados a partir
+do `usage` do upstream: nos requests **não-streaming** (do corpo da resposta) e nos **streaming**,
+acumulando o `usage` dos frames SSE (chunks OpenAI, `message_start`/`message_delta` Anthropic e
+`response.completed` de Responses) — as requisições são registradas quando o fluxo termina.
 
 ```powershell
 local-proxy stats               # resumo do dia (requests, tokens in/out, latency, erros) + por provider + recentes

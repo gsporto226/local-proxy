@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -11,6 +12,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
 use axum::Router as AxumRouter;
+use futures_util::Stream;
 use miette::Diagnostic;
 use notify::RecursiveMode;
 use serde_json::{json, Value};
@@ -21,8 +23,7 @@ use crate::config::{Config, ConfigError, ProviderFormat};
 use crate::error::ApiError;
 use crate::router::{Router, RouterError};
 use crate::stats::{self, StatLine};
-use crate::streams;
-use crate::streams::UpstreamStream;
+use crate::streams::{self, StreamCapture, UpstreamStream};
 use crate::translate;
 use crate::upstream::{send_and_read, ProviderClient, UpstreamError};
 
@@ -291,13 +292,74 @@ fn sse_response(stream: UpstreamStream) -> Response {
         .into_response()
 }
 
-/// Forward a same-format upstream SSE response verbatim.
-fn passthrough_stream(resp: reqwest::Response) -> Response {
+/// A same-format SSE body stream that tees raw bytes to the client while
+/// scanning them for cumulative token usage, recording stats when the stream
+/// ends. The client bytes are forwarded unchanged.
+struct ScannedClientStream {
+    inner: Pin<Box<dyn Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send>>,
+    capture: Option<StreamCapture>,
+    buf: String,
+    usage: translate::TokenUsage,
+    recorded: bool,
+}
+
+impl Stream for ScannedClientStream {
+    type Item = Result<axum::body::Bytes, reqwest::Error>;
+
+    fn poll_next(
+        mut self: Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        match this.inner.as_mut().poll_next(cx) {
+            std::task::Poll::Ready(Some(Ok(bytes))) => {
+                for frame in crate::sse::feed_frames(&mut this.buf, &bytes) {
+                    if let Some(v) = frame.json() {
+                        let part = translate::usage_from_frame(&v);
+                        if part != translate::TokenUsage::default() {
+                            translate::merge_usage(&mut this.usage, part);
+                        }
+                    }
+                }
+                std::task::Poll::Ready(Some(Ok(bytes)))
+            }
+            std::task::Poll::Ready(Some(Err(e))) => std::task::Poll::Ready(Some(Err(e))),
+            std::task::Poll::Ready(None) => {
+                if let Some(f) = crate::sse::flush_frames(&mut this.buf) {
+                    if let Some(v) = f.json() {
+                        let part = translate::usage_from_frame(&v);
+                        translate::merge_usage(&mut this.usage, part);
+                    }
+                }
+                if !this.recorded {
+                    this.recorded = true;
+                    if let Some(c) = &this.capture {
+                        c.record(this.usage);
+                    }
+                }
+                std::task::Poll::Ready(None)
+            }
+            std::task::Poll::Pending => std::task::Poll::Pending,
+        }
+    }
+}
+
+/// Forward a same-format upstream SSE response verbatim, scanning for usage.
+fn passthrough_stream(resp: reqwest::Response, capture: Option<StreamCapture>) -> Response {
+    let status = resp.status();
+    let inner: Pin<Box<dyn Stream<Item = Result<axum::body::Bytes, reqwest::Error>> + Send>> =
+        Box::pin(resp.bytes_stream());
     Response::builder()
-        .status(resp.status())
+        .status(status)
         .header(header::CONTENT_TYPE, "text/event-stream")
         .header(header::CACHE_CONTROL, "no-cache")
-        .body(Body::from_stream(resp.bytes_stream()))
+        .body(Body::from_stream(ScannedClientStream {
+            inner,
+            capture,
+            buf: String::new(),
+            usage: translate::TokenUsage::default(),
+            recorded: false,
+        }))
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
@@ -337,16 +399,12 @@ fn client_for(
     })
 }
 
-/// Best-effort local statistics capture for one handled request.
+/// Best-effort local statistics capture for a non-streaming request.
 ///
 /// Extracts token usage from the upstream (already consumed) body where
 /// possible, records the row against the local stats database, and ignores any
-/// failure. The provider/model are the resolved upstream ones.
-/// Best-effort local statistics capture for one handled request.
-///
-/// Extracts token usage from the upstream (already consumed) body where
-/// possible, records the row against the local stats database, and ignores any
-/// failure. The provider/model are the resolved upstream ones.
+/// failure. The provider/model are the resolved upstream ones. Streaming
+/// requests are recorded by [`StreamCapture`] once the SSE stream completes.
 #[allow(clippy::needless_pass_by_value)]
 fn capture(
     endpoint: &'static str,
@@ -437,20 +495,19 @@ async fn handle_messages(
         return Err(ApiError::from_upstream(status, rbody));
     }
     if streaming {
-        capture(
+        let cap = StreamCapture::new(
             "/v1/messages",
             &provider.name,
             &upstream_model,
-            true,
             status,
-            None,
-            &started,
+            started,
         );
         return match provider.format {
-            ProviderFormat::Anthropic => Ok(passthrough_stream(resp)),
+            ProviderFormat::Anthropic => Ok(passthrough_stream(resp, Some(cap))),
             ProviderFormat::Openai => Ok(sse_response(streams::anthropic_from_openai(
                 resp,
                 upstream_model,
+                Some(cap),
             ))),
         };
     }
@@ -545,20 +602,19 @@ async fn handle_chat_completions(
         return Err(ApiError::from_upstream(status, rbody));
     }
     if streaming {
-        capture(
+        let cap = StreamCapture::new(
             "/v1/chat/completions",
             &provider.name,
             &upstream_model,
-            true,
             status,
-            None,
-            &started,
+            started,
         );
         return match provider.format {
-            ProviderFormat::Openai => Ok(passthrough_stream(resp)),
+            ProviderFormat::Openai => Ok(passthrough_stream(resp, Some(cap))),
             ProviderFormat::Anthropic => Ok(sse_response(streams::openai_from_anthropic(
                 resp,
                 upstream_model,
+                Some(cap),
             ))),
         };
     }
@@ -653,23 +709,23 @@ async fn handle_responses(
         return Err(ApiError::from_upstream(status, rbody));
     }
     if streaming {
-        capture(
+        let cap = StreamCapture::new(
             "/v1/responses",
             &provider.name,
             &upstream_model,
-            true,
             status,
-            None,
-            &started,
+            started,
         );
         return match provider.format {
             ProviderFormat::Openai => Ok(sse_response(streams::responses_from_openai(
                 resp,
                 upstream_model,
+                Some(cap),
             ))),
             ProviderFormat::Anthropic => Ok(sse_response(streams::responses_from_anthropic(
                 resp,
                 upstream_model,
+                Some(cap),
             ))),
         };
     }

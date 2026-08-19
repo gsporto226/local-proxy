@@ -1,17 +1,69 @@
 use std::collections::HashMap;
 use std::convert::Infallible;
 use std::pin::Pin;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use axum::response::sse::Event;
 use futures_util::{Stream, StreamExt};
 use serde_json::{json, Value};
 
 use crate::sse::{sse_frames, SseError, SseFrame};
+use crate::stats::{self, StatLine};
 use crate::translate::{parse_usage, responses_usage, TokenUsage};
 
 /// A stream of already-framed SSE `Event`s ready to be sent to the client.
 pub type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> + Send>>;
+
+/// Deferred best-effort stats capture for a streaming request.
+///
+/// A streaming request cannot be recorded up-front: its token usage is only
+/// known once the SSE stream has been fully read. This type carries the request
+/// metadata and records the row (with the cumulative usage) when the stream
+/// completes. A failure is logged and ignored, as with non-streaming capture.
+pub struct StreamCapture {
+    endpoint: &'static str,
+    provider: String,
+    model: String,
+    status: u16,
+    started: Instant,
+}
+
+impl StreamCapture {
+    /// Build a capture handle for a proxied streaming request.
+    #[must_use]
+    pub fn new(
+        endpoint: &'static str,
+        provider: &str,
+        model: &str,
+        status: u16,
+        started: Instant,
+    ) -> Self {
+        Self {
+            endpoint,
+            provider: provider.to_string(),
+            model: model.to_string(),
+            status,
+            started,
+        }
+    }
+
+    /// Write the stats row with the final cumulative `usage`. Best-effort.
+    pub fn record(&self, usage: TokenUsage) {
+        stats::record(
+            self.started,
+            StatLine {
+                endpoint: self.endpoint,
+                provider: self.provider.clone(),
+                model: self.model.clone(),
+                input_tokens: usage.input,
+                output_tokens: usage.output,
+                streamed: true,
+                status: self.status,
+                error: self.status >= 400,
+            },
+        );
+    }
+}
 
 fn now_ts() -> u64 {
     SystemTime::now()
@@ -46,6 +98,8 @@ trait Machine: Send {
     fn process(&mut self, frame: &SseFrame) -> Vec<Value>;
     /// Produce any remaining terminal events once the upstream stream ends.
     fn finalize(&mut self) -> Vec<Value>;
+    /// The accumulated usage observed so far (final once [`Self::finalize`] ran).
+    fn usage(&self) -> TokenUsage;
 }
 
 struct Driver<M: Machine> {
@@ -54,6 +108,8 @@ struct Driver<M: Machine> {
     pending: Vec<Value>,
     done: bool,
     finalized: bool,
+    capture: Option<StreamCapture>,
+    reported: bool,
 }
 
 async fn drive<M: Machine>(mut st: Driver<M>) -> Option<(Result<Event, Infallible>, Driver<M>)> {
@@ -65,6 +121,12 @@ async fn drive<M: Machine>(mut st: Driver<M>) -> Option<(Result<Event, Infallibl
             if !st.finalized {
                 st.finalized = true;
                 st.pending = st.machine.finalize();
+                if !st.reported {
+                    st.reported = true;
+                    if let Some(c) = &st.capture {
+                        c.record(st.machine.usage());
+                    }
+                }
                 if st.pending.is_empty() {
                     return None;
                 }
@@ -79,13 +141,19 @@ async fn drive<M: Machine>(mut st: Driver<M>) -> Option<(Result<Event, Infallibl
     }
 }
 
-fn build<M: Machine + 'static>(resp: reqwest::Response, machine: M) -> UpstreamStream {
+fn build<M: Machine + 'static>(
+    resp: reqwest::Response,
+    machine: M,
+    capture: Option<StreamCapture>,
+) -> UpstreamStream {
     let driver = Driver {
         frames: Box::pin(sse_frames(resp)),
         machine,
         pending: Vec::new(),
         done: false,
         finalized: false,
+        capture,
+        reported: false,
     };
     Box::pin(futures_util::stream::unfold(driver, drive))
 }
@@ -427,6 +495,10 @@ impl Machine for OaMachine {
         events.push(json!({"type": "message_stop"}));
         events
     }
+
+    fn usage(&self) -> TokenUsage {
+        self.usage
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -647,6 +719,10 @@ impl Machine for AoMachine {
         events.push(chunk);
         events.push(json!("[DONE]"));
         events
+    }
+
+    fn usage(&self) -> TokenUsage {
+        self.usage
     }
 }
 
@@ -954,6 +1030,10 @@ impl Machine for A2RMachine {
         }));
         events
     }
+
+    fn usage(&self) -> TokenUsage {
+        self.usage
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1211,6 +1291,10 @@ impl Machine for O2RMachine {
         }));
         events
     }
+
+    fn usage(&self) -> TokenUsage {
+        self.usage
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1218,27 +1302,55 @@ impl Machine for O2RMachine {
 // ---------------------------------------------------------------------------
 
 /// `OpenAI` chat-completions upstream -> Anthropic Messages SSE stream.
+///
+/// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
+/// stream completes.
 #[must_use]
-pub fn anthropic_from_openai(resp: reqwest::Response, model: String) -> UpstreamStream {
-    build(resp, OaMachine::new(model))
+pub fn anthropic_from_openai(
+    resp: reqwest::Response,
+    model: String,
+    capture: Option<StreamCapture>,
+) -> UpstreamStream {
+    build(resp, OaMachine::new(model), capture)
 }
 
 /// Anthropic Messages upstream -> `OpenAI` chat-completions SSE stream.
+///
+/// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
+/// stream completes.
 #[must_use]
-pub fn openai_from_anthropic(resp: reqwest::Response, model: String) -> UpstreamStream {
-    build(resp, AoMachine::new(model))
+pub fn openai_from_anthropic(
+    resp: reqwest::Response,
+    model: String,
+    capture: Option<StreamCapture>,
+) -> UpstreamStream {
+    build(resp, AoMachine::new(model), capture)
 }
 
 /// Anthropic Messages upstream -> `OpenAI` Responses SSE stream.
+///
+/// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
+/// stream completes.
 #[must_use]
-pub fn responses_from_anthropic(resp: reqwest::Response, model: String) -> UpstreamStream {
-    build(resp, A2RMachine::new(model))
+pub fn responses_from_anthropic(
+    resp: reqwest::Response,
+    model: String,
+    capture: Option<StreamCapture>,
+) -> UpstreamStream {
+    build(resp, A2RMachine::new(model), capture)
 }
 
 /// `OpenAI` chat-completions upstream -> `OpenAI` Responses SSE stream.
+///
+/// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
+/// stream completes.
 #[must_use]
-pub fn responses_from_openai(resp: reqwest::Response, model: String) -> UpstreamStream {
-    build(resp, O2RMachine::new(model))
+pub fn responses_from_openai(
+    resp: reqwest::Response,
+    model: String,
+    capture: Option<StreamCapture>,
+) -> UpstreamStream {
+    build(resp, O2RMachine::new(model), capture)
 }
 
 // ---------------------------------------------------------------------------
@@ -1292,6 +1404,56 @@ mod tests {
             .iter()
             .filter_map(|e| e.get("type").and_then(Value::as_str).map(str::to_string))
             .collect()
+    }
+
+    // ---- usage accumulation across frames ----
+
+    #[test]
+    fn ao_machine_accumulates_usage_across_frames() {
+        // Anthropic -> OpenAI: usage arrives in message_start (input) and
+        // message_delta (output). After streaming, the machine's cumulative
+        // usage should reflect both.
+        let mut m = AoMachine::new("claude".to_string());
+        m.process(&anthro(
+            "message_start",
+            json!({"message": {"id": "msg_1", "usage": {"input_tokens": 5, "output_tokens": 0}}}),
+        ));
+        m.process(&anthro(
+            "message_delta",
+            json!({"delta": {"stop_reason": "end_turn"}, "usage": {"output_tokens": 7}}),
+        ));
+        m.finalize();
+        assert_eq!(
+            m.usage(),
+            TokenUsage {
+                input: 5,
+                output: 7,
+                reasoning: 0
+            }
+        );
+        assert_eq!(m.usage().output, 7);
+    }
+
+    #[test]
+    fn oa_machine_usage_covers_openai_chunk() {
+        // OpenAI -> Anthropic: usage rides on a chunk with `usage`.
+        let mut m = OaMachine::new("gpt".to_string());
+        m.process(&oai_chunk(json!({"content": "hi"}), Some("stop")));
+        m.process(&frame(json!({
+            "id": "cmpl_1",
+            "object": "chat.completion.chunk",
+            "choices": [],
+            "usage": {"prompt_tokens": 11, "completion_tokens": 4}
+        })));
+        m.finalize();
+        assert_eq!(
+            m.usage(),
+            TokenUsage {
+                input: 11,
+                output: 4,
+                reasoning: 0
+            }
+        );
     }
 
     // ---- OpenAI -> Anthropic (text) ----

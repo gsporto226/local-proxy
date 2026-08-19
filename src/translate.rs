@@ -1287,6 +1287,43 @@ pub fn parse_usage(value: &Value) -> TokenUsage {
     usage
 }
 
+/// Merge `part` into `acc`, keeping the highest value per field.
+///
+/// Used to accumulate cumulative usage across SSE frames: some events carry
+/// only a partial usage (e.g. an Anthropic `message_delta` reports just
+/// `output_tokens`), so later frames may revisit earlier fields at their final
+/// (larger) value.
+pub fn merge_usage(acc: &mut TokenUsage, part: TokenUsage) {
+    acc.input = acc.input.max(part.input);
+    acc.output = acc.output.max(part.output);
+    acc.reasoning = acc.reasoning.max(part.reasoning);
+}
+
+/// Extract cumulative token usage from a generic SSE frame payload.
+///
+/// Covers the shapes that carry usage mid-stream: an `OpenAI` chat-completions
+/// chunk (`usage`), an Anthropic `message_start`/`message_delta`
+/// (`message.usage` / `usage`) and a Responses `response.completed`
+/// (`response.usage`). Returns a zeroed [`TokenUsage`] when the frame carries
+/// none.
+#[must_use]
+pub fn usage_from_frame(value: &Value) -> TokenUsage {
+    if let Some(u) = value.get("usage") {
+        return parse_usage(u);
+    }
+    if let Some(msg) = value.get("message") {
+        if let Some(u) = msg.get("usage") {
+            return parse_usage(u);
+        }
+    }
+    if let Some(resp) = value.get("response") {
+        if let Some(u) = resp.get("usage") {
+            return parse_usage(u);
+        }
+    }
+    TokenUsage::default()
+}
+
 fn num(v: Option<&Value>) -> Option<u64> {
     v.and_then(Value::as_u64)
 }
@@ -1746,6 +1783,72 @@ mod tests {
         let text = serde_json::to_string(&out).unwrap();
         assert!(!text.contains("cache_control"));
         assert_eq!(out["messages"][0]["content"][0]["text"], "x");
+    }
+
+    #[test]
+    fn merge_usage_keeps_max_per_field() {
+        let mut acc = TokenUsage::default();
+        // first a partial Anthropic message_delta (output only)
+        merge_usage(
+            &mut acc,
+            TokenUsage {
+                input: 0,
+                output: 2,
+                reasoning: 0,
+            },
+        );
+        // then a full picture with larger input
+        merge_usage(
+            &mut acc,
+            TokenUsage {
+                input: 5,
+                output: 3,
+                reasoning: 1,
+            },
+        );
+        assert_eq!(acc.input, 5);
+        assert_eq!(acc.output, 3);
+        assert_eq!(acc.reasoning, 1);
+        // a smaller value never shrinks an accumulated field
+        merge_usage(
+            &mut acc,
+            TokenUsage {
+                input: 1,
+                output: 1,
+                reasoning: 0,
+            },
+        );
+        assert_eq!(acc.input, 5);
+        assert_eq!(acc.output, 3);
+    }
+
+    #[test]
+    fn usage_from_frame_covers_event_shapes() {
+        // OpenAI chat chunk
+        let oai = json!({"usage": {"prompt_tokens": 3, "completion_tokens": 2}});
+        let u = usage_from_frame(&oai);
+        assert_eq!((u.input, u.output), (3, 2));
+
+        // Anthropic message_start (message.usage)
+        let astart = json!({"type": "message_start", "message": {"usage": {"input_tokens": 4, "output_tokens": 0}}});
+        let u = usage_from_frame(&astart);
+        assert_eq!((u.input, u.output), (4, 0));
+
+        // Anthropic message_delta (top-level usage)
+        let adelta = json!({"type": "message_delta", "usage": {"output_tokens": 7}});
+        let u = usage_from_frame(&adelta);
+        assert_eq!((u.input, u.output), (0, 7));
+
+        // Responses completed (response.usage)
+        let resp = json!({"type": "response.completed", "response": {"usage": {"input_tokens": 8, "output_tokens": 9}}});
+        let u = usage_from_frame(&resp);
+        assert_eq!((u.input, u.output), (8, 9));
+
+        // A frame with no usage yields default
+        assert_eq!(
+            usage_from_frame(&json!({"type": "message_stop"})),
+            TokenUsage::default()
+        );
     }
 
     #[test]
