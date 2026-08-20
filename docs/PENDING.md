@@ -153,6 +153,33 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-20.
   com `X-Claude-Code-Session-Id`, e confere que `statusline --session` renderiza o custo/tokens reais
   da sessão (custo `usage.cost` incluso). **139** unit tests verdes; fmt/clippy limpos; e2e 17 verdes.
 
+### Nova rodada — `statusline setup` automatiza o wiring no Claude Code
+- `statusline setup` escreve o script (`statusline.ps1`/`statusline.sh`) no config dir (**sem
+  sidecar files**: o script agora está **embutido no binário**) e registra a entrada `statusLine` no
+  `settings.json` do Claude Code, **preservando todas as demais chaves** (merge via `serde_json`).
+- `main.rs`: subcomando `statusline setup` (`--settings <path>` opcional) + flag `--setup`/`--settings`
+  no subcomando de renderização (mesma ação).
+- `statusline.rs`: `setup()` + helpers — `script_path()`, `claude_settings_path()` (path da plataforma),
+  `merge_settings()`; `SetupError` para falhas de escrita. Sem settings.json existente (e sem
+  `--settings` custom) só escreve o script e imprime o snippet manual — **nunca cria** `.claude` à força.
+- Testes: **e2e real** `e2e/statusline-setup.test.ts` (2 testes) — `statusLine` merge preservando chaves
+  + fallback sem settings. **143** unit tests verdes (4 novos); fmt/clippy limpos; e2e mock 17 + setup 2.
+
+### Novo — default adaptativo de status line (sem config)
+- Sem `--template` e sem bloco `statusline:` no config, `statusline` usa um **default adaptativo**
+  (`statusline::default_template`): monta a linha só com os params com dados (`model · cost_session ·
+  % ctx · tokens`), omite ausentes, e mostra `local-proxy: sem dados` quando não há nenhum dado —
+  antes o fallback fixo imprimia `? · ? · ...`.
+- Testes: 3 novos unit tests (`default_template_*`). **146** unit tests verdes; fmt/clippy limpos.
+
+### Novo — `model` na status line = modelo atual do proxy
+- O param `model` da status line agora reflete o **modelo atual do proxy**: `--model` explícito
+  (JSON da status line) vence; senão `defaults.active_model` (`local-proxy model`); senão o primeiro
+  modelo de um provider conectado. Antes vinha do `last_model` da sessão nos stats (desatualizado e
+  route-dependent).
+- `cli.rs` `statusline`: resolve `model` de `config.defaults.active_model` / `first_available_model`
+  em vez de `sess.last_model`. **146** unit tests verdes; fmt/clippy limpos.
+
 ### Estado de verificação (task 010)
 - `cargo test --all-features`: **122** unit tests verdes.
 - `cargo clippy --all-targets --all-features -- -D warnings`: limpo.

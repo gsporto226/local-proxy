@@ -259,6 +259,8 @@ local-proxy statusline --session "<uuid>" --template "{model} · {cost_session} 
 
 Template params (absent values render as `?`): `cost_session`, `cost_month`, `cost_total`, `cost_known`, `tokens_in`, `tokens_out`, `requests`, `model`, `context_pct`. Cost only appears when the upstream reports it; it is never estimated. Formatting is entirely the template's job.
 
+The `model` param reflects the proxy's current model: an explicit `--model` (from the status line JSON) wins, then the active model selected via `local-proxy model`, then the first model available from a connected provider.
+
 The template can come from the config (`statusline:` block) or from `--template`, which wins:
 
 ```yaml
@@ -266,7 +268,20 @@ statusline:
   template: "{model} · {cost_session} · {context_pct}% ctx"
 ```
 
-Ready scripts that read the JSON from stdin, extract `session_id`, and call the binary live in `scripts/statusline.sh` and `scripts/statusline.ps1`. Point Claude Code's `settings.json` at one of them:
+When no template is configured, the proxy uses an **adaptive default**: it builds the line only from the params that have data for that session, omitting the absent ones, and shows `local-proxy: sem dados` when there is no data yet.
+
+### Automatic setup (`statusline setup`)
+
+To write the status-line script into the config dir and register it in Claude Code's `settings.json` in one step:
+
+```powershell
+local-proxy statusline setup                                 # uses ~/.claude/settings.json (default)
+local-proxy statusline setup --settings C:\path\settings.json  # custom target
+```
+
+The command writes `statusline.ps1` (Windows) or `statusline.sh` (POSIX) into the config dir (the same `LOCAL_PROXY_CONFIG_DIR`) and adds/updates the `statusLine` entry in `settings.json`, **preserving all other settings**. If no `settings.json` exists (and no `--settings` was given), it only writes the script and prints the manual snippet — it never creates a `.claude` directory you didn't have. The same action is available as a flag on the rendering subcommand: `local-proxy statusline --setup`.
+
+Ready scripts that read the JSON from stdin, extract `session_id`, and call the binary also live in `scripts/statusline.sh` and `scripts/statusline.ps1`. Point Claude Code's `settings.json` at one of them:
 
 ```json
 { "statusLine": { "type": "command", "command": "/abs/path/scripts/statusline.ps1" } }
@@ -332,7 +347,7 @@ src/
 ├── exec.rs        $proxy executor, token detection, arg parsing, timeout
 ├── error.rs       ApiError and per-format error shape
 ├── stats.rs       local statistics (SQLite stats.db) and stats command
-├── statusline.rs  sandboxed Rhai template for the status line
+├── statusline.rs  sandboxed Rhai template + `statusline setup` (embedded script + settings.json)
 └── handlers.rs    axum endpoints, hot-reload state, /v1/models, count_tokens, $proxy
 e2e/               Bun test suite (mock and live)
 scripts/           status line scripts (bash and PowerShell)

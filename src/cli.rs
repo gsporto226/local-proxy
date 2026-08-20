@@ -95,6 +95,11 @@ pub enum CliError {
     )]
     Runtime(#[from] crate::handlers::RuntimeError),
 
+    /// The status line could not be set up (script/settings write failed).
+    #[error(transparent)]
+    #[diagnostic(transparent)]
+    StatuslineSetup(#[from] crate::statusline::SetupError),
+
     /// The local usage statistics could not be read.
     #[error("failed to read usage statistics")]
     #[diagnostic(
@@ -919,12 +924,16 @@ pub fn statusline(
     model: Option<String>,
     context_pct: Option<f64>,
     template_flag: Option<String>,
+    setup: bool,
+    settings: Option<PathBuf>,
 ) -> miette::Result<()> {
-    // Resolve the template: flag > config `statusline:` block.
+    if setup {
+        return statusline_setup(config_path, settings);
+    }
+    // Resolve the template: flag > config `statusline:` block. If neither is
+    // set, we fall back to an adaptive default built from the params that have
+    // data (see below), instead of a fixed string showing `?` everywhere.
     let config = effective_config(&config_path)?;
-    let template = template_flag
-        .or_else(|| config.statusline.template.clone())
-        .unwrap_or_else(|| "{model} · {cost_session} · {context_pct}% ctx".to_string());
 
     let session = session.unwrap_or_default();
     let now = std::time::SystemTime::now()
@@ -962,9 +971,6 @@ pub fn statusline(
         params.insert("tokens_out".to_string(), s.tokens_out.to_string());
         params.insert("requests".to_string(), s.requests.to_string());
         params.insert("cost_known".to_string(), s.cost_known_requests.to_string());
-        if let Some(m) = &s.last_model {
-            params.insert("model".to_string(), m.clone());
-        }
         if s.cost_known_requests > 0 {
             // only a cost figure when the session actually has reported cost
             params.insert("cost_session".to_string(), s.cost_usd.to_string());
@@ -976,15 +982,70 @@ pub fn statusline(
     if let Some(c) = cost_total {
         params.insert("cost_total".to_string(), c.to_string());
     }
+    // The `model` param reflects the proxy's current model: an explicit
+    // `--model` flag (from the status line JSON) wins, then the active model
+    // selected via `local-proxy model`, then the first model available from a
+    // connected provider. Falling back to the last model used by the session is
+    // avoided so the status line tracks what the proxy would route now.
+    let proxy_model = config
+        .defaults
+        .active_model
+        .clone()
+        .or_else(|| first_available_model(&config_path).ok().flatten());
     if let Some(m) = &model {
         params.insert("model".to_string(), m.clone());
+    } else if let Some(m) = proxy_model {
+        params.insert("model".to_string(), m);
     }
     if let Some(p) = context_pct {
         params.insert("context_pct".to_string(), p.to_string());
     }
 
+    let template = template_flag
+        .or_else(|| config.statusline.template.clone())
+        .unwrap_or_else(|| crate::statusline::default_template(&params));
+
     let line = crate::statusline::render(&template, &params);
     println!("{line}");
+    Ok(())
+}
+
+/// Write the status-line script into the config dir and register it in Claude's
+/// `settings.json`.
+///
+/// Keeps every existing setting and only adds the `statusLine` entry pointing at
+/// the generated script. The script path is resolved from the same `config_dir`
+/// (so it follows `LOCAL_PROXY_CONFIG_DIR` and `--config`, keeping tests and
+/// isolated installs consistent). If no settings file exists yet (and no custom
+/// `--settings` path was given) the script alone is written and the command is
+/// printed for the user to add manually.
+///
+/// # Errors
+///
+/// Returns an error if the script or settings file cannot be written.
+#[allow(clippy::needless_pass_by_value)]
+pub fn statusline_setup(config_path: PathBuf, settings: Option<PathBuf>) -> miette::Result<()> {
+    // `setup` only touches the config dir and Claude's settings, not the
+    // config contents, so the config path is unused here.
+    let _ = config_path;
+    let script = crate::statusline::script_path(&config_dir());
+    let exists = script.exists();
+    let paths = crate::statusline::setup(&config_dir(), settings).map_err(CliError::from)?;
+
+    println!(
+        "status line script: {} ({})",
+        paths.script.display(),
+        if exists { "atualizado" } else { "criado" }
+    );
+    if let Some(s) = &paths.settings {
+        println!("settings.json atualizado: {}", s.display());
+        println!("reinicie o Claude Code para aplicar a status line.");
+    } else {
+        // No settings file was written; tell the user how to wire it manually.
+        let cmd = crate::statusline::settings_statusline_command(&script);
+        println!("nenhum settings.json encontrado; adicione manualmente:");
+        println!("  {cmd}");
+    }
     Ok(())
 }
 
