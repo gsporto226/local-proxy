@@ -142,10 +142,12 @@ impl From<TranslateError> for ApiError {
 impl From<UpstreamError> for ApiError {
     fn from(e: UpstreamError) -> Self {
         match e {
-            UpstreamError::MissingApiKey { provider, env } => Self::new(
+            UpstreamError::MissingApiKey { provider } => Self::new(
                 502,
                 "api_error",
-                format!("provider {provider} has no API key; set env var {env}"),
+                format!(
+                    "provider {provider} has no API key; store one via `local-proxy connect {provider}`"
+                ),
             ),
             UpstreamError::ClientBuild { source } => {
                 Self::internal(format!("failed to build upstream HTTP client: {source}"))

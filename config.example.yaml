@@ -3,8 +3,12 @@
 # The provider catalog is embedded in the binary (src/catalog.yaml). This file
 # only *adds* or *overrides* providers/routes/defaults from that catalog.
 # For the full list of embedded providers (anthropic, openai, opencode-go, zen,
-# groq, xai, google, deepseek, openrouter) and their models, edit the catalog or
-# run `local-proxy providers`.
+# groq, xai, google, deepseek, openrouter, neuralwatt) and their models, edit
+# the catalog or run `local-proxy providers`.
+#
+# Provider API keys live exclusively in the global auth store (`auth.json`),
+# never in the config. Store a key with:
+#   local-proxy connect <provider> [key]
 
 server:
   host: 127.0.0.1
@@ -17,7 +21,6 @@ server:
 # providers:
 #   - name: openai
 #     base_url: https://api.openai.com/v1
-#     api_key_env: OPENAI_API_KEY
 #     format: openai
 #     models:
 #       - gpt-4o
@@ -26,7 +29,6 @@ server:
 # providers:
 #   - name: mylocal
 #     base_url: http://127.0.0.1:8080/v1
-#     api_key_env: MYLOCAL_API_KEY
 #     format: openai
 #     models:
 #       - local-model
@@ -37,3 +39,6 @@ server:
 #
 # defaults:
 #   provider: anthropic
+#   # Active model is selected as `provider/model` via `local-proxy model`
+#   # (e.g. `opencode-go/deepseek-v4-flash`); persisted here.
+#   active_model: opencode-go/deepseek-v4-flash

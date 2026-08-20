@@ -616,8 +616,9 @@ pub fn connected_models(config_path: &Path) -> Result<Vec<String>, CliError> {
             continue;
         }
         for model in &provider.models {
-            if !models.contains(model) {
-                models.push(model.clone());
+            let qualified = crate::config::qualified_id(&provider.name, model);
+            if !models.contains(&qualified) {
+                models.push(qualified);
             }
         }
     }

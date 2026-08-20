@@ -71,11 +71,6 @@ pub struct Provider {
     pub name: String,
     /// Base URL for the provider's API.
     pub base_url: String,
-    /// Environment variable that holds the provider's API key.
-    pub api_key_env: Option<String>,
-    /// API key stored inline in the config (overrides `api_key_env` and the
-    /// auth store when present).
-    pub api_key: Option<String>,
     /// Wire format the provider expects.
     pub format: ProviderFormat,
     /// Native model IDs the provider can serve.
@@ -335,6 +330,21 @@ pub fn create_default_config(path: impl AsRef<Path>) -> Result<(), ConfigError> 
     })
 }
 
+/// Build the provider-qualified model id (`provider/model`) for `model` served
+/// by `provider`.
+///
+/// Models that already carry the `provider/` prefix are returned unchanged
+/// (e.g. `opencode-go/deepseek-v4-flash`); bare models get the prefix
+/// (e.g. `neuralwatt/glm-5.2`).
+#[must_use]
+pub fn qualified_id(provider: &str, model: &str) -> String {
+    if model.starts_with(&format!("{provider}/")) {
+        model.to_string()
+    } else {
+        format!("{provider}/{model}")
+    }
+}
+
 impl fmt::Display for ProviderFormat {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
@@ -363,7 +373,6 @@ mod tests {
         let anthropic = &config.providers[0];
         assert_eq!(anthropic.name, "anthropic");
         assert_eq!(anthropic.base_url, "https://api.anthropic.com");
-        assert_eq!(anthropic.api_key_env.as_deref(), Some("ANTHROPIC_API_KEY"));
         assert_eq!(anthropic.format, ProviderFormat::Anthropic);
         assert_eq!(
             anthropic.models,

@@ -38,8 +38,8 @@ cargo test --all-features   # 91 unit tests
 O proxy embute um catálogo com todos os providers suportados (`src/catalog.yaml`, compilado no
 binário). A config do usuário funciona como **overlay**: um provider definido na config com o mesmo
 nome **sobrescreve** o do catálogo; um nome novo **adiciona**; rotas e `defaults` definidos na config
-vencem os do catálogo. `providers` do catálogo carregam sua chave de `api_key_env` (ex.:
-`ANTHROPIC_API_KEY`, `OPENCODE_ZEN_KEY`, `GROQ_API_KEY`, ...).
+vencem os do catálogo. As chaves dos providers vêm do **auth store** (`auth.json`) ou inline
+(`api_key` no config) — não há fallback por variável de ambiente.
 
 A config principal vive no diretório de config do usuário:
 `%APPDATA%\local-proxy\config.yaml` (Windows) ou `~/.config/local-proxy/config.yaml` (Unix).
@@ -60,7 +60,6 @@ Exemplo adicionando um provider custom e roteando:
 providers:
   - name: zen
     base_url: https://opencode.ai/zen
-    api_key_env: OPENCODE_ZEN_KEY
     format: openai
     models: [deepseek-v4-flash-free, claude-sonnet-4-5]
 routes:
@@ -71,10 +70,11 @@ defaults:
   provider: anthropic          # fallback final (nome do modelo passa inalterado)
 ```
 
-Rode (usa a config global; `--config` é só um override):
+Rode (usa a config global; `--config` é só um override). A chave deve estar no `auth.json`
+(`local-proxy connect zen sk-...`):
 
 ```powershell
-$env:OPENCODE_ZEN_KEY="sk-opencode-zen-..."
+local-proxy connect zen sk-opencode-zen-...
 cargo run -- serve
 ```
 
@@ -88,7 +88,6 @@ mesmo nome sobrescrevem o default de auth/formato. Exemplo — OpenRouter pede o
 providers:
   - name: openrouter
     base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
     format: openai
     headers:
       HTTP-Referer: https://github.com/gsporto226/local-proxy
@@ -108,36 +107,39 @@ local-proxy providers                    # lista providers efetivos + key status
 local-proxy disconnect opencode-go       # remove a chave
 ```
 
-Resolução da chave por request: `api_key` inline na config → `auth.json[provider]` → `api_key_env`.
+Resolução da chave por request: `auth.json[provider]` (única fonte).
 
 ### Modelo ativo (`model` / `models(select)`)
 
 O proxy **nunca usa o modelo pedido pelo harness** (ex.: `ANTHROPIC_MODEL` do Claude Code). Ele
-roteia pelo **modelo ativo**: o modelo explicitamente selecionado, senão o **primeiro modelo
-disponível de um provider conectado**, senão erro. Um provider está *conectado* quando tem uma chave
-resolvível (inline no config → `auth.json` → env var).
+roteia pelo **modelo ativo**, identificado como **`provider/model`**: o modelo explicitamente
+selecionado, senão o **primeiro modelo disponível de um provider conectado**, senão erro. Um provider
+está *conectado* quando tem uma chave no `auth.json`.
 
-Seleção e consulta são feitas pelo CLI **ou** pelo MCP — a mesma lógica (paridade total):
+Seleção e consulta são feitas pelo CLI **ou** pelo MCP — a mesma lógica (paridade total). A lista de
+modelos (`models`) já vem qualificada por provider (`provider/model`):
 
 ```
-local-proxy model                        # modelo ativo (selecionado, senão o primeiro disponível, senão "none")
-local-proxy model deepseek-v4-flash      # valida contra providers conectados e define o modelo ativo
-local-proxy model clear                  # limpa a seleção (volta ao primeiro disponível)
-local-proxy models                       # lista modelos dos providers conectados
+local-proxy model                                # modelo ativo (selecionado, senão o primeiro disponível, senão "none")
+local-proxy model opencode-go/deepseek-v4-flash  # valida contra providers conectados e define o modelo ativo
+local-proxy model clear                          # limpa a seleção (volta ao primeiro disponível)
+local-proxy models                               # lista modelos dos providers conectados (provider/model)
 ```
 
 Via MCP (mesmo comportamento do CLI):
 
 ```
 mcp connect opencode-go <key>
-mcp models                            # lista modelos dos providers conectados
-mcp models --select deepseek-v4-flash # define o modelo ativo (valida contra providers conectados)
+mcp models                            # lista modelos dos providers conectados (provider/model)
+mcp models --select opencode-go/deepseek-v4-flash # define o modelo ativo (valida contra providers conectados)
 mcp models --select ""                # limpa a seleção
 ```
 
 A seleção é persistida em `defaults.active_model` (antes `defaults.model`) no config. Com o campo
 setado, o proxy **ignora o modelo pedido pelo harness** e roteia tudo pelo modelo ativo. O file
-watcher aplica a mudança **sem reiniciar** o proxy.
+watcher aplica a mudança **sem reiniciar** o proxy. Se o modelo ativo resolver para um provider **sem
+chave**, o proxy retorna um erro claro (em vez de rotear e falhar com 502), e **prefere providers
+conectados** quando vários servem o mesmo modelo.
 
 ### Hot-reload
 

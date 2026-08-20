@@ -9,13 +9,11 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Errors that can occur while building clients or talking to upstreams.
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
-    /// The provider requires an API key but its env var is unset or empty.
-    #[error("missing API key for provider {provider}: set env var {env}")]
+    /// The provider has no API key in the auth store.
+    #[error("provider {provider} has no API key; store one via `local-proxy connect {provider}`")]
     MissingApiKey {
         /// Name of the provider missing a key.
         provider: String,
-        /// Environment variable that should hold the key.
-        env: String,
     },
     /// Failed to build the underlying HTTP client.
     #[error("failed to build HTTP client: {source}")]
@@ -46,9 +44,7 @@ pub struct ProviderClient {
     name: String,
     base_url: String,
     format: ProviderFormat,
-    api_key: Option<String>,
     auth_key: Option<String>,
-    api_key_env: Option<String>,
     passthrough: bool,
     headers: std::collections::HashMap<String, String>,
     http: reqwest::Client,
@@ -75,9 +71,7 @@ impl ProviderClient {
             name: provider.name.clone(),
             base_url: provider.base_url.trim_end_matches('/').to_string(),
             format: provider.format,
-            api_key: provider.api_key.clone(),
             auth_key,
-            api_key_env: provider.api_key_env.clone(),
             passthrough,
             headers: provider.headers.clone(),
             http,
@@ -96,11 +90,10 @@ impl ProviderClient {
         self.format
     }
 
-    /// Whether this client has a resolvable API key available (inline, auth
-    /// store, or `api_key_env` present in the environment).
+    /// Whether this client has an API key available from the auth store.
     #[must_use]
     pub fn has_key(&self) -> bool {
-        self.configured_key().is_ok_and(|k| k.is_some())
+        self.auth_key.as_deref().is_some_and(|k| !k.is_empty())
     }
 
     /// Default endpoint path for this provider's format.
@@ -112,29 +105,17 @@ impl ProviderClient {
         }
     }
 
-    fn configured_key(&self) -> Result<Option<String>, UpstreamError> {
-        if let Some(key) = self.api_key.as_deref().filter(|k| !k.is_empty()) {
-            return Ok(Some(key.to_string()));
-        }
-        if let Some(key) = self.auth_key.as_deref().filter(|k| !k.is_empty()) {
-            return Ok(Some(key.to_string()));
-        }
-        self.api_key_env.as_deref().map_or_else(
-            || Ok(None),
-            |env| match std::env::var(env) {
-                Ok(key) if !key.is_empty() => Ok(Some(key)),
-                _ => Err(UpstreamError::MissingApiKey {
-                    provider: self.name.clone(),
-                    env: env.to_string(),
-                }),
-            },
-        )
+    fn configured_key(&self) -> Option<String> {
+        self.auth_key
+            .as_deref()
+            .filter(|k| !k.is_empty())
+            .map(str::to_string)
     }
 
-    fn effective_key(&self, client_key: Option<&str>) -> Result<Option<String>, UpstreamError> {
+    fn effective_key(&self, client_key: Option<&str>) -> Option<String> {
         if self.passthrough {
             if let Some(key) = client_key.filter(|k| !k.is_empty()) {
-                return Ok(Some(key.to_string()));
+                return Some(key.to_string());
             }
         }
         self.configured_key()
@@ -160,7 +141,12 @@ impl ProviderClient {
         body: Value,
         client_key: Option<&str>,
     ) -> Result<reqwest::Response, UpstreamError> {
-        let key = self.effective_key(client_key)?;
+        let key = self.effective_key(client_key);
+        if key.is_none() {
+            return Err(UpstreamError::MissingApiKey {
+                provider: self.name.clone(),
+            });
+        }
         let path = if path.is_empty() {
             self.default_path()
         } else {
@@ -214,24 +200,14 @@ impl ProviderClient {
     }
 }
 
-/// Whether `provider` has a resolvable API key available through the standard
-/// resolution chain (inline `api_key` → auth store → `api_key_env` present in
-/// the environment).
+/// Whether `provider` has an API key available from the auth store.
 ///
 /// Mirrors [`ProviderClient::configured_key`] without building an HTTP client,
 /// so it can be used to decide "connected" providers.
 #[must_use]
 pub fn provider_has_key(provider: &Provider, auth_key: Option<&str>) -> bool {
-    if provider.api_key.as_deref().is_some_and(|k| !k.is_empty()) {
-        return true;
-    }
-    if auth_key.is_some_and(|k| !k.is_empty()) {
-        return true;
-    }
-    provider
-        .api_key_env
-        .as_deref()
-        .is_some_and(|env| std::env::var(env).is_ok_and(|k| !k.is_empty()))
+    let _ = provider;
+    auth_key.is_some_and(|k| !k.is_empty())
 }
 
 /// Read a completed upstream response into `(status, json_body)`, tolerating a
@@ -251,8 +227,6 @@ mod tests {
         Provider {
             name: "test".to_string(),
             base_url: "http://127.0.0.1:9".to_string(),
-            api_key_env: Some("LOCAL_PROXY_TEST_KEY".to_string()),
-            api_key: None,
             format,
             models: Vec::new(),
             headers: std::collections::HashMap::new(),
@@ -277,12 +251,10 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn missing_env_key_is_an_error() {
+    async fn missing_key_is_an_error() {
         let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
-        std::env::remove_var("LOCAL_PROXY_TEST_MISSING_KEY");
-        let mut p = provider(ProviderFormat::Anthropic);
-        p.api_key_env = Some("LOCAL_PROXY_TEST_MISSING_KEY".to_string());
-        let client = ProviderClient::new(&p, false, None).unwrap();
+        let client =
+            ProviderClient::new(&provider(ProviderFormat::Anthropic), false, None).unwrap();
         let err = client
             .chat_request("/v1/messages", json!({}), None)
             .await
@@ -294,50 +266,33 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn effective_key_passthrough_prefers_client_key() {
         let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
-        std::env::set_var("LOCAL_PROXY_TEST_KEY", "configured-key");
-        let client = ProviderClient::new(&provider(ProviderFormat::Anthropic), true, None).unwrap();
-        let key = client.effective_key(Some("client-key")).unwrap();
+        let p = provider(ProviderFormat::Anthropic);
+        let client = ProviderClient::new(&p, true, Some("configured-key".to_string())).unwrap();
+        let key = client.effective_key(Some("client-key"));
         assert_eq!(key.as_deref(), Some("client-key"));
         // without a client key, falls back to the configured key
-        let key = client.effective_key(None).unwrap();
+        let key = client.effective_key(None);
         assert_eq!(key.as_deref(), Some("configured-key"));
         // without passthrough, client key is ignored
-        let client =
-            ProviderClient::new(&provider(ProviderFormat::Anthropic), false, None).unwrap();
-        let key = client.effective_key(Some("client-key")).unwrap();
+        let client = ProviderClient::new(&p, false, Some("configured-key".to_string())).unwrap();
+        let key = client.effective_key(Some("client-key"));
         assert_eq!(key.as_deref(), Some("configured-key"));
-        std::env::remove_var("LOCAL_PROXY_TEST_KEY");
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
-    async fn key_resolution_inline_beats_auth_beats_env() {
+    async fn key_resolution_uses_auth_only() {
         let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
-        std::env::set_var("LOCAL_PROXY_TEST_KEY", "env-key");
 
-        // inline api_key wins over auth and env
-        let mut p = provider(ProviderFormat::Anthropic);
-        p.api_key = Some("inline-key".to_string());
-        let client = ProviderClient::new(&p, false, Some("auth-key".to_string())).unwrap();
-        assert_eq!(
-            client.configured_key().unwrap().as_deref(),
-            Some("inline-key")
-        );
-
-        // auth key wins over env
+        // auth key is used
         let p = provider(ProviderFormat::Anthropic);
         let client = ProviderClient::new(&p, false, Some("auth-key".to_string())).unwrap();
-        assert_eq!(
-            client.configured_key().unwrap().as_deref(),
-            Some("auth-key")
-        );
+        assert_eq!(client.configured_key().as_deref(), Some("auth-key"));
 
-        // env is the last fallback
+        // no key at all
         let p = provider(ProviderFormat::Anthropic);
         let client = ProviderClient::new(&p, false, None).unwrap();
-        assert_eq!(client.configured_key().unwrap().as_deref(), Some("env-key"));
-
-        std::env::remove_var("LOCAL_PROXY_TEST_KEY");
+        assert_eq!(client.configured_key(), None);
     }
 
     /// Spin up a one-shot HTTP server that records the request headers it
@@ -391,7 +346,6 @@ mod tests {
     #[allow(clippy::await_holding_lock)]
     async fn provider_headers_are_attached_to_request() {
         let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
-        std::env::set_var("LOCAL_PROXY_TEST_KEY", "key");
 
         let (base, rx) = header_capture_server().await;
         let mut p = provider(ProviderFormat::Openai);
@@ -403,7 +357,7 @@ mod tests {
             ),
             ("X-Title".to_string(), "local-proxy".to_string()),
         ]);
-        let client = ProviderClient::new(&p, false, None).unwrap();
+        let client = ProviderClient::new(&p, false, Some("key".to_string())).unwrap();
         client
             .chat_request("/v1/chat/completions", json!({}), None)
             .await
@@ -422,14 +376,12 @@ mod tests {
             received.get("authorization").and_then(|v| v.to_str().ok()),
             Some("Bearer key")
         );
-        std::env::remove_var("LOCAL_PROXY_TEST_KEY");
     }
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
     async fn provider_headers_override_auth_default() {
         let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
-        std::env::set_var("LOCAL_PROXY_TEST_KEY", "key");
 
         let (base, rx) = header_capture_server().await;
         let mut p = provider(ProviderFormat::Openai);
@@ -438,7 +390,7 @@ mod tests {
             "Authorization".to_string(),
             "Bearer custom".to_string(),
         )]);
-        let client = ProviderClient::new(&p, false, None).unwrap();
+        let client = ProviderClient::new(&p, false, Some("key".to_string())).unwrap();
         client
             .chat_request("/v1/chat/completions", json!({}), None)
             .await
@@ -449,6 +401,5 @@ mod tests {
             received.get("authorization").and_then(|v| v.to_str().ok()),
             Some("Bearer custom")
         );
-        std::env::remove_var("LOCAL_PROXY_TEST_KEY");
     }
 }
