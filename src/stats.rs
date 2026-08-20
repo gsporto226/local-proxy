@@ -15,8 +15,8 @@
     clippy::cast_precision_loss
 )]
 
-use std::path::PathBuf;
-use std::time::Instant;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
 use thiserror::Error;
 
@@ -111,6 +111,32 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     Ok(())
 }
 
+/// Open the stats database with settings that tolerate concurrent access.
+///
+/// Every call opens a fresh connection (writers and readers alike), so WAL
+/// journal mode and a busy timeout are applied on each open: WAL lets a
+/// background proxy and a `launch`-spawned ephemeral proxy write to the same
+/// database concurrently without `SQLITE_BUSY` failures, and the busy timeout
+/// makes a writer wait rather than fail when the other process holds the lock.
+///
+/// # Errors
+///
+/// Returns a [`StatsError::Open`] if the connection cannot be opened or a
+/// [`StatsError::Query`] if a pragma cannot be applied.
+fn open(path: &Path) -> Result<rusqlite::Connection, StatsError> {
+    let conn = rusqlite::Connection::open(path).map_err(|source| StatsError::Open {
+        path: path.to_path_buf(),
+        source,
+    })?;
+    conn.busy_timeout(Duration::from_secs(5))
+        .map_err(|source| StatsError::Query { source })?;
+    conn.pragma_update(None, "journal_mode", "WAL")
+        .map_err(|source| StatsError::Query { source })?;
+    conn.pragma_update(None, "synchronous", "NORMAL")
+        .map_err(|source| StatsError::Query { source })?;
+    Ok(conn)
+}
+
 /// Record one proxy request in the local database, best-effort.
 ///
 /// A failure to open or write the database is logged with `tracing` and ignored
@@ -132,11 +158,8 @@ pub fn record(started: Instant, stat: StatLine) {
     }
 }
 
-fn write_line(path: &PathBuf, stat: &StatLine, ts: i64, latency_ms: u64) -> Result<(), StatsError> {
-    let conn = rusqlite::Connection::open(path).map_err(|source| StatsError::Open {
-        path: path.clone(),
-        source,
-    })?;
+fn write_line(path: &Path, stat: &StatLine, ts: i64, latency_ms: u64) -> Result<(), StatsError> {
+    let conn = open(path)?;
     ensure_schema(&conn).map_err(|source| StatsError::Query { source })?;
     conn.execute(
         "INSERT INTO requests
@@ -254,8 +277,7 @@ pub fn summary(window: TimeWindow) -> Result<Option<RowSummary>, StatsError> {
     if !path.exists() {
         return Ok(None);
     }
-    let conn =
-        rusqlite::Connection::open(&path).map_err(|source| StatsError::Open { path, source })?;
+    let conn = open(&path)?;
     summary_on(&conn, window).map(Some)
 }
 
@@ -303,8 +325,7 @@ pub fn by_provider(window: TimeWindow) -> Result<Option<Vec<ProviderStats>>, Sta
     if !path.exists() {
         return Ok(None);
     }
-    let conn =
-        rusqlite::Connection::open(&path).map_err(|source| StatsError::Open { path, source })?;
+    let conn = open(&path)?;
     by_provider_on(&conn, window).map(Some)
 }
 
@@ -357,8 +378,7 @@ pub fn recent(window: TimeWindow, limit: u32) -> Result<Option<Vec<RequestRow>>,
     if !path.exists() {
         return Ok(None);
     }
-    let conn =
-        rusqlite::Connection::open(&path).map_err(|source| StatsError::Open { path, source })?;
+    let conn = open(&path)?;
     recent_on(&conn, window, limit).map(Some)
 }
 

@@ -38,6 +38,9 @@ enum Command {
         /// Check once at startup for a newer release and warn in the log
         #[arg(long)]
         check_update: bool,
+        /// Managed instance: skip the shared pid file (used by `launch`)
+        #[arg(long, hide = true)]
+        ephemeral: bool,
     },
     /// Start the proxy (if needed) and launch an Anthropic-compatible tool
     Launch {
@@ -113,6 +116,12 @@ enum Command {
         #[arg(long)]
         no_verify: bool,
     },
+    /// Hidden self-update helper: delete a stale backup after a delay (do not use).
+    #[command(name = "__cleanup-old", hide = true)]
+    CleanupOld {
+        /// Path of the stale `.old` backup to delete after a delay
+        path: String,
+    },
 }
 
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -128,13 +137,21 @@ fn main() -> miette::Result<()> {
     let cli = Cli::parse();
     let config = cli::resolve_config_path(cli.config);
     match cli.command {
-        None => block_on(cli::serve(config, None, None, false, false)),
+        None => block_on(cli::serve(config, None, None, false, false, false)),
         Some(Command::Serve {
             host,
             port,
             background,
             check_update,
-        }) => block_on(cli::serve(config, host, port, background, check_update)),
+            ephemeral,
+        }) => block_on(cli::serve(
+            config,
+            host,
+            port,
+            background,
+            check_update,
+            ephemeral,
+        )),
         Some(Command::Launch {
             tool,
             model,
@@ -168,5 +185,6 @@ fn main() -> miette::Result<()> {
             force,
             no_verify,
         }) => block_on(cli::update(repo, check, force, no_verify)),
+        Some(Command::CleanupOld { path }) => cli::cleanup_old_file(&path),
     }
 }

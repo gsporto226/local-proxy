@@ -2,7 +2,7 @@
 //! `models`. Pure helpers are unit-testable; process spawns are best-effort.
 
 use std::io;
-use std::net::{TcpStream, ToSocketAddrs};
+use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
@@ -152,9 +152,14 @@ pub fn read_pid() -> Option<u32> {
 /// Best-effort kill of the given process ID.
 pub fn stop_process(pid: u32) {
     #[cfg(windows)]
-    let _ = Command::new("taskkill")
-        .args(["/F", "/PID", &pid.to_string()])
-        .status();
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        let _ = Command::new("taskkill")
+            .creation_flags(CREATE_NO_WINDOW)
+            .args(["/F", "/PID", &pid.to_string()])
+            .status();
+    }
     #[cfg(not(windows))]
     let _ = Command::new("kill").args(["-9", &pid.to_string()]).status();
 }
@@ -207,6 +212,46 @@ pub fn spawn_background(args: &[String]) -> io::Result<std::process::Child> {
     }
 }
 
+/// Reserve an OS-assigned (ephemeral) available port for `host`.
+///
+/// Binds a listener to port `0`, reads the assigned port, and drops the
+/// listener so the caller (or the spawned proxy) can bind it. There is a tiny
+/// race between dropping and rebinding, which is acceptable for `launch`.
+///
+/// # Errors
+///
+/// Returns an error if the host cannot be bound to an ephemeral port.
+pub fn pick_ephemeral_port(host: &str) -> io::Result<u16> {
+    let listener = TcpListener::bind(format!("{host}:0"))?;
+    let port = listener.local_addr()?.port();
+    Ok(port)
+}
+
+/// Spawn this same binary as a non-detached child with the given args, keeping
+/// the handle so the caller can kill it when the launched tool exits.
+///
+/// Unlike [`spawn_background`], the child is not detached: its stdout/stderr are
+/// still mirrored to the log file, but the returned handle stays attached so the
+/// proxy lifetime can be tied to a foreground tool.
+///
+/// # Errors
+///
+/// Returns an error if the current executable, runtime directory, or log file
+/// cannot be set up, or if the process cannot be spawned.
+pub fn spawn_launch_proxy(args: &[String]) -> io::Result<std::process::Child> {
+    let exe = std::env::current_exe()?;
+    std::fs::create_dir_all(config_dir())?;
+    let log = std::fs::File::create(log_file())?;
+    let err = log.try_clone()?;
+
+    let mut cmd = Command::new(exe);
+    cmd.args(args)
+        .stdout(Stdio::from(log))
+        .stderr(Stdio::from(err))
+        .stdin(Stdio::null());
+    cmd.spawn()
+}
+
 // ---------------------------------------------------------------------------
 // config loading
 // ---------------------------------------------------------------------------
@@ -251,6 +296,7 @@ pub async fn serve(
     port_flag: Option<u16>,
     background: bool,
     check_update: bool,
+    ephemeral: bool,
 ) -> miette::Result<()> {
     if background {
         let mut args = vec![
@@ -268,6 +314,9 @@ pub async fn serve(
         }
         if check_update {
             args.push("--check-update".to_string());
+        }
+        if ephemeral {
+            args.push("--ephemeral".to_string());
         }
         let child = spawn_background(&args).map_err(CliError::from)?;
         println!(
@@ -305,10 +354,14 @@ pub async fn serve(
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
         .map_err(CliError::from)?;
-    write_pid(std::process::id()).map_err(CliError::from)?;
+    if !ephemeral {
+        write_pid(std::process::id()).map_err(CliError::from)?;
+    }
     tracing::info!(target: crate::LOG_TARGET, %addr, "listening");
     let result = axum::serve(listener, app).await;
-    remove_pid();
+    if !ephemeral {
+        remove_pid();
+    }
     result.map_err(CliError::from)?;
     Ok(())
 }
@@ -345,8 +398,12 @@ fn init_tracing() {
 
 /// The env vars that make an Anthropic-compatible tool point at this proxy.
 #[must_use]
-pub fn launch_environment(config: &Config, model: Option<&str>) -> Vec<(String, String)> {
-    let base = format!("http://{}:{}", config.server.host, config.server.port);
+pub fn launch_environment(
+    config: &Config,
+    port: u16,
+    model: Option<&str>,
+) -> Vec<(String, String)> {
+    let base = format!("http://{}:{}", config.server.host, port);
     let auth = config
         .server
         .api_keys
@@ -372,6 +429,52 @@ fn tool_command_name(tool: &str) -> &'static str {
     }
 }
 
+/// Spawn a dedicated, ephemeral proxy instance on `port` and wait until it
+/// accepts connections, returning the child handle so its lifetime can be tied
+/// to the launched tool.
+///
+/// # Errors
+///
+/// Returns an error if the proxy cannot be spawned or does not come up within
+/// the wait window (the child is killed in that case).
+#[allow(clippy::result_large_err)]
+fn start_ephemeral_proxy(
+    host: &str,
+    port: u16,
+    config_path: &Path,
+) -> Result<std::process::Child, CliError> {
+    let mut child = spawn_launch_proxy(&[
+        "serve".to_string(),
+        "--config".to_string(),
+        config_path.display().to_string(),
+        "--port".to_string(),
+        port.to_string(),
+        "--ephemeral".to_string(),
+    ])
+    .map_err(CliError::from)?;
+    println!("proxy started in background (pid {})", child.id());
+
+    let mut up = false;
+    for _ in 0..50 {
+        if is_serving(host, port) {
+            up = true;
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    if !up {
+        let _ = child.kill();
+        let _ = child.wait();
+        return Err(CliError::Tool {
+            message: format!(
+                "proxy did not come up on http://{host}:{port}; check the log at {}",
+                log_file().display()
+            ),
+        });
+    }
+    Ok(child)
+}
+
 /// Launch the given CLI tool against this proxy, starting the proxy in the
 /// background first if it is not already serving.
 ///
@@ -390,26 +493,20 @@ pub fn launch(
 ) -> miette::Result<()> {
     let config = load_config(&config_path)?;
     let host = config.server.host.clone();
-    let port = config.server.port;
     let tool_cmd = tool_command_name(tool);
 
-    if !is_serving(&host, port) {
-        let bg = spawn_background(&[
-            "serve".to_string(),
-            "--config".to_string(),
-            config_path.display().to_string(),
-        ])
-        .map_err(CliError::from)?;
-        println!("proxy started in background (pid {})", bg.id());
-        for _ in 0..50 {
-            if is_serving(&host, port) {
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(200));
-        }
-    }
+    // Always spin up a dedicated proxy instance on a random available port so
+    // its lifetime can be tied to the launched tool, leaving any pre-existing
+    // background proxy (and the shared pid file) untouched.
+    let port = pick_ephemeral_port(&host).map_err(CliError::from)?;
 
-    let env = launch_environment(&config, model);
+    let proxy = if dry_run {
+        None
+    } else {
+        Some(start_ephemeral_proxy(&host, port, &config_path)?)
+    };
+
+    let env = launch_environment(&config, port, model);
 
     if dry_run {
         for (k, v) in &env {
@@ -437,7 +534,16 @@ pub fn launch(
     cmd.args(&args);
     let status = cmd.status().map_err(|e| CliError::Tool {
         message: format!("failed to spawn '{tool_cmd}' (is it installed and on PATH?): {e}"),
-    })?;
+    });
+
+    // The proxy's lifetime is tied to the launched tool: kill it on exit, in
+    // all cases (including tool spawn failure or non-zero exit code).
+    if let Some(mut child) = proxy {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+
+    let status = status?;
     std::process::exit(status.code().unwrap_or(1));
 }
 
@@ -1098,6 +1204,29 @@ const CURRENT_ARCH: &str = "aarch64";
 #[cfg(not(any(target_arch = "x86_64", target_arch = "aarch64")))]
 const CURRENT_ARCH: &str = "unknown";
 
+/// Env guard that must be set for the hidden `__cleanup-old` mode to delete a
+/// file, so it can never be used to remove arbitrary paths by accident.
+const CLEANUP_ENV: &str = "LOCAL_PROXY_CLEANUP";
+
+/// Hidden self-update helper: wait briefly (so the just-exited process releases
+/// the lock on its swapped `.old` image) then delete the given stale backup.
+///
+/// Only runs when [`CLEANUP_ENV`] is set, and only ever deletes the single
+/// `path` argument. Replaces the previous `cmd /c timeout & del` helper so no
+/// console window can flash during an update.
+///
+/// # Errors
+///
+/// Returns an error if [`CLEANUP_ENV`] is not set (defense against misuse).
+pub fn cleanup_old_file(path: &str) -> miette::Result<()> {
+    if std::env::var_os(CLEANUP_ENV).is_none() {
+        miette::bail!("refusing to delete '{path}' without {CLEANUP_ENV} set");
+    }
+    std::thread::sleep(Duration::from_secs(2));
+    let _ = std::fs::remove_file(path);
+    Ok(())
+}
+
 /// A GitHub release listing (the fields `update` needs).
 #[derive(Debug, Deserialize)]
 struct Release {
@@ -1448,12 +1577,15 @@ fn swap_binary(staged: &Path, exe: &Path) -> Result<(), UpdateError> {
             command: manual_replace_command(staged, exe),
             source,
         })?;
-        let script = format!(
-            "timeout /t 2 /nobreak >nul & del /f /q \"{}\"",
-            old.display()
-        );
-        let mut cmd = Command::new("cmd");
-        cmd.args(["/c", &script]);
+        let helper = std::env::current_exe().map_err(|source| UpdateError::Replace {
+            path: staged.display().to_string(),
+            exe: exe.display().to_string(),
+            command: manual_replace_command(staged, exe),
+            source,
+        })?;
+        let mut cmd = Command::new(helper);
+        cmd.arg("__cleanup-old").arg(&old);
+        cmd.env(CLEANUP_ENV, "1");
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
         cmd.stdin(Stdio::null())
             .stdout(Stdio::null())
@@ -1606,7 +1738,7 @@ mod tests {
     #[test]
     fn launch_env_uses_configured_key_and_model() {
         let cfg = config_with(vec!["sk-proxy".to_string()]);
-        let env = launch_environment(&cfg, Some("kimi-k2.6"));
+        let env = launch_environment(&cfg, 8787, Some("kimi-k2.6"));
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
         assert_eq!(map["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787");
         assert_eq!(map["ANTHROPIC_API_KEY"], "sk-proxy");
@@ -1618,7 +1750,7 @@ mod tests {
     #[test]
     fn launch_env_without_keys_uses_unused_and_no_model() {
         let cfg = config_with(Vec::new());
-        let env = launch_environment(&cfg, None);
+        let env = launch_environment(&cfg, 8787, None);
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
         assert_eq!(map["ANTHROPIC_API_KEY"], "unused");
         assert_eq!(map["ANTHROPIC_AUTH_TOKEN"], "unused");
@@ -1631,6 +1763,14 @@ mod tests {
         assert_eq!(tool_command_name("cc"), "claude");
         assert_eq!(tool_command_name("design"), "design");
         assert_eq!(tool_command_name("cd"), "design");
+    }
+
+    #[test]
+    fn pick_ephemeral_port_returns_an_open_port() {
+        let port = pick_ephemeral_port("127.0.0.1").expect("pick a port");
+        assert_ne!(port, 0);
+        let listener = TcpListener::bind(("127.0.0.1", port)).expect("port is rebindable");
+        assert_eq!(listener.local_addr().unwrap().port(), port);
     }
 
     #[test]
