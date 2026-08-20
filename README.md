@@ -181,6 +181,18 @@ claude
 Claude Code fala `/v1/messages`; o proxy roteia para o provider configurado e traduz (ex.:
 `deepseek-free` → deepseek-v4-flash-free via opencode-zen).
 
+### Launch (uma instância dedicada, vida atrelada à ferramenta)
+
+`local-proxy launch claude [--model X] [--yes] [-- args...]` (e `launch design`) sobe uma **instância
+dedicada** do proxy numa **porta aleatória livre**, aponta a ferramenta para ela e a **mata quando a
+ferramenta sai** — inclusive em erro/saída não-zero. Nunca reutiliza nem toca um proxy de fundo que já
+esteja rodando (nem sobrescreve o pid file compartilhado). As estatísticas continuam indo para o mesmo
+`stats.db` (WAL + busy timeout, seguro com múltiplas instâncias):
+
+```powershell
+local-proxy launch claude --model kimi-k2.6 --yes
+```
+
 ## Atualizar (`update`)
 
 Baixa o binário mais recente do último release do GitHub, verifica SHA256 e **aplica no lugar**:

@@ -149,7 +149,7 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
 - Confirmar `stream_options.include_usage` contra opencode-zen com um 200 limpo (o free rate-limitou antes).
   Se o zen rejeitar, tornar `include_usage` opt-in por provider (flag no config).
 - Caveats menores do launcher (opcionais): pid file único (múltiplos bg se sobrescrevem — futuro: pid por
-  porta/lockfile); `launch --dry-run` ainda inicia o proxy; `status` logo após bg pode dar "not reachable".
+  porta/lockfile); `status` logo após bg pode dar "not reachable".
 - Fora de escopo v1: retry/round-robin multi-key, rate limit, embeddings, cache, imagem Podman.
 
 ## Como rodar os testes
