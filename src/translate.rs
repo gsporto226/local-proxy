@@ -1256,7 +1256,11 @@ pub fn openai_to_responses_response(body: Value, model: &str) -> Result<Value, T
 // ---------------------------------------------------------------------------
 
 /// Aggregate token counts for a single request/response exchange.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+///
+/// `cost_usd` is present only when the *upstream reports it* (`cost`,
+/// `prompt_cost`+`completion_cost`, …). It is never synthesized from a pricing
+/// table; for providers that report nothing it stays `None`.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
 pub struct TokenUsage {
     /// Number of input (prompt) tokens.
     pub input: u64,
@@ -1264,6 +1268,8 @@ pub struct TokenUsage {
     pub output: u64,
     /// Number of reasoning tokens, when reported by the upstream.
     pub reasoning: u64,
+    /// The request's monetary cost in USD, when reported by the upstream.
+    pub cost_usd: Option<f64>,
 }
 
 /// Energy and cost metadata reported by energy-priced providers (`NeuralWatt`).
@@ -1282,6 +1288,21 @@ pub struct EnergyCost {
     pub request_cost_usd: Option<f64>,
     /// Cache savings in USD.
     pub cache_savings_usd: Option<f64>,
+}
+
+impl TokenUsage {
+    /// The request cost as an [`EnergyCost`], when the upstream reported it via
+    /// `usage.cost` / `prompt_cost`+`completion_cost`. This lets the recording
+    /// layer persist an OpenAI/OpenRouter-reported cost (which has no energy
+    /// payload) through the same `cost_usd_um` column. Returns `None` when no
+    /// cost was reported.
+    #[must_use]
+    pub fn as_cost(&self) -> Option<EnergyCost> {
+        self.cost_usd.map(|usd| EnergyCost {
+            request_cost_usd: Some(usd),
+            ..EnergyCost::default()
+        })
+    }
 }
 
 /// Parse a NeuralWatt-style top-level `energy` object.
@@ -1359,8 +1380,28 @@ pub fn parse_usage(value: &Value) -> TokenUsage {
         if let Some(details) = obj.get("output_tokens_details") {
             usage.reasoning = num(details.get("reasoning_tokens")).unwrap_or(usage.reasoning);
         }
+        usage.cost_usd = cost_from_usage(obj);
     }
     usage
+}
+
+/// Extract a reported monetary cost from a usage object, if one is present.
+///
+/// Cost field names differ by provider; we scan a small allow-list and total
+/// when both parts exist. Returns `None` when no recognized field carries a
+/// cost — the proxy never estimates cost from a token-price table.
+fn cost_from_usage(obj: &serde_json::Map<String, Value>) -> Option<f64> {
+    // OpenAI-compatible: a single `cost` field (e.g. OpenRouter, Groq).
+    let single = obj.get("cost").and_then(Value::as_f64);
+    // OpenRouter-style split prompt/completion cost.
+    let both = match (
+        obj.get("prompt_cost").and_then(Value::as_f64),
+        obj.get("completion_cost").and_then(Value::as_f64),
+    ) {
+        (Some(p), Some(c)) => Some(p + c),
+        _ => None,
+    };
+    single.or(both)
 }
 
 /// Merge `part` into `acc`, keeping the highest value per field.
@@ -1373,6 +1414,9 @@ pub fn merge_usage(acc: &mut TokenUsage, part: TokenUsage) {
     acc.input = acc.input.max(part.input);
     acc.output = acc.output.max(part.output);
     acc.reasoning = acc.reasoning.max(part.reasoning);
+    if part.cost_usd.is_some() {
+        acc.cost_usd = part.cost_usd;
+    }
 }
 
 /// Extract cumulative token usage from a generic SSE frame payload.
@@ -1826,7 +1870,8 @@ mod tests {
             TokenUsage {
                 input: 1,
                 output: 2,
-                reasoning: 0
+                reasoning: 0,
+                cost_usd: None,
             }
         );
 
@@ -1843,6 +1888,63 @@ mod tests {
         assert_eq!(u.reasoning, 5);
 
         assert_eq!(parse_usage(&json!({})), TokenUsage::default());
+    }
+
+    #[test]
+    fn parse_usage_captures_reported_cost_when_present() {
+        // OpenAI/OpenRouter single `cost` field.
+        let c = 0.000_123;
+        let single = json!({"prompt_tokens": 1, "completion_tokens": 1, "cost": c});
+        assert_eq!(parse_usage(&single).cost_usd, Some(c));
+
+        // OpenRouter split prompt/completion cost totals both.
+        let split = json!({"prompt_tokens": 1, "completion_tokens": 1, "prompt_cost": 0.01, "completion_cost": 0.02});
+        assert_eq!(parse_usage(&split).cost_usd, Some(0.03));
+
+        // Anthropic reports no cost -> None (never synthesized).
+        let anthro = json!({"input_tokens": 1, "output_tokens": 1});
+        assert_eq!(parse_usage(&anthro).cost_usd, None);
+    }
+
+    #[test]
+    fn merge_usage_propagates_first_reported_cost() {
+        let mut acc = TokenUsage::default();
+        merge_usage(
+            &mut acc,
+            TokenUsage {
+                input: 5,
+                output: 3,
+                reasoning: 0,
+                cost_usd: Some(0.007),
+            },
+        );
+        assert_eq!(acc.cost_usd, Some(0.007));
+        // a later frame without cost does not clear it
+        merge_usage(
+            &mut acc,
+            TokenUsage {
+                input: 6,
+                output: 4,
+                reasoning: 0,
+                cost_usd: None,
+            },
+        );
+        assert_eq!(acc.cost_usd, Some(0.007));
+    }
+
+    #[test]
+    fn as_cost_roundtrips_reported_usage_cost() {
+        // A reported usage cost becomes an EnergyCost carrying request_cost_usd,
+        // so the recording layer can persist it through cost_usd_um.
+        let used = TokenUsage {
+            cost_usd: Some(0.0042),
+            ..TokenUsage::default()
+        };
+        let cost = used.as_cost().expect("cost present");
+        assert_eq!(cost.request_cost_usd, Some(0.0042));
+
+        // No reported cost -> None (nothing to record).
+        assert_eq!(TokenUsage::default().as_cost(), None);
     }
 
     #[test]
@@ -1871,6 +1973,7 @@ mod tests {
                 input: 0,
                 output: 2,
                 reasoning: 0,
+                cost_usd: None,
             },
         );
         // then a full picture with larger input
@@ -1880,6 +1983,7 @@ mod tests {
                 input: 5,
                 output: 3,
                 reasoning: 1,
+                cost_usd: None,
             },
         );
         assert_eq!(acc.input, 5);
@@ -1892,6 +1996,7 @@ mod tests {
                 input: 1,
                 output: 1,
                 reasoning: 0,
+                cost_usd: None,
             },
         );
         assert_eq!(acc.input, 5);

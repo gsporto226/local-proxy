@@ -26,6 +26,7 @@ pub struct StreamCapture {
     model: String,
     status: u16,
     started: Instant,
+    session_id: String,
 }
 
 impl StreamCapture {
@@ -37,6 +38,7 @@ impl StreamCapture {
         model: &str,
         status: u16,
         started: Instant,
+        session_id: &str,
     ) -> Self {
         Self {
             endpoint,
@@ -44,11 +46,14 @@ impl StreamCapture {
             model: model.to_string(),
             status,
             started,
+            session_id: session_id.to_string(),
         }
     }
 
     /// Write the stats row with the final cumulative `usage`, plus any energy
-    /// and cost metadata observed in the stream (NeuralWatt-style). Best-effort.
+    /// and cost metadata observed in the stream (`NeuralWatt`-style). Best-effort.
+    /// When no `NeuralWatt` cost was observed, falls back to the `usage.cost`
+    /// reported by OpenAI/OpenRouter-style upstreams.
     pub fn record(&self, usage: TokenUsage, energy: Option<EnergyCost>, cost: Option<EnergyCost>) {
         stats::record(
             self.started,
@@ -62,7 +67,8 @@ impl StreamCapture {
                 status: self.status,
                 error: self.status >= 400,
                 energy,
-                cost,
+                cost: cost.or_else(|| usage.as_cost()),
+                session_id: self.session_id.clone(),
             },
         );
     }
@@ -296,6 +302,9 @@ const fn merge_usage(acc: &mut TokenUsage, part: TokenUsage) {
     }
     if part.reasoning > 0 {
         acc.reasoning = part.reasoning;
+    }
+    if part.cost_usd.is_some() {
+        acc.cost_usd = part.cost_usd;
     }
 }
 
@@ -1466,7 +1475,8 @@ mod tests {
             TokenUsage {
                 input: 5,
                 output: 7,
-                reasoning: 0
+                reasoning: 0,
+                cost_usd: None,
             }
         );
         assert_eq!(m.usage().output, 7);
@@ -1489,7 +1499,8 @@ mod tests {
             TokenUsage {
                 input: 11,
                 output: 4,
-                reasoning: 0
+                reasoning: 0,
+                cost_usd: None,
             }
         );
     }

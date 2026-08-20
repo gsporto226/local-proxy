@@ -58,12 +58,14 @@ export async function waitHealth(base: string, timeoutMs = 20000): Promise<void>
 export async function startProxy(
   configYaml: string,
   requestedPort?: number,
+  env: Record<string, string> = {},
 ): Promise<ProxyHandle> {
   const port = requestedPort ?? (await findFreePort());
   const cfg = writeConfig(configYaml);
   const proc = spawn([BINARY, "serve", "--config", cfg, "--port", String(port)], {
     stdout: "ignore",
     stderr: "pipe",
+    env: { ...process.env, ...env },
   });
   const base = `http://127.0.0.1:${port}`;
   try {
@@ -73,6 +75,21 @@ export async function startProxy(
     throw e;
   }
   return { proc, base, port };
+}
+
+/** Run the compiled CLI once, returning its combined output and exit code. */
+export async function runCli(
+  args: string[],
+  env: Record<string, string> = {},
+): Promise<{ exit: number; output: string }> {
+  const p = spawn([BINARY, ...args], {
+    stdout: "pipe",
+    stderr: "pipe",
+    env: { ...process.env, ...env },
+  });
+  const out = (await new Response(p.stdout).text()) + (await new Response(p.stderr).text());
+  const exit = await p.exited;
+  return { exit, output: out };
 }
 
 export function stopProxy(_h: ProxyHandle): void {

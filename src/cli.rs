@@ -7,6 +7,8 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::Duration;
 
+use std::collections::HashMap;
+
 use miette::Diagnostic;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -898,6 +900,94 @@ fn window_seconds(kind: &str) -> Option<i64> {
     }
 }
 
+/// Render the status line for a client session from its recorded stats.
+///
+/// The script (typically the status line command configured in Claude Code's
+/// `settings.json`) passes this session's `session_id` plus optional `model`
+/// and `context_pct` fields from the status line JSON; the proxy computes the
+/// numeric params from `stats.db` and evaluates the template (from `--template`
+/// or the config `statusline:` block) against them. Formatting is entirely up
+/// to the template — the proxy exposes raw values only.
+///
+/// # Errors
+///
+/// Returns [`CliError::Stats`] if the stats database cannot be read.
+#[allow(clippy::needless_pass_by_value, clippy::cast_possible_wrap)]
+pub fn statusline(
+    config_path: PathBuf,
+    session: Option<String>,
+    model: Option<String>,
+    context_pct: Option<f64>,
+    template_flag: Option<String>,
+) -> miette::Result<()> {
+    // Resolve the template: flag > config `statusline:` block.
+    let config = effective_config(&config_path)?;
+    let template = template_flag
+        .or_else(|| config.statusline.template.clone())
+        .unwrap_or_else(|| "{model} · {cost_session} · {context_pct}% ctx".to_string());
+
+    let session = session.unwrap_or_default();
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    let month_window = crate::stats::TimeWindow {
+        since: window_seconds("month").map(|s| now - s),
+    };
+    let all_window = crate::stats::TimeWindow { since: None };
+
+    let sess = crate::stats::session(&session).map_err(CliError::from)?;
+    let cost_month = crate::stats::cost_over(month_window).map_err(CliError::from)?;
+    let cost_total = crate::stats::cost_over(all_window).map_err(CliError::from)?;
+
+    // Build the param map. Every known name is bound (defaulting to the
+    // no-data marker) so a template referencing any of them never errors on an
+    // unbound variable; present values replace the marker.
+    let mut params: HashMap<String, String> = [
+        "cost_session",
+        "cost_month",
+        "cost_total",
+        "cost_known",
+        "tokens_in",
+        "tokens_out",
+        "requests",
+        "model",
+        "context_pct",
+    ]
+    .iter()
+    .map(|k| ((*k).to_string(), crate::statusline::NO_DATA.to_string()))
+    .collect();
+
+    if let Some(s) = &sess {
+        params.insert("tokens_in".to_string(), s.tokens_in.to_string());
+        params.insert("tokens_out".to_string(), s.tokens_out.to_string());
+        params.insert("requests".to_string(), s.requests.to_string());
+        params.insert("cost_known".to_string(), s.cost_known_requests.to_string());
+        if let Some(m) = &s.last_model {
+            params.insert("model".to_string(), m.clone());
+        }
+        if s.cost_known_requests > 0 {
+            // only a cost figure when the session actually has reported cost
+            params.insert("cost_session".to_string(), s.cost_usd.to_string());
+        }
+    }
+    if let Some(c) = cost_month {
+        params.insert("cost_month".to_string(), c.to_string());
+    }
+    if let Some(c) = cost_total {
+        params.insert("cost_total".to_string(), c.to_string());
+    }
+    if let Some(m) = &model {
+        params.insert("model".to_string(), m.clone());
+    }
+    if let Some(p) = context_pct {
+        params.insert("context_pct".to_string(), p.to_string());
+    }
+
+    let line = crate::statusline::render(&template, &params);
+    println!("{line}");
+    Ok(())
+}
+
 /// Print aggregate usage statistics collected from upstream requests.
 ///
 /// Renders a human summary (with a per-provider breakdown) by default, or the
@@ -1650,6 +1740,7 @@ mod tests {
             routes: Vec::new(),
             defaults: Defaults::default(),
             exec: crate::config::Exec::default(),
+            statusline: crate::config::StatuslineConfig::default(),
         }
     }
 

@@ -93,6 +93,21 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Render the Claude Code status line for a session from its recorded stats
+    Statusline {
+        /// Client session id from the status line JSON (`session_id`)
+        #[arg(long)]
+        session: Option<String>,
+        /// Model name from the status line JSON (`model.display_name`)
+        #[arg(long)]
+        model: Option<String>,
+        /// Context window usage percent from the status line JSON
+        #[arg(long)]
+        context_pct: Option<f64>,
+        /// Rhai template (overrides the config `statusline:` block)
+        #[arg(long)]
+        template: Option<String>,
+    },
     /// Check for a newer release and stage a manual update from GitHub Releases
     Update {
         /// GitHub owner/repo (overrides `LOCAL_PROXY_REPO`)
@@ -169,6 +184,12 @@ fn main() -> miette::Result<()> {
             let since = since.unwrap_or_else(|| "day".to_string());
             cli::stats(config, since, json)
         }
+        Some(Command::Statusline {
+            session,
+            model,
+            context_pct,
+            template,
+        }) => cli::statusline(config, session, model, context_pct, template),
         Some(Command::Update {
             repo,
             check,

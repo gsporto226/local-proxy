@@ -137,6 +137,16 @@ pub struct Defaults {
     pub active_model: Option<String>,
 }
 
+/// Template for the Claude Code status line, rendered by `local-proxy
+/// statusline`. The script is a sandboxed Rhai expression evaluated inside the
+/// proxy against the current session's recorded stats.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct StatuslineConfig {
+    /// The Rhai template. A `--template` CLI flag overrides this value.
+    pub template: Option<String>,
+}
+
 /// Top-level parsed configuration.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -151,6 +161,9 @@ pub struct Config {
     pub defaults: Defaults,
     /// `$proxy` local-command-execution settings.
     pub exec: Exec,
+    /// Status line template for the Claude Code status line.
+    #[serde(default)]
+    pub statusline: StatuslineConfig,
 }
 
 /// Errors that can occur while loading, parsing, or creating configuration.
@@ -309,12 +322,17 @@ impl Config {
 
 /// Returns the per-user config directory for local-proxy.
 ///
-/// Prefers `directories::ProjectDirs` (`.config_dir()`): on Windows this is
-/// `%APPDATA%\local-proxy`, on Unix `~/.config/local-proxy`. Falls back to the
-/// `APPDATA` (Windows) or `HOME`/`USERPROFILE` environment variables, and
-/// finally to a local `.config/local-proxy` directory. Never panics.
+/// Overridden by the `LOCAL_PROXY_CONFIG_DIR` environment variable (so tests
+/// and tooling can isolate the config dir and the `stats.db` it contains).
+/// Otherwise prefers `directories::ProjectDirs` (`.config_dir()`): on Windows
+/// this is `%APPDATA%\local-proxy`, on Unix `~/.config/local-proxy`. Falls back
+/// to the `APPDATA` (Windows) or `HOME`/`USERPROFILE` environment variables,
+/// and finally to a local `.config/local-proxy` directory. Never panics.
 #[must_use]
 pub fn global_config_dir() -> PathBuf {
+    if let Some(dir) = std::env::var_os("LOCAL_PROXY_CONFIG_DIR").filter(|v| !v.is_empty()) {
+        return PathBuf::from(dir);
+    }
     if let Some(dirs) = directories::ProjectDirs::from("", "", "local-proxy") {
         return dirs.config_dir().to_path_buf();
     }
@@ -492,6 +510,18 @@ mod tests {
             Some(Path::new("custom.yaml"))
         );
         std::env::remove_var(ENV_CONFIG_PATH);
+    }
+
+    #[test]
+    fn global_config_dir_env_override() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
+        let default = global_config_dir();
+        assert_ne!(default, PathBuf::new());
+
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", "/tmp/lp-e2e");
+        assert_eq!(global_config_dir(), PathBuf::from("/tmp/lp-e2e"));
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
     }
 
     #[test]

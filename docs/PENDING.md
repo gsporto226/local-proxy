@@ -1,6 +1,6 @@
 # PENDING / status de trabalho
 
-Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
+Estado atual do proxy `local-proxy`. Última atualização: 2026-08-20.
 
 ## ✅ TODAS AS TASKS CONCLUÍDAS (kanban: backend 001-004 + 006-009, qa 005 + 010 — todas `done`)
 
@@ -124,6 +124,34 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-18.
   provider; recentes mostram valor quando presente.
 - Testes: parse de comentários SSE, parse top-level/payload, round-trip + agregação no stats, e
   migração de schema legado. **122** verdes; fmt/clippy limpos; e2e 16.
+
+### Nova rodada — status line + custo por sessão
+- `statusline` renderiza a **status line do Claude Code** com o uso/custo real da sessão, lidos de
+  `stats.db` (não do side-client local do Claude). Loop: header `X-Claude-Code-Session-Id` em cada
+  `/v1/messages` → proxy grava `session_id` por request → `scripts/statusline.{ps1,sh}` extraem o
+  `session_id` do JSON da status line e chamam `local-proxy statusline --session <id> --template <tpl>`.
+- `translate.rs`: `TokenUsage.cost_usd` parseado de `usage.cost` (OpenAI/OpenRouter/Groq) ou
+  `prompt_cost`+`completion_cost` (OpenRouter split); **nunca sintetizado** de tabela de preço.
+  `merge_usage` propaga o primeiro custo reportado.
+- **Custo de `usage.cost` agora é realmente persistido**: antes só o formato NeuralWatt (objeto/custo
+  top-level) gravava `cost_usd_um`; o custo de `usage.cost` era parseado e descartado. Agora
+  `TokenUsage::as_cost()` converte o custo de uso para `EnergyCost` e é usado como fallback no
+  non-streaming (`capture`) e no streaming (`StreamCapture::record`), quando não há `cost` NeuralWatt.
+- `stats.rs`: coluna `session_id` + migração in-place; queries `session()`/`cost_over()` agregam
+  `cost_usd`, `tokens_in/out`, `requests`, `cost_known`, `last_model` por sessão/janela.
+- `statusline.rs`: template **Rhai** sandboxed (sem file/network/host access). Params bound por
+  variável (número `i64`/`f64`, resto string); valor ausente vira marcador `?`; falha de parse/run
+  loga e imprime fallback estático sem nunca falhar (exit 0).
+- **Bug corrigido**: sessão com requests mas sem custo reportado mostrava `cost=0`; agora só insere
+  `cost_session` quando `cost_known_requests > 0` (senão `?`).
+- `LOCAL_PROXY_CONFIG_DIR`: override de env para o config dir global (e o `stats.db` dentro dele),
+  isolando testes sem tocar o dir real do usuário.
+- `cli.rs`/`main.rs`: subcomando `statusline` (flags `--session`, `--model`, `--context-pct`,
+  `--template`; `--template` vence o bloco `statusline:` do config). README + `config.example.yaml`
+  documentam wiring via `settings.json` `statusLine`.
+- Testes: **e2e real** `e2e/statusline.test.ts` — sobe o proxy com config dir isolado, manda requests
+  com `X-Claude-Code-Session-Id`, e confere que `statusline --session` renderiza o custo/tokens reais
+  da sessão (custo `usage.cost` incluso). **139** unit tests verdes; fmt/clippy limpos; e2e 17 verdes.
 
 ### Estado de verificação (task 010)
 - `cargo test --all-features`: **122** unit tests verdes.

@@ -48,7 +48,9 @@ function chatHandler(body: any): Response {
         logprobs: null,
       },
     ],
-    usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5 },
+    // `cost` reported by cost-aware OpenAI-compatible upstreams (OpenRouter,
+    // Groq, …); the proxy records it verbatim as the session cost.
+    usage: { prompt_tokens: 3, completion_tokens: 2, total_tokens: 5, cost: 0.0042 },
   });
 }
 
