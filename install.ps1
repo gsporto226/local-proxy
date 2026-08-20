@@ -38,22 +38,47 @@ param(
 $ErrorActionPreference = "Stop"
 
 function Get-Os {
-  if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) {
-    return "windows"
+  $isWin = Get-Variable -Name IsWindows -ErrorAction SilentlyContinue
+  $isLx = Get-Variable -Name IsLinux -ErrorAction SilentlyContinue
+  $isMac = Get-Variable -Name IsOSX -ErrorAction SilentlyContinue
+  if ($isWin -and $isWin.Value) { return "windows" }
+  if ($isLx -and $isLx.Value) { return "linux" }
+  if ($isMac -and $isMac.Value) { return "darwin" }
+
+  try {
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Windows)) { return "windows" }
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)) { return "linux" }
+    if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) { return "darwin" }
+  } catch { }
+
+  if ($env:OS -and $env:OS -like "Windows*") { return "windows" }
+
+  if (Get-Command -Name uname -ErrorAction SilentlyContinue) {
+    $s = (& uname -s).ToLowerInvariant()
+    if ($s -like "*mingw*" -or $s -like "*msys*" -or $s -like "cygwin*") { return "windows" }
+    if ($s -eq "darwin") { return "darwin" }
+    if ($s -like "linux*") { return "linux" }
   }
-  if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::Linux)) {
-    return "linux"
-  }
-  if ([System.Runtime.InteropServices.RuntimeInformation]::IsOSPlatform([System.Runtime.InteropServices.OSPlatform]::OSX)) {
-    return "darwin"
-  }
-  throw "SO não suportado"
+
+  throw "Não foi possível detectar o sistema operacional."
 }
 
 function Get-Arch {
-  $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString().ToLowerInvariant()
-  if ($arch -eq "x64") { return "x86_64" }
-  if ($arch -eq "arm64") { return "aarch64" }
+  if ($os -eq "windows") {
+    $arch = $null
+    try {
+      $arch = [System.Runtime.InteropServices.RuntimeInformation]::OSArchitecture.ToString()
+    } catch { }
+    if (-not $arch) { $arch = $env:PROCESSOR_ARCHITECTURE }
+    $arch = $arch.ToLowerInvariant()
+    if ($arch -eq "x64" -or $arch -eq "amd64") { return "x86_64" }
+    if ($arch -eq "arm64" -or $arch -eq "aarch64") { return "aarch64" }
+    return $arch
+  }
+
+  $arch = (& uname -m).ToLowerInvariant()
+  if ($arch -eq "x86_64") { return "x86_64" }
+  if ($arch -eq "aarch64" -or $arch -eq "arm64") { return "aarch64" }
   return $arch
 }
 
