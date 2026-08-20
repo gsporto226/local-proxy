@@ -119,14 +119,16 @@ param(
   [string]$Template = ""
 )
 
-$input = [Console]::In.ReadToEnd()
+# Note: `$input` is a reserved automatic variable in PowerShell, so the raw
+# status-line JSON is read into `$raw` instead.
+$raw = [Console]::In.ReadToEnd()
 
 $session = ""
-if ($input -match '"session_id"\s*:\s*"([^"]*)"') { $session = $Matches[1] }
+if ($raw -match '"session_id"\s*:\s*"([^"]*)"') { $session = $Matches[1] }
 $model = ""
-if ($input -match '"(display_name|model)"\s*:\s*"([^"]*)"') { $model = $Matches[2] }
+if ($raw -match '"(display_name|model)"\s*:\s*"([^"]*)"') { $model = $Matches[2] }
 $ctx = ""
-if ($input -match '"used_percentage"\s*:\s*([0-9.]*)') { $ctx = $Matches[1] }
+if ($raw -match '"used_percentage"\s*:\s*([0-9.]*)') { $ctx = $Matches[1] }
 
 $args = @()
 if ($session) { $args += "--session", $session }
@@ -509,6 +511,19 @@ mod tests {
         }
         let p = super::claude_settings_path().expect("resolves");
         assert_eq!(p, home.join(".claude").join("settings.json"));
+    }
+
+    #[test]
+    fn windows_script_does_not_use_reserved_input_var() {
+        // `$input` is a reserved automatic variable in PowerShell: assigning to
+        // it never holds the value, so the script would read empty stdin and
+        // extract no session/model/context. The script must read into `$raw`.
+        let script = super::SCRIPT_WINDOWS;
+        assert!(script.contains("$raw = [Console]::In.ReadToEnd()"));
+        assert!(!script.contains("$input = "), "must not assign to $input");
+        // the JSON extraction reads from `$raw`, not the reserved variable
+        assert!(!script.contains("if ($input -match"));
+        assert!(script.contains("if ($raw -match"));
     }
 
     #[test]
