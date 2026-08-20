@@ -36,6 +36,9 @@ pub struct RuntimeState {
     pub router: Arc<Router>,
     /// The built upstream clients, keyed by provider name.
     pub clients: Arc<HashMap<String, ProviderClient>>,
+    /// The config file this instance was started with (used by `$proxy model`
+    /// to persist the selection).
+    pub config_path: PathBuf,
 }
 
 /// Shared application state threaded through the axum handlers.
@@ -56,6 +59,15 @@ impl AppState {
     /// Snapshot the current runtime state (cheap Arc clones).
     pub async fn snapshot(&self) -> RuntimeState {
         self.inner.read().await.clone()
+    }
+
+    /// Set the in-memory `active_model` for this instance without touching any
+    /// other running proxy. Persistence is handled separately by the caller.
+    pub async fn set_active_model(&self, model: Option<String>) {
+        let mut guard = self.inner.write().await;
+        let mut new_config = (*guard.config).clone();
+        new_config.defaults.active_model = model;
+        guard.config = Arc::new(new_config);
     }
 }
 
@@ -116,6 +128,7 @@ pub fn build_runtime_state(config_path: &Path) -> Result<RuntimeState, RuntimeEr
         config,
         router,
         clients,
+        config_path: config_path.to_path_buf(),
     })
 }
 
@@ -170,7 +183,15 @@ pub fn spawn_watcher(config_path: PathBuf, app_state: &AppState) -> Result<(), R
         let _debouncer = debouncer;
         while brx.recv().await.is_some() {
             match build_runtime_state(&config_path) {
-                Ok(new_state) => {
+                Ok(mut new_state) => {
+                    // Preserve this instance's in-memory active model: a model
+                    // write to the shared config must never leak to other
+                    // running proxies via hot-reload. Everything else (providers,
+                    // routes, auth) still reloads from the file.
+                    let current_model = state.read().await.config.defaults.active_model.clone();
+                    let mut cfg = (*new_state.config).clone();
+                    cfg.defaults.active_model = current_model;
+                    new_state.config = Arc::new(cfg);
                     *state.write().await = new_state;
                     tracing::info!("config/auth change applied (hot-reload)");
                 }
@@ -477,20 +498,169 @@ fn capture(
 }
 
 // ---------------------------------------------------------------------------
+// $proxy local-command execution
+// ---------------------------------------------------------------------------
+
+/// The active model for a response, or `local-proxy` when none is selected.
+#[must_use]
+fn active_model_or_default(state: &RuntimeState) -> String {
+    state
+        .config
+        .defaults
+        .active_model
+        .clone()
+        .unwrap_or_else(|| "local-proxy".to_string())
+}
+
+/// Unix epoch seconds (for synthesized response timestamps).
+#[must_use]
+fn now_ts() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs())
+}
+
+/// Run the `$proxy` command carried by `body`, if any, returning its captured
+/// output. Returns `None` when exec is disabled or the request is not a
+/// `$proxy` command.
+async fn maybe_exec(
+    app: &AppState,
+    state: &RuntimeState,
+    body: &Value,
+) -> Option<crate::exec::ExecOutput> {
+    let exec = &state.config.exec;
+    if !exec.enabled {
+        return None;
+    }
+    let text = crate::exec::request_text(body)?;
+    let cmd = crate::exec::split_command(&text, &exec.token)?;
+    let args = crate::exec::parse_args(cmd);
+    if args.first().map(String::as_str) == Some("model") {
+        Some(handle_model_exec(app, state, &args).await)
+    } else {
+        Some(crate::exec::run(&exec.command, &args, Duration::from_secs(exec.timeout_secs)).await)
+    }
+}
+
+/// Handle `$proxy model ...` in-process: report this instance's in-memory
+/// model, or validate/persist via the CLI logic and update the in-memory
+/// `active_model` (per-instance, no broadcast to other running proxies).
+async fn handle_model_exec(
+    app: &AppState,
+    state: &RuntimeState,
+    args: &[String],
+) -> crate::exec::ExecOutput {
+    let selection = args.get(1).map(String::as_str);
+    let stdout = match selection {
+        None => state.config.defaults.active_model.as_deref().map_or_else(
+            || "nenhum modelo ativo".to_string(),
+            |m| format!("modelo ativo: {m}"),
+        ),
+        Some("clear") => {
+            let msg = crate::cli::model_result(&state.config_path, Some("clear"))
+                .unwrap_or_else(|e| e.to_string());
+            app.set_active_model(None).await;
+            msg
+        }
+        Some(selected) => match crate::cli::model_result(&state.config_path, Some(selected)) {
+            Ok(msg) => {
+                if msg.starts_with("modelo ativo:") {
+                    app.set_active_model(Some(selected.to_string())).await;
+                }
+                msg
+            }
+            Err(e) => {
+                return crate::exec::ExecOutput {
+                    stdout: String::new(),
+                    stderr: e.to_string(),
+                    code: 1,
+                    timed_out: false,
+                };
+            }
+        },
+    };
+    crate::exec::ExecOutput {
+        stdout,
+        stderr: String::new(),
+        code: 0,
+        timed_out: false,
+    }
+}
+
+/// Synthesize an `Anthropic` Messages response carrying `$proxy` output.
+fn exec_messages_response(text: &str, model: &str) -> Response {
+    json_response(
+        StatusCode::OK,
+        json!({
+            "id": "msg_local-proxy",
+            "type": "message",
+            "role": "assistant",
+            "model": model,
+            "content": [{"type": "text", "text": text}],
+            "stop_reason": "end_turn",
+            "stop_sequence": null,
+            "usage": crate::translate::anthropic_usage(&crate::translate::TokenUsage::default())
+        }),
+    )
+}
+
+/// Synthesize an `OpenAI` chat-completions response carrying `$proxy` output.
+fn exec_chat_response(text: &str, model: &str) -> Response {
+    json_response(
+        StatusCode::OK,
+        json!({
+            "id": "chatcmpl-local-proxy",
+            "object": "chat.completion",
+            "created": now_ts(),
+            "model": model,
+            "choices": [{
+                "index": 0,
+                "message": {"role": "assistant", "content": text},
+                "finish_reason": "stop",
+                "logprobs": null
+            }],
+            "usage": crate::translate::openai_usage(&crate::translate::TokenUsage::default()),
+            "system_fingerprint": null
+        }),
+    )
+}
+
+/// Synthesize an `OpenAI` Responses response carrying `$proxy` output.
+fn exec_responses_response(text: &str, model: &str) -> Response {
+    json_response(
+        StatusCode::OK,
+        json!({
+            "id": "resp_local-proxy",
+            "object": "response",
+            "created_at": now_ts(),
+            "status": "completed",
+            "model": model,
+            "output": [{
+                "type": "message",
+                "role": "assistant",
+                "content": [{"type": "output_text", "text": text, "annotations": []}]
+            }],
+            "parallel_tool_calls": true,
+            "usage": crate::translate::responses_usage(&crate::translate::TokenUsage::default())
+        }),
+    )
+}
+
+// ---------------------------------------------------------------------------
 // /v1/messages (Anthropic client)
 // ---------------------------------------------------------------------------
 
 async fn messages_handler(
-    State(state): State<AppState>,
+    State(app): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let state = state.snapshot().await;
+    let state = app.snapshot().await;
     let client_key = match authenticate(&state, &headers) {
         Ok(k) => k,
         Err(e) => return error_response(&e, true),
     };
-    match handle_messages(&state, &body, client_key.as_deref()).await {
+    match handle_messages(&app, &state, &body, client_key.as_deref()).await {
         Ok(r) => {
             tracing::info!(
                 target: crate::LOG_TARGET,
@@ -514,13 +684,27 @@ async fn messages_handler(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_messages(
+    app: &AppState,
     state: &RuntimeState,
     body: &Bytes,
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let mut body = parse_body(body)?;
+
+    if let Some(out) = maybe_exec(app, state, &body).await {
+        let text = crate::exec::format_output(&out);
+        let model = active_model_or_default(state);
+        tracing::info!(
+            target: crate::LOG_TARGET,
+            endpoint = "/v1/messages",
+            "handled $proxy command"
+        );
+        return Ok(exec_messages_response(&text, &model));
+    }
+
     let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state)?;
     tracing::info!(
@@ -622,16 +806,16 @@ async fn handle_messages(
 // ---------------------------------------------------------------------------
 
 async fn chat_completions_handler(
-    State(state): State<AppState>,
+    State(app): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let state = state.snapshot().await;
+    let state = app.snapshot().await;
     let client_key = match authenticate(&state, &headers) {
         Ok(k) => k,
         Err(e) => return error_response(&e, false),
     };
-    match handle_chat_completions(&state, &body, client_key.as_deref()).await {
+    match handle_chat_completions(&app, &state, &body, client_key.as_deref()).await {
         Ok(r) => {
             tracing::info!(
                 target: crate::LOG_TARGET,
@@ -655,13 +839,27 @@ async fn chat_completions_handler(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_chat_completions(
+    app: &AppState,
     state: &RuntimeState,
     body: &Bytes,
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let mut body = parse_body(body)?;
+
+    if let Some(out) = maybe_exec(app, state, &body).await {
+        let text = crate::exec::format_output(&out);
+        let model = active_model_or_default(state);
+        tracing::info!(
+            target: crate::LOG_TARGET,
+            endpoint = "/v1/chat/completions",
+            "handled $proxy command"
+        );
+        return Ok(exec_chat_response(&text, &model));
+    }
+
     let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state)?;
     tracing::info!(
@@ -763,16 +961,16 @@ async fn handle_chat_completions(
 // ---------------------------------------------------------------------------
 
 async fn responses_handler(
-    State(state): State<AppState>,
+    State(app): State<AppState>,
     headers: HeaderMap,
     body: Bytes,
 ) -> Response {
-    let state = state.snapshot().await;
+    let state = app.snapshot().await;
     let client_key = match authenticate(&state, &headers) {
         Ok(k) => k,
         Err(e) => return error_response(&e, false),
     };
-    match handle_responses(&state, &body, client_key.as_deref()).await {
+    match handle_responses(&app, &state, &body, client_key.as_deref()).await {
         Ok(r) => {
             tracing::info!(
                 target: crate::LOG_TARGET,
@@ -796,13 +994,27 @@ async fn responses_handler(
     }
 }
 
+#[allow(clippy::too_many_lines)]
 async fn handle_responses(
+    app: &AppState,
     state: &RuntimeState,
     body: &Bytes,
     client_key: Option<&str>,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let mut body = parse_body(body)?;
+
+    if let Some(out) = maybe_exec(app, state, &body).await {
+        let text = crate::exec::format_output(&out);
+        let model = active_model_or_default(state);
+        tracing::info!(
+            target: crate::LOG_TARGET,
+            endpoint = "/v1/responses",
+            "handled $proxy command"
+        );
+        return Ok(exec_responses_response(&text, &model));
+    }
+
     let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state)?;
     tracing::info!(
@@ -1009,11 +1221,13 @@ mod tests {
             providers: Vec::new(),
             routes: Vec::new(),
             defaults: crate::config::Defaults::default(),
+            exec: crate::config::Exec::default(),
         };
         let state = RuntimeState {
             config: Arc::new(cfg),
             router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
             clients: Arc::new(HashMap::new()),
+            config_path: PathBuf::new(),
         };
         let mut headers = HeaderMap::new();
         assert!(authenticate(&state, &headers).is_err());
@@ -1036,6 +1250,7 @@ mod tests {
             config: Arc::new(cfg),
             router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
             clients: Arc::new(HashMap::new()),
+            config_path: PathBuf::new(),
         };
         assert_eq!(authenticate(&state, &HeaderMap::new()).unwrap(), None);
     }
@@ -1117,11 +1332,13 @@ mod tests {
                 provider: "openai".to_string(),
                 active_model: Some("gpt-4o".to_string()),
             },
+            exec: crate::config::Exec::default(),
         });
         let state = RuntimeState {
             config: cfg.clone(),
             router: Arc::new(Router::new(cfg).unwrap()),
             clients: Arc::new(HashMap::new()),
+            config_path: PathBuf::new(),
         };
 
         // The harness asks for an unknown model, but active_model forces gpt-4o.
@@ -1148,11 +1365,13 @@ mod tests {
                 provider: "openai".to_string(),
                 active_model: None,
             },
+            exec: crate::config::Exec::default(),
         });
         let state = RuntimeState {
             config: cfg.clone(),
             router: Arc::new(Router::new(cfg.clone()).unwrap()),
             clients: Arc::new(build_clients(&cfg).expect("clients")),
+            config_path: PathBuf::new(),
         };
         let (provider, upstream) = resolve_model(&state).expect("resolves");
         assert_eq!(provider.name, "openai");
@@ -1177,12 +1396,85 @@ mod tests {
                 provider: "openai".to_string(),
                 active_model: None,
             },
+            exec: crate::config::Exec::default(),
         });
         let state = RuntimeState {
             config: cfg.clone(),
             router: Arc::new(Router::new(cfg).unwrap()),
             clients: Arc::new(HashMap::new()),
+            config_path: PathBuf::new(),
         };
         assert!(resolve_model(&state).is_err());
+    }
+
+    fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+        tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap()
+            .block_on(fut)
+    }
+
+    #[test]
+    fn set_active_model_is_per_instance() {
+        let app = AppState::new(RuntimeState {
+            config: Arc::new(Config::default()),
+            router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
+            clients: Arc::new(HashMap::new()),
+            config_path: PathBuf::new(),
+        });
+        block_on(async {
+            assert_eq!(app.snapshot().await.config.defaults.active_model, None);
+            app.set_active_model(Some("gpt-4o".to_string())).await;
+            assert_eq!(
+                app.snapshot().await.config.defaults.active_model.as_deref(),
+                Some("gpt-4o")
+            );
+        });
+    }
+
+    #[test]
+    fn maybe_exec_returns_none_when_disabled() {
+        let mut cfg = Config::default();
+        cfg.exec.enabled = false;
+        let app = AppState::new(RuntimeState {
+            config: Arc::new(cfg),
+            router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
+            clients: Arc::new(HashMap::new()),
+            config_path: PathBuf::new(),
+        });
+        let body = json!({"messages": [{"role": "user", "content": "$proxy status"}]});
+        block_on(async {
+            let state = app.snapshot().await;
+            assert!(maybe_exec(&app, &state, &body).await.is_none());
+        });
+    }
+
+    #[test]
+    fn maybe_exec_model_get_runs_in_process() {
+        // The `model` get path resolves in-process (from the effective config /
+        // catalog) without spawning any binary, and must not mutate the
+        // in-memory selection. The exact model reported is environment-dependent
+        // (depends on connected providers), so only structure is asserted.
+        let app = AppState::new(RuntimeState {
+            config: Arc::new(Config::default()),
+            router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
+            clients: Arc::new(HashMap::new()),
+            config_path: PathBuf::new(),
+        });
+        let body = json!({"messages": [{"role": "user", "content": "$proxy model"}]});
+        block_on(async {
+            let state = app.snapshot().await;
+            let out = maybe_exec(&app, &state, &body).await.expect("is $proxy");
+            assert!(!out.stdout.is_empty());
+            assert_eq!(out.code, 0);
+            assert_eq!(app.snapshot().await.config.defaults.active_model, None);
+        });
+    }
+
+    #[test]
+    fn exec_messages_response_carries_output() {
+        let resp = exec_messages_response("hello\nworld", "gpt-4o");
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 }

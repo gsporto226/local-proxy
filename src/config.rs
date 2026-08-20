@@ -100,6 +100,36 @@ pub struct Route {
     pub upstream_model: Option<String>,
 }
 
+/// Configuration for the `$proxy` local-command-execution feature.
+///
+/// When the last user message of a request starts with the `token` prefix,
+/// the proxy runs the remainder as a [`crate::config::Exec::command`]
+/// invocation instead of forwarding the request upstream, returning the
+/// terminal output as the model's reply.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+#[serde(default)]
+pub struct Exec {
+    /// Whether `$proxy` execution is active. On by default.
+    pub enabled: bool,
+    /// The magic prefix that triggers local execution, e.g. `$proxy`.
+    pub token: String,
+    /// The binary invoked for `$proxy` commands.
+    pub command: String,
+    /// Maximum seconds a `$proxy` command may run before it is killed.
+    pub timeout_secs: u64,
+}
+
+impl Default for Exec {
+    fn default() -> Self {
+        Self {
+            enabled: true,
+            token: "$proxy".to_string(),
+            command: "local-proxy".to_string(),
+            timeout_secs: 30,
+        }
+    }
+}
+
 /// Fallback values used when a request doesn't match any route.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -107,8 +137,8 @@ pub struct Defaults {
     /// Provider used when no route matches.
     pub provider: String,
     /// Active model that the proxy routes all traffic through, ignoring the
-    /// model requested by the harness. Set via `local-proxy model` or MCP
-    /// `models(select)`; persists across restarts.
+    /// model requested by the harness. Set via `local-proxy model` or
+    /// `$proxy model`; persists across restarts.
     pub active_model: Option<String>,
 }
 
@@ -124,6 +154,8 @@ pub struct Config {
     pub routes: Vec<Route>,
     /// Fallback defaults.
     pub defaults: Defaults,
+    /// `$proxy` local-command-execution settings.
+    pub exec: Exec,
 }
 
 /// Errors that can occur while loading, parsing, or creating configuration.

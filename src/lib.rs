@@ -18,17 +18,14 @@ pub mod auth;
 /// Embedded provider catalog and config-overlay merging.
 pub mod catalog;
 
-/// MCP server exposing provider/key/model management.
-pub mod mcp;
-
 /// Configuration types and loading.
 pub mod config;
 
 /// Shared error types.
 pub mod error;
 
-/// Harness (opencode/claude) detection and MCP config registration.
-pub mod harness;
+/// `$proxy` local-command execution helpers.
+pub mod exec;
 
 /// Axum HTTP request handlers.
 pub mod handlers;

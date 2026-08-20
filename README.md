@@ -15,10 +15,11 @@ providers configuráveis, com tradução de erros e `count_tokens` real.
 - Tradução request/response e **streaming SSE evento-a-evento** nas 3 direções.
 - **Catálogo de providers embutido** (`anthropic`, `openai`, `opencode-go`, `zen`, `groq`, `xai`,
   `google`, `deepseek`, `openrouter`, `neuralwatt`); o `config.yaml` só **adiciona** ou **sobrescreve**.
-- **Hot-reload**: edições no config e `connect`/MCP aplicam em runtime via file watcher, sem reinício.
+- **Hot-reload**: edições no config e `connect` aplicam em runtime via file watcher, sem reinício.
 - **Auth store** (`auth.json`): chaves separadas do config, como o `/connect` do opencode.
-- **Servidor MCP** (`local-proxy mcp`) com tools `connect`/`disconnect`/`providers`/`models(select)`
-  para gerenciar chaves e selecionar o modelo ativo sem reiniciar o proxy.
+- **`$proxy` executor**: num request (Messages, Chat Completions ou Responses), se a última mensagem
+  do usuário começar com `$proxy `, o proxy executa o resto como um comando `local-proxy` e devolve
+  a saída como resposta do modelo — sem precisar de provider conectado.
 - Roteamento por modelo (rota exata → `provider/model` → prefixo → lista nativa → default).
 - Erros do upstream reformatados para o shape do cliente (Anthropic ou OpenAI).
 - Auth opcional (`X-API-Key` / `Authorization: Bearer`) e `passthrough_keys`.
@@ -30,7 +31,7 @@ providers configuráveis, com tradução de erros e `count_tokens` real.
 
 ```powershell
 cargo build
-cargo test --all-features   # 91 unit tests
+cargo test --all-features   # 128 unit tests
 ```
 
 ## Config (catálogo embutido + overlay)
@@ -110,14 +111,14 @@ local-proxy disconnect opencode-go       # remove a chave
 
 Resolução da chave por request: `api_key` inline na config → `auth.json[provider]` → `api_key_env`.
 
-### Modelo ativo (`model` / `models(select)`)
+### Modelo ativo (`model`)
 
 O proxy **nunca usa o modelo pedido pelo harness** (ex.: `ANTHROPIC_MODEL` do Claude Code). Ele
 roteia pelo **modelo ativo**: o modelo explicitamente selecionado, senão o **primeiro modelo
 disponível de um provider conectado**, senão erro. Um provider está *conectado* quando tem uma chave
 resolvível (inline no config → `auth.json` → env var).
 
-Seleção e consulta são feitas pelo CLI **ou** pelo MCP — a mesma lógica (paridade total):
+Seleção e consulta são feitas pelo CLI **ou** via `$proxy` — a mesma lógica de validação:
 
 ```
 local-proxy model                        # modelo ativo (selecionado, senão o primeiro disponível, senão "none")
@@ -126,47 +127,52 @@ local-proxy model clear                  # limpa a seleção (volta ao primeiro 
 local-proxy models                       # lista modelos dos providers conectados
 ```
 
-Via MCP (mesmo comportamento do CLI):
+Dentro de um request, `$proxy model` reporta o modelo ativo **desta instância** (em memória) e
+`$proxy model <m>` seleciona e persiste:
 
 ```
-mcp connect opencode-go <key>
-mcp models                            # lista modelos dos providers conectados
-mcp models --select deepseek-v4-flash # define o modelo ativo (valida contra providers conectados)
-mcp models --select ""                # limpa a seleção
+$proxy model                        # modelo ativo desta instância
+$proxy model deepseek-v4-flash      # define o modelo ativo (valida contra providers conectados)
 ```
 
-A seleção é persistida em `defaults.active_model` (antes `defaults.model`) no config. Com o campo
-setado, o proxy **ignora o modelo pedido pelo harness** e roteia tudo pelo modelo ativo. O file
-watcher aplica a mudança **sem reiniciar** o proxy.
+A seleção é persistida em `defaults.active_model` no config — **last-write wins** (quem gravar por
+último vence na próxima inicialização). Cada instância do proxy mantém o **seu** modelo ativo **em
+memória**, que **não** é propagado para as outras via hot-reload: rodar `local-proxy model X` (CLI)
+só grava o config e não muda nenhum proxy já em execução.
 
 ### Hot-reload
 
-Qualquer edição no `config.yaml` ou `auth.json` (por CLI, MCP ou manual) é aplicada em runtime por um
-file watcher (debounce 300ms) — nada de reinício.
+Qualquer edição no `config.yaml` ou `auth.json` (por CLI ou manual) é aplicada em runtime por um file
+watcher (debounce 300ms) — nada de reinício. Exceção: `defaults.active_model` **não** é relido do
+arquivo; cada instância preserva o modelo ativo que ela definiu em memória.
 
-## Servidor MCP
+## Execução local via `$proxy`
 
-```powershell
-local-proxy mcp    # servidor MCP stdio
+Em qualquer endpoint (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`), se a última mensagem
+do usuário começar com o token `$proxy `, o proxy **não encaminha** para um provider: executa o resto
+como um comando `local-proxy` e devolve a saída como resposta do modelo (nos três formatos de wire).
+Funciona mesmo sem provider conectado.
+
+```
+$proxy status                        # status do proxy
+$proxy models                        # modelos dos providers conectados
+$proxy stats --since week            # estatísticas de uso
+$proxy model deepseek-v4-flash       # seleciona o modelo ativo desta instância (e persiste)
+$proxy connect opencode-go <key>     # salva a chave (passada como argumento, sem prompt interativo)
 ```
 
-Tools: `connect(provider, key)`, `disconnect(provider)`, `providers()`, `models([select])` — as
-tools de modelo/lista delegam exatamente ao CLI (`model`/`models`), então se comportam de forma
-idêntica.
+O token, o binário executado e o timeout são configuráveis em `exec` no config:
 
-### Registrar o MCP nos harnesses (`init`)
-
-`local-proxy init` detecta os harnesses instalados (opencode e/ou Claude Code) e registra o servidor
-MCP do local-proxy nos configs deles (`~/.config/opencode/opencode.json` e `~/.claude.json`),
-preservando as chaves existentes e fazendo backup em `<path>.bak`:
-
-```powershell
-local-proxy init       # pergunta antes de configurar cada harness detectado
-local-proxy init --yes # aceita todos os harnesses detectados sem perguntar
+```yaml
+exec:
+  enabled: true        # on por padrão
+  token: "$proxy"      # prefixo que dispara a execução
+  command: local-proxy # binário executado
+  timeout_secs: 30     # kill após o timeout
 ```
 
-O `init` **só** registra o MCP — não faz setup de provider nem de modelo (isso fica com
-`connect`/`model`).
+Segurança: só executa o binário `exec.command` (padrão `local-proxy`) com argumentos parseados sem
+shell — nada de execução arbitrária. Requer a chave do proxy (auth) como qualquer endpoint.
 
 ## Usar com Claude Code
 
@@ -257,16 +263,16 @@ src/
 ├── config.rs      Config/Provider/Route/Defaults (YAML/JSON) — overlay, auto-created, headers por provider
 ├── catalog.rs     catálogo embutido + merge catálogo↔config
 ├── auth.rs        auth.json (keys) + escrita atômica
-├── cli.rs         serve/launch/status/stop/models/model/connect/disconnect/providers/stats/init/mcp/update
+├── cli.rs         serve/launch/status/stop/models/model/connect/disconnect/providers/stats/update
 ├── router.rs      resolve_model → (provider, upstream_model)
 ├── upstream.rs    chamada HTTP + resolução de chave (inline > auth > env) + headers por provider
 ├── translate.rs   requests/responses A↔O↔Responses
 ├── sse.rs         parser de frames SSE
 ├── streams.rs     máquinas de estado de streaming (3 direções)
-├── mcp.rs         servidor MCP stdio (connect/disconnect/providers/models(select))
+├── exec.rs        executor `$proxy` (detecção de token, parse de args, run com timeout)
 ├── error.rs       ApiError + shape por formato
 ├── stats.rs       estatísticas locais (SQLite `stats.db`) + `local-proxy stats`
-└── handlers.rs    endpoints axum + RuntimeState hot-reload + /v1/models + count_tokens
+└── handlers.rs    endpoints axum + RuntimeState hot-reload + /v1/models + count_tokens + `$proxy`
 e2e/               suíte de testes em Bun (mock + live)
 ```
 

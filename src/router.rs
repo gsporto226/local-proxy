@@ -220,6 +220,7 @@ mod tests {
                 provider: "anthropic".to_string(),
                 active_model: None,
             },
+            exec: crate::config::Exec::default(),
         }
     }
 

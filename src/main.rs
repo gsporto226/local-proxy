@@ -93,14 +93,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run the MCP stdio server (connect/disconnect/models/providers)
-    Mcp,
-    /// Register the local-proxy MCP server into detected harnesses (opencode/claude)
-    Init {
-        /// Auto-accept all detected harnesses without prompting
-        #[arg(long, short)]
-        yes: bool,
-    },
     /// Check for a newer release and stage a manual update from GitHub Releases
     Update {
         /// GitHub owner/repo (overrides `LOCAL_PROXY_REPO`)
@@ -177,8 +169,6 @@ fn main() -> miette::Result<()> {
             let since = since.unwrap_or_else(|| "day".to_string());
             cli::stats(config, since, json)
         }
-        Some(Command::Mcp) => block_on(cli::mcp(config)),
-        Some(Command::Init { yes }) => cli::init(config, yes),
         Some(Command::Update {
             repo,
             check,

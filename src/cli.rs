@@ -863,80 +863,6 @@ pub fn connect(config_path: PathBuf, provider: String, key: Option<String>) -> m
     Ok(())
 }
 
-/// CLI entry for `init`: register the local-proxy MCP server into each
-/// detected harness (opencode/claude) config file.
-///
-/// Detected harnesses are listed; unless `yes` is given, each one is confirmed
-/// via an interactive prompt (defaulting to accept). Only the MCP server
-/// registration is written — model selection and provider setup are untouched.
-/// Existing configs are preserved (merged) and backed up to `<path>.bak`.
-///
-/// # Errors
-///
-/// Returns a [`CliError`] if a prompt fails or a harness config cannot be read,
-/// merged, or written.
-#[allow(clippy::needless_pass_by_value)]
-pub fn init(config_path: PathBuf, yes: bool) -> miette::Result<()> {
-    let _ = config_path;
-    let detected = crate::harness::detect();
-    println!("=== configurando MCP local-proxy ===");
-    if detected.is_empty() {
-        println!("nenhum harness detectado (opencode/claude)");
-        return Ok(());
-    }
-    println!("harnesses detectados:");
-    for h in &detected {
-        println!("  - {}", h.name());
-    }
-
-    let mut accepted = Vec::new();
-    for h in detected {
-        let ok = if yes {
-            true
-        } else {
-            dialoguer::Confirm::new()
-                .with_prompt(format!(
-                    "Configurar {} para usar o local-proxy via MCP?",
-                    h.name()
-                ))
-                .default(true)
-                .interact()
-                .map_err(|e| CliError::Connect {
-                    message: format!("falha ao ler a resposta: {e}"),
-                })?
-        };
-        if ok {
-            accepted.push(h);
-        }
-    }
-
-    if accepted.is_empty() {
-        println!("nenhum harness configurado");
-        return Ok(());
-    }
-
-    for h in accepted {
-        let path = h.config_path();
-        let existing = if path.exists() {
-            std::fs::read_to_string(&path).map_err(CliError::from)?
-        } else {
-            String::new()
-        };
-        let merged =
-            crate::harness::merge_mcp_entry(&existing, h).map_err(|e| CliError::Connect {
-                message: format!("falha ao mesclar o config do {}: {e}", h.name()),
-            })?;
-        let written = crate::harness::write_with_backup(&path, &merged).map_err(CliError::from)?;
-        println!(
-            "{} configurado: {} (backup: {}.bak — para desfazer, restaure o backup)",
-            h.name(),
-            written.display(),
-            written.display()
-        );
-    }
-    Ok(())
-}
-
 /// CLI entry for `disconnect`: remove the stored API key for a provider.
 ///
 /// # Errors
@@ -1137,16 +1063,6 @@ fn render_stats_json(
         "recent": recent_json,
     });
     println!("{out}");
-}
-
-/// Run the MCP stdio server exposing connect/disconnect/models/providers.
-///
-/// # Errors
-///
-/// Returns a [`CliError`] if the MCP server cannot be started.
-#[allow(clippy::needless_pass_by_value)]
-pub async fn mcp(config_path: PathBuf) -> miette::Result<()> {
-    crate::mcp::run(config_path).await
 }
 
 /// Resolve the config path from an explicit flag, the environment, the current
@@ -1732,6 +1648,7 @@ mod tests {
             providers: Vec::new(),
             routes: Vec::new(),
             defaults: Defaults::default(),
+            exec: crate::config::Exec::default(),
         }
     }
 
