@@ -1,66 +1,120 @@
 # local-proxy
 
-Proxy local de tradução **OpenAI ⇄ Anthropic** multi-provider, em Rust (axum). Expõe endpoints
-compatíveis com Anthropic Messages API (`/v1/messages` — Claude Code, Claude Design) e OpenAI
-Chat Completions / Responses API (`/v1/chat/completions`, `/v1/responses` — Codex e afins), e
-traduz entre formatos roteando para qualquer provider compatível com um dos dois.
+A local translation proxy for AI APIs. It speaks the Anthropic Messages API and the OpenAI Chat Completions and Responses APIs, then routes each request to any provider that uses either wire format.
 
-Referência de design: [ocgo](https://github.com/emanuelcasco/ocgo), generalizado para múltiplos
-providers configuráveis, com tradução de erros e `count_tokens` real.
+Claude Code talks `/v1/messages`. Codex and opencode talk `/v1/chat/completions` and `/v1/responses`. Each tool is locked to its vendor's format, so you can't just point it at another provider. The proxy sits in the middle: it accepts one format, translates the request, calls the upstream provider, and translates the response back. Streaming stays streaming, event by event.
 
-## Recursos
+You keep the tool you like and pick the provider you want, per model, per request, without touching the tool's config.
 
-- `/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`, `/v1/responses`,
-  `/v1/models`, `/health`.
-- Tradução request/response e **streaming SSE evento-a-evento** nas 3 direções.
-- **Catálogo de providers embutido** (`anthropic`, `openai`, `opencode-go`, `zen`, `groq`, `xai`,
-  `google`, `deepseek`, `openrouter`, `neuralwatt`); o `config.yaml` só **adiciona** ou **sobrescreve**.
-- **Hot-reload**: edições no config e `connect` aplicam em runtime via file watcher, sem reinício.
-- **Auth store** (`auth.json`): chaves separadas do config, como o `/connect` do opencode.
-- **`$proxy` executor**: num request (Messages, Chat Completions ou Responses), se a última mensagem
-  do usuário começar com `$proxy `, o proxy executa o resto como um comando `local-proxy` e devolve
-  a saída como resposta do modelo — sem precisar de provider conectado.
-- Roteamento por modelo (rota exata → `provider/model` → prefixo → lista nativa → default).
-- Erros do upstream reformatados para o shape do cliente (Anthropic ou OpenAI).
-- Auth opcional (`X-API-Key` / `Authorization: Bearer`) e `passthrough_keys`.
-- **Estatísticas de uso** (`local-proxy stats`): banco local SQLite (`stats.db`) registra cada request
-  (endpoint, provider, model, tokens in/out, latency, streaming, status) e é consultado por janela
-  de tempo com resumo por provider e requests recentes.
+## Why
 
-## Build
+Most AI tools hardcode their vendor's API shape. The reference design here is [ocgo](https://github.com/emanuelcasco/ocgo), generalized to many configurable providers, with real error translation and a working `count_tokens`. Instead of a second tool per vendor, one proxy speaks all the wire formats and forwards to any of them.
 
-```powershell
-cargo build
-cargo test --all-features   # 128 unit tests
+## Features
+
+- Endpoints: `/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/health`.
+- Request and response translation plus streaming SSE, event by event, in all three directions (Anthropic to OpenAI, OpenAI to Anthropic, Responses to Anthropic and OpenAI).
+- Embedded provider catalog (`anthropic`, `openai`, `opencode-go`, `zen`, `groq`, `xai`, `google`, `deepseek`, `openrouter`, `neuralwatt`). Your `config.yaml` only adds to it or overrides entries; it never replaces the whole list.
+- Hot reload. Editing the config or `auth.json` applies in runtime through a file watcher, no restart.
+- Auth store separate from the config (`auth.json`), modeled after opencode's `/connect`. Keys never live in the config.
+- `$proxy` executor. When the last user message starts with `$proxy `, the proxy runs the rest as a `local-proxy` command and returns the output as the model's reply. Works with no provider connected.
+- Model routing with a clear precedence (exact route, `provider/model`, prefix, native list, default).
+- Upstream errors reformatted into the client's shape (Anthropic or OpenAI).
+- Optional auth (`X-API-Key` or `Authorization: Bearer`) and `passthrough_keys`.
+- Usage statistics in a local SQLite database (`stats.db`): endpoint, provider, model, tokens in and out, latency, streaming, status, per request, queryable by time window.
+
+## Requirements
+
+- Rust stable to build from source.
+- Bun only for the e2e suite.
+- Release binaries are published for x86_64 only (linux, darwin, windows).
+
+## Install
+
+Three ways to get `local-proxy`.
+
+### Prebuilt binary
+
+The installers fetch the latest release from GitHub, verify the SHA256, and install to `~/.local/bin`.
+
+Linux and macOS:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/gsporto226/local-proxy/main/install.sh | bash
 ```
 
-## Config (catálogo embutido + overlay)
+Windows, PowerShell (any version, 5.1 included):
 
-O proxy embute um catálogo com todos os providers suportados (`src/catalog.yaml`, compilado no
-binário). A config do usuário funciona como **overlay**: um provider definido na config com o mesmo
-nome **sobrescreve** o do catálogo; um nome novo **adiciona**; rotas e `defaults` definidos na config
-vencem os do catálogo. As chaves dos providers vêm do **auth store** (`auth.json`) ou inline
-(`api_key` no config) — não há fallback por variável de ambiente.
+```powershell
+irm https://raw.githubusercontent.com/gsporto226/local-proxy/main/install.ps1 | iex
+```
 
-A config principal vive no diretório de config do usuário:
-`%APPDATA%\local-proxy\config.yaml` (Windows) ou `~/.config/local-proxy/config.yaml` (Unix).
-Os arquivos de runtime (pid + log + `auth.json`) ficam no mesmo diretório.
+`install.sh` respects `LOCAL_PROXY_REPO` for a different owner/repo, `LOCAL_PROXY_INSTALL_DIR` for a target directory, and `LOCAL_PROXY_SKIP_VERIFY=1` to skip the SHA256 check. `install.ps1` takes the same options as parameters: `-Repo`, `-Tag`, `-InstallDir`, `-AddToPath`, and `-SkipVerify`.
 
-Se esse arquivo global não existir, o CLI o cria a partir de um default embutido (mínimo — só
-`server:`; o resto vem do catálogo) e imprime uma mensagem dizendo onde foi criado.
+### Cargo
 
-Resolução de config (precedência):
-1. Flag explícita `--config <path>`.
-2. Env var `LOCAL_PROXY_CONFIG`.
-3. `config.yaml`/`config.json` no diretório de trabalho (override project-local, só se existir).
-4. Global default (o arquivo criado automaticamente).
+```bash
+cargo install local-proxy
+```
 
-O config dir global (onde ficam `config.yaml`, `auth.json` e `stats.db`) segue o padrão do sistema
-(`%APPDATA%\local-proxy` no Windows, `~/.config/local-proxy` no Unix) e pode ser redirecionado pela
-env var `LOCAL_PROXY_CONFIG_DIR` (usada para isolar dados em testes/tooling sem tocar o dir real).
+### From source
 
+```bash
+cargo build --release
+```
 
-Exemplo adicionando um provider custom e roteando:
+The binary lands in `target/release/local-proxy` (`local-proxy.exe` on Windows).
+
+## Quick start
+
+```bash
+local-proxy connect opencode-go          # prompts for the API key
+local-proxy serve                        # proxy on 127.0.0.1:8787
+```
+
+Point Claude Code at it:
+
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+export ANTHROPIC_AUTH_TOKEN=sk-proxy     # the server api_key, or "unused" with no auth
+claude
+```
+
+Claude Code sends `/v1/messages`; the proxy routes to a connected provider and translates. `local-proxy models` lists what you can use, and `local-proxy model <provider>/<model>` selects the active one.
+
+## CLI reference
+
+| Command | Purpose |
+| --- | --- |
+| `serve` | Run the proxy server, foreground by default. `--host`, `--port`, `--background`, `--check-update`. |
+| `launch <claude\|design>` | Start a dedicated instance on a random free port, run the tool against it, kill the proxy when the tool exits. `--model`, `--yes`, `--dry-run`, `-- args...`. |
+| `status` | Show whether the background proxy is running. |
+| `stop` | Stop the background proxy. |
+| `models` | List models from connected providers, as `provider/model`. |
+| `model [<m>]` | Show or set the active model. `model clear` unsets it. |
+| `connect <provider> [key]` | Store an API key for an existing provider. Prompts hidden if the key is omitted. |
+| `disconnect <provider>` | Remove the stored API key. |
+| `providers` | List effective providers (catalog plus config) with key status. |
+| `stats [--since day\|week\|month\|all] [--json]` | Show usage statistics from recorded requests. |
+| `statusline --session <uuid>` | Render the Claude Code status line for a session from its recorded stats. |
+| `update` | Check for and apply a newer release. |
+
+## Configuration
+
+The provider catalog is compiled into the binary from `src/catalog.yaml`. Your config is an overlay. A provider with the same name replaces the catalog entry. A new name adds a provider. Routes and defaults defined in your config win over the catalog's. Keys come from the auth store or inline `api_key`; there is no environment variable fallback.
+
+The main config lives in the user config directory: `%APPDATA%\local-proxy\config.yaml` on Windows, `~/.config/local-proxy/config.yaml` on Unix. The runtime files (pid, log, `auth.json`, `stats.db`) live in the same directory. If the global file does not exist, the CLI creates it from a minimal embedded default and prints where it was created.
+
+Config resolution, in order:
+
+1. Explicit `--config <path>` flag.
+2. `LOCAL_PROXY_CONFIG` environment variable.
+3. `config.yaml` or `config.json` in the working directory, only if it exists.
+4. The global default file.
+
+The global config directory can be redirected with `LOCAL_PROXY_CONFIG_DIR`, which isolates test data without touching the real directory.
+
+Example: add a custom provider and a route.
 
 ```yaml
 providers:
@@ -73,22 +127,14 @@ routes:
     provider: zen
     upstream_model: deepseek-v4-flash-free
 defaults:
-  provider: anthropic          # fallback final (nome do modelo passa inalterado)
+  provider: anthropic          # final fallback, model name passes unchanged
 ```
 
-Rode (usa a config global; `--config` é só um override). A chave deve estar no `auth.json`
-(`local-proxy connect zen sk-...`):
+A copy of this example ships as `config.example.yaml` in the repo.
 
-```powershell
-local-proxy connect zen sk-opencode-zen-...
-cargo run -- serve
-```
+### Per-provider headers
 
-### Headers por provider
-
-Qualquer provider pode enviar headers estáticos em toda request, definidos em `headers:`. Headers com o
-mesmo nome sobrescrevem o default de auth/formato. Exemplo — OpenRouter pede os headers de roteamento
-`HTTP-Referer` e `X-Title`; o catálogo embutido já os envia:
+Any provider can send static headers on every request through `headers:`. A header with the same name overrides the default auth or format header. OpenRouter needs the routing headers `HTTP-Referer` and `X-Title`; the embedded catalog already sends them:
 
 ```yaml
 providers:
@@ -101,225 +147,219 @@ providers:
     models: [openrouter/auto]
 ```
 
-### Chaves: `connect` / `disconnect`
+### Keys: connect and disconnect
 
-As chaves ficam em `auth.json` (formato do opencode), nunca no `config.yaml`. `connect` só aceita
-providers que **já existem** (no catálogo ou adicionados na config):
+Keys live in `auth.json`, never in the config. `connect` only accepts providers that already exist, in the catalog or added by your config.
 
-```powershell
-local-proxy connect opencode-go          # pede a chave oculta
-local-proxy connect opencode-go sk-xxx   # ou direto
-local-proxy providers                    # lista providers efetivos + key status
-local-proxy disconnect opencode-go       # remove a chave
+```bash
+local-proxy connect opencode-go          # prompts hidden
+local-proxy connect opencode-go sk-xxx   # or pass it directly
+local-proxy providers                    # effective providers plus key status
+local-proxy disconnect opencode-go       # remove the key
 ```
 
-Resolução da chave por request: `auth.json[provider]` (única fonte).
+Per request, the key resolution reads `auth.json[provider]`. That is the only source.
 
-### Modelo ativo (`model`)
+### Active model
 
-O proxy **nunca usa o modelo pedido pelo harness** (ex.: `ANTHROPIC_MODEL` do Claude Code). Ele
-roteia pelo **modelo ativo**, identificado como **`provider/model`**: o modelo explicitamente
-selecionado, senão o **primeiro modelo disponível de um provider conectado**, senão erro. Um provider
-está *conectado* quando tem uma chave no `auth.json`.
+The proxy never uses the model the harness asks for, for example `ANTHROPIC_MODEL` from Claude Code. It routes by the active model, written as `provider/model`: the explicitly selected model, else the first model from a connected provider, else an error. A provider counts as connected when it has a key in `auth.json`.
 
-Seleção e consulta são feitas pelo CLI **ou** via `$proxy` — a mesma lógica de validação:
+Selection and query happen through the CLI or through `$proxy`, with the same validation logic:
 
-```
-local-proxy model                                # modelo ativo (selecionado, senão o primeiro disponível, senão "none")
-local-proxy model opencode-go/deepseek-v4-flash  # valida contra providers conectados e define o modelo ativo
-local-proxy model clear                          # limpa a seleção (volta ao primeiro disponível)
-local-proxy models                               # lista modelos dos providers conectados (provider/model)
+```bash
+local-proxy model                                # selected model, else first available, else "none"
+local-proxy model opencode-go/deepseek-v4-flash  # validates against connected providers, sets active
+local-proxy model clear                          # back to first available
+local-proxy models                               # models from connected providers
 ```
 
-Dentro de um request, `$proxy model` reporta o modelo ativo **desta instância** (em memória) e
-`$proxy model <m>` seleciona e persiste:
+Inside a request, `$proxy model` reports this instance's active model in memory, and `$proxy model <m>` selects and persists it.
 
-```
-$proxy model                        # modelo ativo desta instância
-$proxy model deepseek-v4-flash      # define o modelo ativo (valida contra providers conectados)
-```
+The selection is stored in `defaults.active_model` in the config. Last write wins on the next start. Each proxy instance keeps its own active model in memory and does not propagate it to other instances through hot reload. Running `local-proxy model X` from the CLI only writes the config and does not change a proxy that is already running.
 
-A seleção é persistida em `defaults.active_model` no config — **last-write wins** (quem gravar por
-último vence na próxima inicialização). Cada instância do proxy mantém o **seu** modelo ativo **em
-memória**, que **não** é propagado para as outras via hot-reload: rodar `local-proxy model X` (CLI)
-só grava o config e não muda nenhum proxy já em execução.
+### Hot reload
 
-### Hot-reload
+Any edit to `config.yaml` or `auth.json`, by CLI or by hand, applies in runtime through a file watcher with a 300ms debounce. No restart. One exception: `defaults.active_model` is not reread from the file. Each instance keeps the active model it set in memory.
 
-Qualquer edição no `config.yaml` ou `auth.json` (por CLI ou manual) é aplicada em runtime por um file
-watcher (debounce 300ms) — nada de reinício. Exceção: `defaults.active_model` **não** é relido do
-arquivo; cada instância preserva o modelo ativo que ela definiu em memória.
+## HTTP endpoints
 
-## Execução local via `$proxy`
+| Endpoint | Purpose |
+| --- | --- |
+| `POST /v1/messages` | Anthropic Messages API. |
+| `POST /v1/messages/count_tokens` | Anthropic token counting, routed like a normal message. |
+| `POST /v1/chat/completions` | OpenAI Chat Completions. |
+| `POST /v1/responses` | OpenAI Responses API. |
+| `GET /v1/models` | List available models. |
+| `GET /health` | Liveness check. |
 
-Em qualquer endpoint (`/v1/messages`, `/v1/chat/completions`, `/v1/responses`), se a última mensagem
-do usuário começar com o token `$proxy `, o proxy **não encaminha** para um provider: executa o resto
-como um comando `local-proxy` e devolve a saída como resposta do modelo (nos três formatos de wire).
-Funciona mesmo sem provider conectado.
+## Using with Claude Code
 
-```
-$proxy status                        # status do proxy
-$proxy models                        # modelos dos providers conectados
-$proxy stats --since week            # estatísticas de uso
-$proxy model deepseek-v4-flash       # seleciona o modelo ativo desta instância (e persiste)
-$proxy connect opencode-go <key>     # salva a chave (passada como argumento, sem prompt interativo)
-```
-
-O token, o binário executado e o timeout são configuráveis em `exec` no config:
-
-```yaml
-exec:
-  enabled: true        # on por padrão
-  token: "$proxy"      # prefixo que dispara a execução
-  command: local-proxy # binário executado
-  timeout_secs: 30     # kill após o timeout
-```
-
-Segurança: só executa o binário `exec.command` (padrão `local-proxy`) com argumentos parseados sem
-shell — nada de execução arbitrária. Requer a chave do proxy (auth) como qualquer endpoint.
-
-## Usar com Claude Code
-
-Aponte Claude Code para o proxy:
-
-```powershell
-$env:ANTHROPIC_BASE_URL = "http://127.0.0.1:8787"
-$env:ANTHROPIC_AUTH_TOKEN = "sk-proxy"   # a api_key do server, ou "unused" se sem auth
+```bash
+export ANTHROPIC_BASE_URL=http://127.0.0.1:8787
+export ANTHROPIC_AUTH_TOKEN=sk-proxy
 claude
 ```
 
-Claude Code fala `/v1/messages`; o proxy roteia para o provider configurado e traduz (ex.:
-`deepseek-free` → deepseek-v4-flash-free via opencode-zen).
+Claude Code talks `/v1/messages`; the proxy routes to the configured provider and translates, for example `deepseek-free` to `deepseek-v4-flash-free` through opencode-zen.
 
-### Launch (uma instância dedicada, vida atrelada à ferramenta)
+### Launch: one dedicated instance
 
-`local-proxy launch claude [--model X] [--yes] [-- args...]` (e `launch design`) sobe uma **instância
-dedicada** do proxy numa **porta aleatória livre**, aponta a ferramenta para ela e a **mata quando a
-ferramenta sai** — inclusive em erro/saída não-zero. Nunca reutiliza nem toca um proxy de fundo que já
-esteja rodando (nem sobrescreve o pid file compartilhado). As estatísticas continuam indo para o mesmo
-`stats.db` (WAL + busy timeout, seguro com múltiplas instâncias):
+`local-proxy launch claude [--model X] [--yes] [-- args...]` (and `launch design`) starts a dedicated proxy instance on a random free port, points the tool at it, and kills the proxy when the tool exits, including on error or non-zero exit. It never reuses or touches a background proxy that is already running, and never overwrites the shared pid file. Statistics still go to the same `stats.db` (WAL plus busy timeout, safe with multiple instances):
 
-```powershell
+```bash
 local-proxy launch claude --model kimi-k2.6 --yes
 ```
 
-## Atualizar (`update`)
+## The `$proxy` executor
 
-Baixa o binário mais recente do último release do GitHub, verifica SHA256 e **aplica no lugar**:
-no Linux o swap é atômico (rename POSIX, funciona com o binário em execução); no Windows o
-executável em uso é renomeado para um backup e o novo assume o lugar na hora, com a limpeza do
-backup feita ao sair e no próximo start. Instalações via `cargo` delegam ao cargo:
+On any endpoint, if the last user message starts with the token `$proxy `, the proxy does not forward to a provider. It runs the rest as a `local-proxy` command and returns the output as the model's reply, in all three wire formats. Works with no provider connected.
 
-```powershell
-local-proxy update --check        # só informa a versão mais recente
-local-proxy update                # baixa, verifica SHA256 e aplica
-local-proxy update --force        # atualiza mesmo se já estiver na latest
-local-proxy update --repo dono/repo  # repositório alternativo (ou $env:LOCAL_PROXY_REPO)
-local-proxy update --no-verify    # pula a verificação de SHA256
+```bash
+$proxy status                        # proxy status
+$proxy models                        # models from connected providers
+$proxy stats --since week            # usage statistics
+$proxy model deepseek-v4-flash       # select this instance's active model, persisted
+$proxy connect opencode-go <key>     # store the key, no interactive prompt
 ```
 
-O `serve` aceita `--check-update` para avisar no log quando há versão mais recente
-(desative com `$env:LOCAL_PROXY_DISABLE_AUTOUPDATE=1`).
+The token, the binary, and the timeout are configurable in the `exec` block:
 
-## Estatísticas de uso (`stats`)
-
-O proxy registra cada request proxied no banco local `stats.db` (no diretório de config global) —
-best-effort: uma falha de escrita é logada e nunca quebra o proxy. Tokens são contabilizados a partir
-do `usage` do upstream: nos requests **não-streaming** (do corpo da resposta) e nos **streaming**,
-acumulando o `usage` dos frames SSE (chunks OpenAI, `message_start`/`message_delta` Anthropic e
-`response.completed` de Responses) — as requisições são registradas quando o fluxo termina.
-
-Providers com **preço por energia** (NeuralWatt) têm seus metadados de **energia e custo** capturados:
-em responses non-streaming pelos campos top-level `energy`/`cost`, e em streaming pelos **comentários
-SSE** (`: energy {...}` / `: cost {...}`). O relatório mostra totais de energia (kWh) e custo (USD)
-por janela e por provider quando presentes.
-
-```powershell
-local-proxy stats               # resumo do dia (requests, tokens/energia/custo, latency, erros) + por provider + recentes
-local-proxy stats --since week  # dia | week | month | all
-local-proxy stats --json        # mesmo relatório em JSON (summary/providers/recent)
+```yaml
+exec:
+  enabled: true        # on by default
+  token: "$proxy"      # prefix that triggers execution
+  command: local-proxy # binary executed
+  timeout_secs: 30     # kill after the timeout
 ```
 
-## Status line (custo/sessão em tempo real)
+Security: it only runs `exec.command` (default `local-proxy`) with args parsed without a shell. No arbitrary execution. It requires the proxy key like any endpoint.
 
-O [Claude Code status line](https://docs.claude.com/en/docs/claude-code/statusline) é
-calculado *client-side* pelo próprio Claude Code usando a tabela de preços dele — o que fica
-errado quando o tráfego passa por este proxy multi-provider. Em vez disso, o `local-proxy`
-renderiza a linha a partir dos stats reais que ele mesmo registra.
+## Statistics and status line
 
-O fluxo: o Claude Code envia `X-Claude-Code-Session-Id` (um UUID por sessão) em cada request;
-o proxy grava `session_id` em cada linha do `stats.db`; o script da status line passa o seu
-`session_id` para `local-proxy statusline`, que agrega os stats daquela sessão e renderiza um
-template (Rhai, sandboxed).
+The proxy records every proxied request in the local `stats.db` in the global config directory. Best effort: a write failure is logged and never breaks the proxy. Tokens come from the upstream `usage`: in the response body for non-streaming requests, and for streaming by accumulating `usage` from the SSE frames (OpenAI chunks, Anthropic `message_start` and `message_delta`, Responses `response.completed`). Requests are recorded when the stream finishes.
 
-```powershell
-# renderiza a linha para uma sessão (params opcionais do JSON da status line)
+Providers with energy-based pricing (NeuralWatt) return energy and cost metadata: top-level `energy` and `cost` fields in non-streaming responses, and SSE comments (`: energy {...}` / `: cost {...}`) in streaming. The report shows totals for energy (kWh) and cost (USD) per window and per provider when present. For OpenAI-compatible providers that report a cost in `usage.cost` (OpenRouter, Groq), the proxy persists it. It never estimates cost from a price table.
+
+```bash
+local-proxy stats               # today's summary, per provider, and recent requests
+local-proxy stats --since week  # day | week | month | all
+local-proxy stats --json        # same report as JSON, keys summary/providers/recent
+```
+
+### Status line
+
+The Claude Code status line is computed client-side from Claude's own price table, which is wrong when traffic goes through a multi-provider proxy. The proxy renders the line from the stats it records instead.
+
+The flow: Claude Code sends `X-Claude-Code-Session-Id` (a UUID per session) on every request. The proxy stores `session_id` on each `stats.db` row. The status line script passes its `session_id` to `local-proxy statusline`, which aggregates that session's stats and renders a Rhai template, sandboxed.
+
+```bash
 local-proxy statusline --session "<uuid>" --model "claude-..." --context-pct 42
-local-proxy statusline --session "<uuid>" --template "`{model} · `{cost_session} · `{context_pct}% ctx"
+local-proxy statusline --session "<uuid>" --template "{model} · {cost_session} · {context_pct}% ctx"
 ```
 
-Params disponíveis no template (ausentes viram `?`): `cost_session`, `cost_month`, `cost_total`,
-`cost_known`, `tokens_in`, `tokens_out`, `requests`, `model`, `context_pct`. O custo só aparece
-quando o *upstream reporta* o custo (OpenRouter/Groq etc.); nunca é estimado. Formatação é toda
-do template.
+Template params (absent values render as `?`): `cost_session`, `cost_month`, `cost_total`, `cost_known`, `tokens_in`, `tokens_out`, `requests`, `model`, `context_pct`. Cost only appears when the upstream reports it; it is never estimated. Formatting is entirely the template's job.
 
-O template pode vir do config (`statusline:` block) ou ser passado com `--template` (flag vence):
+The template can come from the config (`statusline:` block) or from `--template`, which wins:
 
 ```yaml
 statusline:
   template: "{model} · {cost_session} · {context_pct}% ctx"
 ```
 
-Scripts prontos (lêem o JSON da stdin, extraem `session_id` e chamam o binário) em
-`scripts/statusline.sh` / `scripts/statusline.ps1`; aponte para um deles no `settings.json` do
-Claude Code:
+Ready scripts that read the JSON from stdin, extract `session_id`, and call the binary live in `scripts/statusline.sh` and `scripts/statusline.ps1`. Point Claude Code's `settings.json` at one of them:
 
 ```json
 { "statusLine": { "type": "command", "command": "/abs/path/scripts/statusline.ps1" } }
 ```
 
-## Testes
+## Update
 
-- **Unit (Rust)**: `cargo test --all-features` — traduções, roteamento, erros, máquinas de streaming,
-  catálogo/merge, auth, hot-reload, select.
-- **e2e (Bun, mock upstream)**: `bun test e2e/mock.test.ts` (ou `bun test` na pasta `e2e/`) —
-  sobe o binário + um upstream mock e valida tradução/streaming/auth/erros via HTTP real.
-- **e2e live (opencode-zen)**: `$env:OPENCODE_ZEN_KEY=...; bun test e2e/live-zen.test.ts` —
-  valida contra o provider real. O upstream free pode limitar por uso (`FreeUsageLimitError`); nesse
-  caso os testes reportam *environmental skip* (não são falha do proxy). Inclui também dois testes
-  que sobem o **CLI `claude` real** apontado ao proxy (`ANTHROPIC_BASE_URL`, sem auth de cliente — o
-  proxy usa a chave configurada do usuário), validando o caminho completo Anthropic → tradução → zen
-  com o binário de verdade (`--output-format text` e `stream-json`).
+`update` downloads the latest release binary from GitHub, verifies the SHA256, and applies it in place. On Linux the swap is atomic (POSIX rename, safe while the binary is running). On Windows the running executable is renamed to a backup and the new one takes its place, with cleanup of the backup on exit and at the next start. Cargo installs delegate to cargo.
 
-```powershell
-# na pasta e2e/
-bun install 2>$null; bun test            # mock (determinístico)
-$env:OPENCODE_ZEN_KEY="sk-..."; bun test live-zen.test.ts   # live (best-effort)
+```bash
+local-proxy update --check        # report the latest version only
+local-proxy update                # download, verify, apply
+local-proxy update --force        # update even on the latest version
+local-proxy update --repo owner/repo  # alternate repository, or $LOCAL_PROXY_REPO
+local-proxy update --no-verify    # skip SHA256 verification
 ```
 
-## Estrutura
+`serve` accepts `--check-update` to warn in the log when a newer release exists. Disable it with `$env:LOCAL_PROXY_DISABLE_AUTOUPDATE=1`.
+
+## Development
+
+```bash
+cargo build
+cargo fmt --all -- --check
+cargo clippy --all-targets --all-features -- -D warnings
+cargo test --all-features
+```
+
+The e2e suite runs with Bun against a deterministic mock upstream:
+
+```bash
+cd e2e
+cargo build --manifest-path ../Cargo.toml
+bun install
+bun test mock.test.ts
+```
+
+A live suite runs against opencode-zen with a real key:
+
+```bash
+cd e2e
+$env:OPENCODE_ZEN_KEY="sk-..."; bun test live-zen.test.ts
+```
+
+The free upstream may rate-limit (`FreeUsageLimitError`); in that case the live tests report an environmental skip, which is not a proxy failure. The suite also includes tests that launch the real `claude` CLI against the proxy over `ANTHROPIC_BASE_URL`.
+
+The CI workflow in `.github/workflows/ci.yml` runs fmt, clippy with `-D warnings`, and the unit tests on Ubuntu and Windows, plus the mock e2e suite, and a scheduled `cargo-audit` job. Run the same commands locally before pushing.
+
+## Project structure
 
 ```
 src/
-├── main.rs        CLI + boot (erros com miette, códigos config::/cli::)
-├── config.rs      Config/Provider/Route/Defaults (YAML/JSON) — overlay, auto-created, headers por provider
-├── catalog.rs     catálogo embutido + merge catálogo↔config
-├── auth.rs        auth.json (keys) + escrita atômica
-├── cli.rs         serve/launch/status/stop/models/model/connect/disconnect/providers/stats/statusline/update
-├── router.rs      resolve_model → (provider, upstream_model)
-├── upstream.rs    chamada HTTP + resolução de chave (inline > auth > env) + headers por provider
-├── translate.rs   requests/responses A↔O↔Responses
-├── sse.rs         parser de frames SSE
-├── streams.rs     máquinas de estado de streaming (3 direções)
-├── exec.rs        executor `$proxy` (detecção de token, parse de args, run com timeout)
-├── error.rs       ApiError + shape por formato
-├── stats.rs       estatísticas locais (SQLite `stats.db`) + `local-proxy stats` + sessões
-├── statusline.rs  template Rhai sandboxed para a status line
-└── handlers.rs    endpoints axum + RuntimeState hot-reload + /v1/models + count_tokens + `$proxy`
-e2e/               suíte de testes em Bun (mock + live)
-scripts/           scripts de status line (bash/PowerShell)
+├── main.rs        CLI and boot (errors with miette)
+├── config.rs      Config, Provider, Route, Defaults (YAML/JSON), overlay, per-provider headers
+├── catalog.rs     embedded catalog and catalog to config merge
+├── auth.rs        auth.json keys and atomic writes
+├── cli.rs         serve, launch, status, stop, models, model, connect, disconnect, providers, stats, statusline, update
+├── router.rs      resolve_model to (provider, upstream_model)
+├── upstream.rs    HTTP calls, key resolution, per-provider headers
+├── translate.rs   request and response translation across the three formats
+├── sse.rs         SSE frame parser
+├── streams.rs     streaming state machines, all three directions
+├── exec.rs        $proxy executor, token detection, arg parsing, timeout
+├── error.rs       ApiError and per-format error shape
+├── stats.rs       local statistics (SQLite stats.db) and stats command
+├── statusline.rs  sandboxed Rhai template for the status line
+└── handlers.rs    axum endpoints, hot-reload state, /v1/models, count_tokens, $proxy
+e2e/               Bun test suite (mock and live)
+scripts/           status line scripts (bash and PowerShell)
 ```
 
-## Licença
+## Troubleshooting
+
+- `FreeUsageLimitError` from live tests. The free opencode-zen model is rate-limited. The tests report an environmental skip; the proxy is not at fault.
+- `Invalid API key` or 401s. The key lives in `auth.json`, not in the config. Run `local-proxy providers` to see which providers have a resolvable key, then `local-proxy connect <provider>`.
+- Port already in use. The default port is 8787. Pass `--port` to `serve`, or use `launch`, which picks a free random port.
+- Where is the config? `%APPDATA%\local-proxy\config.yaml` on Windows, `~/.config/local-proxy/config.yaml` on Unix. Override with `--config`, `LOCAL_PROXY_CONFIG`, or `LOCAL_PROXY_CONFIG_DIR`.
+- `status` says "not reachable" right after `--background`. The background process may still be starting. Check again in a second.
+- A `local-proxy.old` file on Windows. That is the previous executable, renamed while the new one took its place. It is cleaned up on exit and at the next start.
+
+## Limitations
+
+The known gaps, tracked in `docs/PENDING.md`, are not in scope for the current version:
+
+- `model` rewrites the config through serde, so manual comments and formatting in `config.yaml` are lost on that write.
+- Concurrent `connect` and `disconnect` calls can race on `auth.json`. Atomic writes prevent corruption, but there is no lock.
+- The launcher keeps a single pid file, so multiple background proxies overwrite each other.
+- No retry or round-robin across keys, no rate limiting, no embeddings, no cache, no container image.
+
+## Contributing
+
+Open an issue or a pull request. Before pushing, run the exact commands CI runs: `cargo fmt --all -- --check`, `cargo clippy --all-targets --all-features -- -D warnings`, and `cargo test --all-features`, plus the mock e2e suite. The project enforces `missing_docs = "deny"` for public items. Full details in `AGENTS.md`.
+
+## License
 
 MIT.
