@@ -289,6 +289,17 @@ fn extract_client_key(headers: &HeaderMap) -> Option<String> {
     None
 }
 
+/// Extract the client session id (`X-Claude-Code-Session-Id`) from the inbound
+/// headers, defaulting to `""` when absent (curl, plain `OpenAI` clients, tests).
+#[must_use]
+fn extract_session_id(headers: &HeaderMap) -> String {
+    headers
+        .get("x-claude-code-session-id")
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or_default()
+        .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // small helpers
 // ---------------------------------------------------------------------------
@@ -460,7 +471,7 @@ fn client_for(
 /// possible, records the row against the local stats database, and ignores any
 /// failure. The provider/model are the resolved upstream ones. Streaming
 /// requests are recorded by [`StreamCapture`] once the `SSE` stream completes.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 fn capture(
     endpoint: &'static str,
     provider: &str,
@@ -469,6 +480,7 @@ fn capture(
     status: u16,
     upstream_body: Option<&Value>,
     started: &Instant,
+    session_id: &str,
 ) {
     let mut tokens = crate::translate::TokenUsage::default();
     let (energy, cost) = upstream_body.map_or((None, None), |body| {
@@ -477,7 +489,10 @@ fn capture(
         }
         (
             crate::translate::energy_from_value(body),
-            crate::translate::cost_from_value(body),
+            // A `NeuralWatt`-style top-level `cost` object wins; otherwise fall
+            // back to the `usage.cost` reported by OpenAI/OpenRouter-style
+            // upstreams (e.g. OpenRouter, Groq) so that cost is still recorded.
+            crate::translate::cost_from_value(body).or_else(|| tokens.as_cost()),
         )
     });
     stats::record(
@@ -493,6 +508,7 @@ fn capture(
             error: status >= 400,
             energy,
             cost,
+            session_id: session_id.to_string(),
         },
     );
 }
@@ -660,7 +676,8 @@ async fn messages_handler(
         Ok(k) => k,
         Err(e) => return error_response(&e, true),
     };
-    match handle_messages(&app, &state, &body, client_key.as_deref()).await {
+    let session_id = extract_session_id(&headers);
+    match handle_messages(&app, &state, &body, client_key.as_deref(), &session_id).await {
         Ok(r) => {
             tracing::info!(
                 target: crate::LOG_TARGET,
@@ -690,6 +707,7 @@ async fn handle_messages(
     state: &RuntimeState,
     body: &Bytes,
     client_key: Option<&str>,
+    session_id: &str,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let mut body = parse_body(body)?;
@@ -741,6 +759,7 @@ async fn handle_messages(
             status,
             Some(&rbody),
             &started,
+            session_id,
         );
         tracing::warn!(
             target: crate::LOG_TARGET,
@@ -759,6 +778,7 @@ async fn handle_messages(
             &upstream_model,
             status,
             started,
+            session_id,
         );
         return match provider.format {
             ProviderFormat::Anthropic => Ok(passthrough_stream(resp, Some(cap))),
@@ -781,6 +801,7 @@ async fn handle_messages(
                 status,
                 Some(&rbody),
                 &started,
+                session_id,
             );
             Ok(json_response(StatusCode::OK, rbody))
         }
@@ -793,6 +814,7 @@ async fn handle_messages(
                 status,
                 Some(&rbody),
                 &started,
+                session_id,
             );
             let translated = translate::openai_to_anthropic_response(rbody, &upstream_model)
                 .map_err(ApiError::from)?;
@@ -815,7 +837,8 @@ async fn chat_completions_handler(
         Ok(k) => k,
         Err(e) => return error_response(&e, false),
     };
-    match handle_chat_completions(&app, &state, &body, client_key.as_deref()).await {
+    let session_id = extract_session_id(&headers);
+    match handle_chat_completions(&app, &state, &body, client_key.as_deref(), &session_id).await {
         Ok(r) => {
             tracing::info!(
                 target: crate::LOG_TARGET,
@@ -845,6 +868,7 @@ async fn handle_chat_completions(
     state: &RuntimeState,
     body: &Bytes,
     client_key: Option<&str>,
+    session_id: &str,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let mut body = parse_body(body)?;
@@ -896,6 +920,7 @@ async fn handle_chat_completions(
             status,
             Some(&rbody),
             &started,
+            session_id,
         );
         tracing::warn!(
             target: crate::LOG_TARGET,
@@ -914,6 +939,7 @@ async fn handle_chat_completions(
             &upstream_model,
             status,
             started,
+            session_id,
         );
         return match provider.format {
             ProviderFormat::Openai => Ok(passthrough_stream(resp, Some(cap))),
@@ -936,6 +962,7 @@ async fn handle_chat_completions(
                 status,
                 Some(&rbody),
                 &started,
+                session_id,
             );
             Ok(json_response(StatusCode::OK, rbody))
         }
@@ -948,6 +975,7 @@ async fn handle_chat_completions(
                 status,
                 Some(&rbody),
                 &started,
+                session_id,
             );
             let translated = translate::anthropic_to_openai_response(rbody, &upstream_model)
                 .map_err(ApiError::from)?;
@@ -970,7 +998,8 @@ async fn responses_handler(
         Ok(k) => k,
         Err(e) => return error_response(&e, false),
     };
-    match handle_responses(&app, &state, &body, client_key.as_deref()).await {
+    let session_id = extract_session_id(&headers);
+    match handle_responses(&app, &state, &body, client_key.as_deref(), &session_id).await {
         Ok(r) => {
             tracing::info!(
                 target: crate::LOG_TARGET,
@@ -1000,6 +1029,7 @@ async fn handle_responses(
     state: &RuntimeState,
     body: &Bytes,
     client_key: Option<&str>,
+    session_id: &str,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let mut body = parse_body(body)?;
@@ -1051,6 +1081,7 @@ async fn handle_responses(
             status,
             Some(&rbody),
             &started,
+            session_id,
         );
         tracing::warn!(
             target: crate::LOG_TARGET,
@@ -1069,6 +1100,7 @@ async fn handle_responses(
             &upstream_model,
             status,
             started,
+            session_id,
         );
         return match provider.format {
             ProviderFormat::Openai => Ok(sse_response(streams::responses_from_openai(
@@ -1093,6 +1125,7 @@ async fn handle_responses(
         status,
         Some(&rbody),
         &started,
+        session_id,
     );
     let translated = match provider.format {
         ProviderFormat::Openai => translate::openai_to_responses_response(rbody, &upstream_model)
@@ -1222,6 +1255,7 @@ mod tests {
             routes: Vec::new(),
             defaults: crate::config::Defaults::default(),
             exec: crate::config::Exec::default(),
+            statusline: crate::config::StatuslineConfig::default(),
         };
         let state = RuntimeState {
             config: Arc::new(cfg),
@@ -1333,6 +1367,7 @@ mod tests {
                 active_model: Some("gpt-4o".to_string()),
             },
             exec: crate::config::Exec::default(),
+            statusline: crate::config::StatuslineConfig::default(),
         });
         let state = RuntimeState {
             config: cfg.clone(),
@@ -1366,6 +1401,7 @@ mod tests {
                 active_model: None,
             },
             exec: crate::config::Exec::default(),
+            statusline: crate::config::StatuslineConfig::default(),
         });
         let state = RuntimeState {
             config: cfg.clone(),
@@ -1397,6 +1433,7 @@ mod tests {
                 active_model: None,
             },
             exec: crate::config::Exec::default(),
+            statusline: crate::config::StatuslineConfig::default(),
         });
         let state = RuntimeState {
             config: cfg.clone(),

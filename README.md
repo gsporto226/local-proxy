@@ -55,6 +55,11 @@ Resolução de config (precedência):
 3. `config.yaml`/`config.json` no diretório de trabalho (override project-local, só se existir).
 4. Global default (o arquivo criado automaticamente).
 
+O config dir global (onde ficam `config.yaml`, `auth.json` e `stats.db`) segue o padrão do sistema
+(`%APPDATA%\local-proxy` no Windows, `~/.config/local-proxy` no Unix) e pode ser redirecionado pela
+env var `LOCAL_PROXY_CONFIG_DIR` (usada para isolar dados em testes/tooling sem tocar o dir real).
+
+
 Exemplo adicionando um provider custom e roteando:
 
 ```yaml
@@ -236,6 +241,44 @@ local-proxy stats --since week  # dia | week | month | all
 local-proxy stats --json        # mesmo relatório em JSON (summary/providers/recent)
 ```
 
+## Status line (custo/sessão em tempo real)
+
+O [Claude Code status line](https://docs.claude.com/en/docs/claude-code/statusline) é
+calculado *client-side* pelo próprio Claude Code usando a tabela de preços dele — o que fica
+errado quando o tráfego passa por este proxy multi-provider. Em vez disso, o `local-proxy`
+renderiza a linha a partir dos stats reais que ele mesmo registra.
+
+O fluxo: o Claude Code envia `X-Claude-Code-Session-Id` (um UUID por sessão) em cada request;
+o proxy grava `session_id` em cada linha do `stats.db`; o script da status line passa o seu
+`session_id` para `local-proxy statusline`, que agrega os stats daquela sessão e renderiza um
+template (Rhai, sandboxed).
+
+```powershell
+# renderiza a linha para uma sessão (params opcionais do JSON da status line)
+local-proxy statusline --session "<uuid>" --model "claude-..." --context-pct 42
+local-proxy statusline --session "<uuid>" --template "`{model} · `{cost_session} · `{context_pct}% ctx"
+```
+
+Params disponíveis no template (ausentes viram `?`): `cost_session`, `cost_month`, `cost_total`,
+`cost_known`, `tokens_in`, `tokens_out`, `requests`, `model`, `context_pct`. O custo só aparece
+quando o *upstream reporta* o custo (OpenRouter/Groq etc.); nunca é estimado. Formatação é toda
+do template.
+
+O template pode vir do config (`statusline:` block) ou ser passado com `--template` (flag vence):
+
+```yaml
+statusline:
+  template: "{model} · {cost_session} · {context_pct}% ctx"
+```
+
+Scripts prontos (lêem o JSON da stdin, extraem `session_id` e chamam o binário) em
+`scripts/statusline.sh` / `scripts/statusline.ps1`; aponte para um deles no `settings.json` do
+Claude Code:
+
+```json
+{ "statusLine": { "type": "command", "command": "/abs/path/scripts/statusline.ps1" } }
+```
+
 ## Testes
 
 - **Unit (Rust)**: `cargo test --all-features` — traduções, roteamento, erros, máquinas de streaming,
@@ -263,7 +306,7 @@ src/
 ├── config.rs      Config/Provider/Route/Defaults (YAML/JSON) — overlay, auto-created, headers por provider
 ├── catalog.rs     catálogo embutido + merge catálogo↔config
 ├── auth.rs        auth.json (keys) + escrita atômica
-├── cli.rs         serve/launch/status/stop/models/model/connect/disconnect/providers/stats/update
+├── cli.rs         serve/launch/status/stop/models/model/connect/disconnect/providers/stats/statusline/update
 ├── router.rs      resolve_model → (provider, upstream_model)
 ├── upstream.rs    chamada HTTP + resolução de chave (inline > auth > env) + headers por provider
 ├── translate.rs   requests/responses A↔O↔Responses
@@ -271,9 +314,11 @@ src/
 ├── streams.rs     máquinas de estado de streaming (3 direções)
 ├── exec.rs        executor `$proxy` (detecção de token, parse de args, run com timeout)
 ├── error.rs       ApiError + shape por formato
-├── stats.rs       estatísticas locais (SQLite `stats.db`) + `local-proxy stats`
+├── stats.rs       estatísticas locais (SQLite `stats.db`) + `local-proxy stats` + sessões
+├── statusline.rs  template Rhai sandboxed para a status line
 └── handlers.rs    endpoints axum + RuntimeState hot-reload + /v1/models + count_tokens + `$proxy`
 e2e/               suíte de testes em Bun (mock + live)
+scripts/           scripts de status line (bash/PowerShell)
 ```
 
 ## Licença

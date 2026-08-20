@@ -48,6 +48,9 @@ pub mod upstream;
 /// Local usage statistics collected from upstream requests (SQLite store).
 pub mod stats;
 
+/// Sandboxed Rhai template rendering for the Claude Code status line.
+pub mod statusline;
+
 /// Global lock that serializes unit tests mutating process-global state (the
 /// current working directory and environment variables), preventing races
 /// between parallel test threads.

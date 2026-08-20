@@ -65,6 +65,7 @@ pub fn effective_config(base: Config, overlay: Config) -> Config {
         routes,
         defaults,
         exec: overlay.exec,
+        statusline: overlay.statusline,
     }
 }
 

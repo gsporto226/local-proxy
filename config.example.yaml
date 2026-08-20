@@ -37,3 +37,11 @@ server:
 #
 # defaults:
 #   provider: anthropic
+
+# Status line template for the Claude Code status line (see README). A Rhai
+# script evaluated against the current session's recorded stats. A `--template`
+# flag on `local-proxy statusline` overrides this block. Available params:
+# session (cost_session, cost_month, cost_total, cost_known), tokens_in,
+# tokens_out, requests, model, context_pct. Absent values bind to `?`.
+# statusline:
+#   template: "{model} · {cost_session} · {context_pct}% ctx"

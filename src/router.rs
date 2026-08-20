@@ -221,6 +221,7 @@ mod tests {
                 active_model: None,
             },
             exec: crate::config::Exec::default(),
+            statusline: crate::config::StatuslineConfig::default(),
         }
     }
 

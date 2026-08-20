@@ -49,6 +49,8 @@ pub struct StatLine {
     pub energy: Option<crate::translate::EnergyCost>,
     /// Cost metadata reported by the upstream, if any.
     pub cost: Option<crate::translate::EnergyCost>,
+    /// The client session (`X-Claude-Code-Session-Id`), or `""` when absent.
+    pub session_id: String,
 }
 
 /// Errors opening or querying the local statistics database.
@@ -89,13 +91,15 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             latency_ms INTEGER NOT NULL DEFAULT 0,
             error INTEGER NOT NULL DEFAULT 0,
             energy_kwh_um INTEGER,
-            cost_usd_um INTEGER
+            cost_usd_um INTEGER,
+            session_id TEXT NOT NULL DEFAULT ''
         );
         CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
         CREATE INDEX IF NOT EXISTS idx_requests_provider ON requests(provider);",
     )?;
     // Lightweight migration for databases created before energy/cost existed.
-    let cols = ["energy_kwh_um", "cost_usd_um"];
+    // Guarded by a column-exists check so prior stats survive in place.
+    let cols = ["energy_kwh_um", "cost_usd_um", "session_id"];
     for col in cols {
         let exists: bool = conn
             .query_row(
@@ -105,9 +109,17 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             )
             .unwrap_or(false);
         if !exists {
-            conn.execute_batch(&format!("ALTER TABLE requests ADD COLUMN {col} INTEGER"))?;
+            // `session_id` is TEXT; the others are INTEGER.
+            let ty = if col == "session_id" {
+                "TEXT NOT NULL DEFAULT ''"
+            } else {
+                "INTEGER"
+            };
+            conn.execute_batch(&format!("ALTER TABLE requests ADD COLUMN {col} {ty}"))?;
         }
     }
+    // Created after the migration so it works on pre-existing databases too.
+    conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);")?;
     Ok(())
 }
 
@@ -164,8 +176,9 @@ fn write_line(path: &Path, stat: &StatLine, ts: i64, latency_ms: u64) -> Result<
     conn.execute(
         "INSERT INTO requests
             (ts, endpoint, provider, model, input_tokens, output_tokens,
-             streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+             streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
+             session_id)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
         rusqlite::params![
             ts,
             stat.endpoint,
@@ -179,6 +192,7 @@ fn write_line(path: &Path, stat: &StatLine, ts: i64, latency_ms: u64) -> Result<
             i64::from(stat.error),
             stat.energy.and_then(|e| e.energy_kwh).map(to_um),
             stat.cost.and_then(|c| c.request_cost_usd).map(to_um),
+            stat.session_id,
         ],
     )
     .map_err(|source| StatsError::Query { source })?;
@@ -264,6 +278,8 @@ pub struct RequestRow {
     pub energy_kwh_um: Option<u64>,
     /// Cost in micro-USD, if reported.
     pub cost_usd_um: Option<u64>,
+    /// The client session (`X-Claude-Code-Session-Id`), or `""` when absent.
+    pub session_id: String,
 }
 
 /// Overall totals for the window, or `None` if the database does not exist yet.
@@ -396,7 +412,8 @@ pub fn recent_on(
     let (wsql, params) = where_clause(window);
     let sql = format!(
         "SELECT ts, endpoint, provider, model, input_tokens, output_tokens,
-                streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um
+                streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
+                session_id
          FROM requests {wsql}
          ORDER BY ts DESC, id DESC LIMIT {limit}"
     );
@@ -418,6 +435,7 @@ pub fn recent_on(
                 error: r.get::<_, i64>(9)? != 0,
                 energy_kwh_um: r.get::<_, Option<i64>>(10)?.map(|v| v as u64),
                 cost_usd_um: r.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+                session_id: r.get(12)?,
             })
         })
         .map_err(|source| StatsError::Query { source })?
@@ -432,6 +450,110 @@ fn where_clause(window: TimeWindow) -> (String, Vec<rusqlite::types::Value>) {
         || (String::new(), Vec::new()),
         |since| ("WHERE ts >= ?1".to_string(), vec![since.into()]),
     )
+}
+
+/// Aggregated figures for a single client session (drives the status line).
+#[derive(Debug, Clone, Default)]
+pub struct SessionStats {
+    /// Number of recorded requests in the session.
+    pub requests: u64,
+    /// Sum of input tokens.
+    pub tokens_in: u64,
+    /// Sum of output tokens.
+    pub tokens_out: u64,
+    /// Sum of reported cost in USD (only over rows carrying a known cost).
+    pub cost_usd: f64,
+    /// Number of requests whose cost was reported (unknown-cost rows excluded).
+    pub cost_known_requests: u64,
+    /// The most recent model used in the session, if any.
+    pub last_model: Option<String>,
+}
+
+/// Aggregate a single session's requests, or `None` when the database does not
+/// exist or the session has no rows.
+///
+/// # Errors
+///
+/// Returns a [`StatsError::Open`] if the database cannot be opened or a
+/// [`StatsError::Query`] if the query fails.
+pub fn session(session_id: &str) -> Result<Option<SessionStats>, StatsError> {
+    let path = stats_db();
+    if !path.exists() {
+        return Ok(None);
+    }
+    if session_id.is_empty() {
+        return Ok(None);
+    }
+    let conn = open(&path)?;
+    session_on(&conn, session_id)
+}
+
+/// Aggregate `session_id`'s requests over a live connection. Returns `None`
+/// when there are no rows for the session.
+///
+/// # Errors
+///
+/// Returns a [`StatsError::Query`] if the query fails.
+pub fn session_on(
+    conn: &rusqlite::Connection,
+    session_id: &str,
+) -> Result<Option<SessionStats>, StatsError> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT COUNT(*),
+                    COALESCE(SUM(input_tokens),0),
+                    COALESCE(SUM(output_tokens),0),
+                    COALESCE(SUM(cost_usd_um),0),
+                    COUNT(cost_usd_um),
+                    (SELECT model FROM requests r2
+                      WHERE r2.session_id = ?1 ORDER BY ts DESC, id DESC LIMIT 1)
+             FROM requests WHERE session_id = ?1",
+        )
+        .map_err(|source| StatsError::Query { source })?;
+    let first = stmt
+        .query_row(rusqlite::params![session_id], |r| {
+            let requests = r.get::<_, i64>(0)?;
+            let last_model = r.get::<_, Option<String>>(5)?;
+            Ok(if requests == 0 {
+                None
+            } else {
+                Some(SessionStats {
+                    requests: requests as u64,
+                    tokens_in: r.get::<_, i64>(1)? as u64,
+                    tokens_out: r.get::<_, i64>(2)? as u64,
+                    cost_usd: r.get::<_, i64>(3)? as f64 / 1_000_000.0,
+                    cost_known_requests: r.get::<_, i64>(4)? as u64,
+                    last_model,
+                })
+            })
+        })
+        .map_err(|source| StatsError::Query { source })?;
+    Ok(first)
+}
+
+/// Sum of reported cost (USD) over a time window, or `None` when the database
+/// does not exist. Used for the month/total cost params in the status line.
+///
+/// # Errors
+///
+/// Returns a [`StatsError::Open`] if the database cannot be opened or a
+/// [`StatsError::Query`] if the query fails.
+pub fn cost_over(window: TimeWindow) -> Result<Option<f64>, StatsError> {
+    let path = stats_db();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = open(&path)?;
+    let (wsql, params) = where_clause(window);
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT COALESCE(SUM(cost_usd_um),0) FROM requests {wsql}"
+        ))
+        .map_err(|source| StatsError::Query { source })?;
+    let sum = stmt
+        .query_row(rusqlite::params_from_iter(params), |r| r.get::<_, i64>(0))
+        .map_err(|source| StatsError::Query { source })?;
+    Ok(Some(sum as f64 / 1_000_000.0))
 }
 
 #[cfg(test)]
@@ -459,8 +581,9 @@ mod tests {
         conn.execute(
             "INSERT INTO requests
                 (ts, endpoint, provider, model, input_tokens, output_tokens,
-                 streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um)
-             VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11)",
+                 streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
+                 session_id)
+             VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
             rusqlite::params![
                 line.endpoint,
                 line.provider,
@@ -473,6 +596,7 @@ mod tests {
                 i64::from(line.error),
                 line.energy.and_then(|e| e.energy_kwh).map(to_um),
                 line.cost.and_then(|c| c.request_cost_usd).map(to_um),
+                line.session_id,
             ],
         )
         .unwrap();
@@ -585,6 +709,7 @@ mod tests {
             error: false,
             energy: Some(e),
             cost: Some(c),
+            session_id: String::new(),
         };
         insert_line(&conn, &line);
 
@@ -633,5 +758,50 @@ mod tests {
         assert_eq!(s.requests, 1);
         assert_eq!(s.input_tokens, 1);
         assert_eq!(s.energy_kwh_um, 0);
+    }
+
+    #[test]
+    fn session_aggregates_per_session_with_cost() {
+        let conn = in_memory();
+        // a row with reported cost, one without, for the same session
+        let mut line = StatLine {
+            endpoint: "/v1/messages",
+            provider: "openrouter".to_string(),
+            model: "model-a".to_string(),
+            input_tokens: 10,
+            output_tokens: 5,
+            streamed: false,
+            status: 200,
+            error: false,
+            energy: None,
+            cost: Some(crate::translate::EnergyCost {
+                energy_joules: None,
+                energy_kwh: None,
+                avg_power_watts: None,
+                request_cost_usd: Some(0.001),
+                cache_savings_usd: None,
+            }),
+            session_id: "sess-1".to_string(),
+        };
+        insert_line(&conn, &line);
+        line.cost = None;
+        line.model = "model-b".to_string();
+        insert_line(&conn, &line);
+        // a different session must be excluded
+        line.session_id = "sess-2".to_string();
+        line.input_tokens = 999;
+        insert_line(&conn, &line);
+
+        let s = session_on(&conn, "sess-1").unwrap().unwrap();
+        assert_eq!(s.requests, 2);
+        assert_eq!(s.tokens_in, 20);
+        assert_eq!(s.tokens_out, 10);
+        // 0.001 USD -> 1000 um -> back to 0.001
+        assert!((s.cost_usd - 0.001).abs() < 1e-9);
+        assert_eq!(s.cost_known_requests, 1);
+        assert_eq!(s.last_model.as_deref(), Some("model-b"));
+
+        // unknown session -> None
+        assert!(session_on(&conn, "nope").unwrap().is_none());
     }
 }
