@@ -190,13 +190,21 @@ pub fn build_clients(config: &Config) -> Result<HashMap<String, ProviderClient>,
     let passthrough = config.server.passthrough_keys;
     let auth = crate::auth::read_auth().unwrap_or_default();
     let mut map = HashMap::new();
+    let mut connected = Vec::new();
     for provider in &config.providers {
         let auth_key = auth.get(&provider.name).map(|e| e.key.clone());
-        map.insert(
-            provider.name.clone(),
-            ProviderClient::new(provider, passthrough, auth_key)?,
-        );
+        let client = ProviderClient::new(provider, passthrough, auth_key)?;
+        if client.has_key() {
+            connected.push(provider.name.clone());
+        }
+        map.insert(provider.name.clone(), client);
     }
+    tracing::info!(
+        target: crate::LOG_TARGET,
+        providers = config.providers.len(),
+        connected = %connected.join(", "),
+        "built upstream clients"
+    );
     Ok(map)
 }
 
@@ -209,6 +217,7 @@ pub fn app(state: AppState) -> AxumRouter {
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/responses", post(responses_handler))
         .route("/v1/models", get(models_handler))
+        .layer(tower_http::trace::TraceLayer::new_for_http())
         .with_state(state)
 }
 
@@ -230,8 +239,16 @@ fn authenticate(state: &RuntimeState, headers: &HeaderMap) -> Result<Option<Stri
     }
     match &presented {
         Some(key) if state.config.server.api_keys.iter().any(|k| k == key) => Ok(presented),
-        Some(_) => Err(ApiError::unauthorized("invalid API key")),
-        None => Err(ApiError::unauthorized("missing API key")),
+        Some(_) => {
+            let e = ApiError::unauthorized("invalid API key");
+            tracing::warn!(target: crate::LOG_TARGET, status = e.status, kind = %e.kind, "auth rejected: invalid API key");
+            Err(e)
+        }
+        None => {
+            let e = ApiError::unauthorized("missing API key");
+            tracing::warn!(target: crate::LOG_TARGET, status = e.status, kind = %e.kind, "auth rejected: missing API key");
+            Err(e)
+        }
     }
 }
 
@@ -474,8 +491,26 @@ async fn messages_handler(
         Err(e) => return error_response(&e, true),
     };
     match handle_messages(&state, &body, client_key.as_deref()).await {
-        Ok(r) => r,
-        Err(e) => error_response(&e, true),
+        Ok(r) => {
+            tracing::info!(
+                target: crate::LOG_TARGET,
+                endpoint = "/v1/messages",
+                status = r.status().as_u16(),
+                "request completed"
+            );
+            r
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: crate::LOG_TARGET,
+                endpoint = "/v1/messages",
+                status = e.status,
+                kind = %e.kind,
+                message = %e.message,
+                "request failed"
+            );
+            error_response(&e, true)
+        }
     }
 }
 
@@ -488,6 +523,14 @@ async fn handle_messages(
     let mut body = parse_body(body)?;
     let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state)?;
+    tracing::info!(
+        target: crate::LOG_TARGET,
+        endpoint = "/v1/messages",
+        provider = %provider.name,
+        upstream_model,
+        streaming,
+        "resolved route"
+    );
     body["model"] = json!(upstream_model);
     let client = client_for(state, &provider)?;
 
@@ -514,6 +557,14 @@ async fn handle_messages(
             status,
             Some(&rbody),
             &started,
+        );
+        tracing::warn!(
+            target: crate::LOG_TARGET,
+            endpoint = "/v1/messages",
+            provider = %provider.name,
+            status,
+            body = %rbody,
+            "upstream returned error"
         );
         return Err(ApiError::from_upstream(status, rbody));
     }
@@ -581,8 +632,26 @@ async fn chat_completions_handler(
         Err(e) => return error_response(&e, false),
     };
     match handle_chat_completions(&state, &body, client_key.as_deref()).await {
-        Ok(r) => r,
-        Err(e) => error_response(&e, false),
+        Ok(r) => {
+            tracing::info!(
+                target: crate::LOG_TARGET,
+                endpoint = "/v1/chat/completions",
+                status = r.status().as_u16(),
+                "request completed"
+            );
+            r
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: crate::LOG_TARGET,
+                endpoint = "/v1/chat/completions",
+                status = e.status,
+                kind = %e.kind,
+                message = %e.message,
+                "request failed"
+            );
+            error_response(&e, false)
+        }
     }
 }
 
@@ -595,6 +664,14 @@ async fn handle_chat_completions(
     let mut body = parse_body(body)?;
     let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state)?;
+    tracing::info!(
+        target: crate::LOG_TARGET,
+        endpoint = "/v1/chat/completions",
+        provider = %provider.name,
+        upstream_model,
+        streaming,
+        "resolved route"
+    );
     body["model"] = json!(upstream_model);
     let client = client_for(state, &provider)?;
 
@@ -621,6 +698,14 @@ async fn handle_chat_completions(
             status,
             Some(&rbody),
             &started,
+        );
+        tracing::warn!(
+            target: crate::LOG_TARGET,
+            endpoint = "/v1/chat/completions",
+            provider = %provider.name,
+            status,
+            body = %rbody,
+            "upstream returned error"
         );
         return Err(ApiError::from_upstream(status, rbody));
     }
@@ -688,8 +773,26 @@ async fn responses_handler(
         Err(e) => return error_response(&e, false),
     };
     match handle_responses(&state, &body, client_key.as_deref()).await {
-        Ok(r) => r,
-        Err(e) => error_response(&e, false),
+        Ok(r) => {
+            tracing::info!(
+                target: crate::LOG_TARGET,
+                endpoint = "/v1/responses",
+                status = r.status().as_u16(),
+                "request completed"
+            );
+            r
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: crate::LOG_TARGET,
+                endpoint = "/v1/responses",
+                status = e.status,
+                kind = %e.kind,
+                message = %e.message,
+                "request failed"
+            );
+            error_response(&e, false)
+        }
     }
 }
 
@@ -702,6 +805,14 @@ async fn handle_responses(
     let mut body = parse_body(body)?;
     let streaming = wants_stream(&body);
     let (provider, upstream_model) = resolve_model(state)?;
+    tracing::info!(
+        target: crate::LOG_TARGET,
+        endpoint = "/v1/responses",
+        provider = %provider.name,
+        upstream_model,
+        streaming,
+        "resolved route"
+    );
     body["model"] = json!(upstream_model);
     let client = client_for(state, &provider)?;
 
@@ -728,6 +839,14 @@ async fn handle_responses(
             status,
             Some(&rbody),
             &started,
+        );
+        tracing::warn!(
+            target: crate::LOG_TARGET,
+            endpoint = "/v1/responses",
+            provider = %provider.name,
+            status,
+            body = %rbody,
+            "upstream returned error"
         );
         return Err(ApiError::from_upstream(status, rbody));
     }
@@ -781,6 +900,12 @@ async fn handle_responses(
 async fn models_handler(State(state): State<AppState>, headers: HeaderMap) -> Response {
     let state = state.snapshot().await;
     let models = state.router.list_models();
+    tracing::info!(
+        target: crate::LOG_TARGET,
+        endpoint = "/v1/models",
+        count = models.len(),
+        "serving model list"
+    );
     if headers.contains_key("anthropic-version") {
         let data: Vec<Value> = models
             .iter()
@@ -817,9 +942,25 @@ async fn count_tokens_handler(
     match parse_body(&body) {
         Ok(body) => {
             let n = estimate_tokens(&body);
+            tracing::info!(
+                target: crate::LOG_TARGET,
+                endpoint = "/v1/messages/count_tokens",
+                input_tokens = n,
+                "counted tokens"
+            );
             json_response(StatusCode::OK, json!({"input_tokens": n}))
         }
-        Err(e) => error_response(&e, true),
+        Err(e) => {
+            tracing::warn!(
+                target: crate::LOG_TARGET,
+                endpoint = "/v1/messages/count_tokens",
+                status = e.status,
+                kind = %e.kind,
+                message = %e.message,
+                "request failed"
+            );
+            error_response(&e, true)
+        }
     }
 }
 

@@ -167,6 +167,13 @@ impl ProviderClient {
             path
         };
         let url = format!("{}{}", self.base_url, path);
+        tracing::debug!(
+            target: crate::LOG_TARGET,
+            provider = %self.name,
+            url = %url,
+            has_key = key.is_some(),
+            "sending upstream request"
+        );
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));

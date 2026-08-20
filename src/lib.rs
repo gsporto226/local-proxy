@@ -4,6 +4,11 @@
 //! and upstream HTTP client ([`upstream`]) that back the command-line
 //! front-end ([`cli`]).
 
+/// The tracing target used by every log line the proxy emits. Kept on a single
+/// target so operators can filter the whole application with one
+/// `RUST_LOG=local_proxy=...` entry.
+pub const LOG_TARGET: &str = "local_proxy";
+
 /// Command-line interface implementation.
 pub mod cli;
 

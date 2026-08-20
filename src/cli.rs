@@ -15,8 +15,6 @@ use thiserror::Error;
 use crate::config::{Config, DEFAULT_CONFIG_PATH};
 use crate::handlers::{self, AppState};
 
-const LOG_TARGET: &str = "local_proxy";
-
 // ---------------------------------------------------------------------------
 // errors
 // ---------------------------------------------------------------------------
@@ -287,14 +285,14 @@ pub async fn serve(
     if check_update && std::env::var_os("LOCAL_PROXY_DISABLE_AUTOUPDATE").is_none() {
         if let Some(v) = latest_available_version().await {
             tracing::warn!(
-                target: LOG_TARGET,
+                target: crate::LOG_TARGET,
                 %v,
                 "uma versão mais recente está disponível; rode `local-proxy update` para atualizar"
             );
         }
     }
     let runtime = handlers::build_runtime_state(&config_path).map_err(CliError::from)?;
-    tracing::info!(target: LOG_TARGET, path = %config_path.display(), "loaded config");
+    tracing::info!(target: crate::LOG_TARGET, path = %config_path.display(), "loaded config");
 
     let host = host_flag.unwrap_or_else(|| runtime.config.server.host.clone());
     let port = port_flag.unwrap_or(runtime.config.server.port);
@@ -308,7 +306,7 @@ pub async fn serve(
         .await
         .map_err(CliError::from)?;
     write_pid(std::process::id()).map_err(CliError::from)?;
-    tracing::info!(target: LOG_TARGET, %addr, "listening");
+    tracing::info!(target: crate::LOG_TARGET, %addr, "listening");
     let result = axum::serve(listener, app).await;
     remove_pid();
     result.map_err(CliError::from)?;
@@ -317,8 +315,28 @@ pub async fn serve(
 
 fn init_tracing() {
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| format!("{LOG_TARGET}=info,tower_http=info").into());
-    let _ = tracing_subscriber::fmt().with_env_filter(filter).try_init();
+        .unwrap_or_else(|_| format!("{}={},tower_http=debug", crate::LOG_TARGET, "debug").into());
+
+    // Mirror the proxy's logs into the per-user app data dir alongside the pid
+    // file, in addition to the console, so issues can be diagnosed from the log
+    // file even when the server runs in the background or detached. If the file
+    // cannot be opened (e.g. read-only config dir), fall back to stdout only.
+    let file_writer = std::fs::create_dir_all(config_dir())
+        .and_then(|()| std::fs::File::create(log_file()))
+        .map(std::sync::Arc::new);
+
+    let builder = tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true);
+    match file_writer {
+        Ok(file) => {
+            use tracing_subscriber::fmt::writer::MakeWriterExt;
+            let _ = builder.with_writer(std::io::stdout.and(file)).try_init();
+        }
+        Err(_) => {
+            let _ = builder.try_init();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
