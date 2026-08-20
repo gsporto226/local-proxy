@@ -1,25 +1,22 @@
-# Catálogo de providers embutido no binário (base).
-# O config.yaml do usuário só adiciona ou sobrescreve o que está aqui.
+﻿# CatÃ¡logo de providers embutido no binÃ¡rio (base).
+# O config.yaml do usuÃ¡rio sÃ³ adiciona ou sobrescreve o que estÃ¡ aqui.
 # Suportamos dois wire formats: anthropic (Messages API) e openai (Chat Completions).
 
 providers:
   - name: anthropic
     base_url: https://api.anthropic.com
-    api_key_env: ANTHROPIC_API_KEY
     format: anthropic
     models:
       - claude-sonnet-4-5
       - claude-opus-4-1
   - name: openai
     base_url: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
     format: openai
     models:
       - gpt-4o
       - gpt-5.1
   - name: opencode-go
     base_url: https://opencode.ai/zen/go
-    api_key_env: OPENCODE_ZEN_KEY
     format: openai
     models:
       - opencode-go/deepseek-v4-flash
@@ -35,7 +32,6 @@ providers:
       - opencode-go/qwen3.7-max
   - name: zen
     base_url: https://opencode.ai/zen
-    api_key_env: OPENCODE_ZEN_KEY
     format: openai
     models:
       - deepseek-v4-flash-free
@@ -43,33 +39,28 @@ providers:
       - gpt-5.1
   - name: groq
     base_url: https://api.groq.com/openai/v1
-    api_key_env: GROQ_API_KEY
     format: openai
     models:
       - llama-3.3-70b-versatile
   - name: xai
     base_url: https://api.x.ai/v1
-    api_key_env: XAI_API_KEY
     format: openai
     models:
       - grok-4
   - name: google
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
-    api_key_env: GOOGLE_API_KEY
     format: openai
     models:
       - gemini-2.5-pro
       - gemini-2.5-flash
   - name: deepseek
     base_url: https://api.deepseek.com
-    api_key_env: DEEPSEEK_API_KEY
     format: openai
     models:
       - deepseek-chat
       - deepseek-reasoner
   - name: openrouter
     base_url: https://openrouter.ai/api/v1
-    api_key_env: OPENROUTER_API_KEY
     format: openai
     headers:
       HTTP-Referer: https://github.com/gsporto226/local-proxy
@@ -78,7 +69,6 @@ providers:
       - openrouter/auto
   - name: neuralwatt
     base_url: https://api.neuralwatt.com/v1
-    api_key_env: NEURALWATT_API_KEY
     format: openai
     models:
       - gemma-4-31b

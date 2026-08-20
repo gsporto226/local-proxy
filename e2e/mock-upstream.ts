@@ -115,8 +115,8 @@ export function mockConfig(
     opts.apiKeys && opts.apiKeys.length
       ? `  api_keys:\n${opts.apiKeys.map((k) => `    - ${k}`).join("\n")}`
       : "  api_keys: []";
-  // Inline api_key makes every provider "connected" (has a resolvable key) so
-  // the proxy can route to it under the active-model semantics.
+  // Providers get keys only from auth.json (see mock.test.ts, which seeds
+  // `mock_openai`/`mock_anthropic` there so the proxy sees them as connected).
   const active = opts.activeModel
     ? `  active_model: ${opts.activeModel}\n`
     : "";
@@ -130,11 +130,9 @@ ${apiKeys}
 providers:
   - name: mock_openai
     base_url: ${mockBase}
-    api_key: test-key
     format: openai
   - name: mock_anthropic
     base_url: ${mockBase}
-    api_key: test-key
     format: anthropic
 
 routes:

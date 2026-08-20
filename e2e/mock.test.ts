@@ -1,4 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
+import { existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
   eventNames,
@@ -12,6 +14,38 @@ import {
   type ProxyHandle,
 } from "./helpers";
 import { mockConfig, startMockUpstream, type MockUpstream } from "./mock-upstream";
+
+// Providers get their API keys only from the global auth store (auth.json), so
+// seed the mock providers there for the duration of this suite, restoring the
+// user's real auth file afterwards.
+function globalConfigDir(): string {
+  if (process.platform === "win32") {
+    return join(process.env.APPDATA ?? "", "local-proxy", "config");
+  }
+  return join(process.env.HOME ?? process.env.USERPROFILE ?? "", ".config", "local-proxy");
+}
+const authPath = join(globalConfigDir(), "auth.json");
+let authBackup: string | null = null;
+
+beforeAll(() => {
+  if (existsSync(authPath)) {
+    authBackup = readFileSync(authPath, "utf8");
+  }
+  mkdirSync(globalConfigDir(), { recursive: true });
+  const auth = existsSync(authPath) ? JSON.parse(readFileSync(authPath, "utf8")) : {};
+  for (const p of ["mock_openai", "mock_anthropic"]) {
+    auth[p] = { type: "api", key: "test-key" };
+  }
+  writeFileSync(authPath, JSON.stringify(auth, null, 2));
+});
+
+afterAll(() => {
+  if (authBackup === null) {
+    rmSync(authPath, { force: true });
+  } else {
+    writeFileSync(authPath, authBackup);
+  }
+});
 
 /**
  * Start a mock upstream plus a proxy whose active model routes to a specific

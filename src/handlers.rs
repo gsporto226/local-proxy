@@ -418,6 +418,13 @@ fn passthrough_stream(resp: reqwest::Response, capture: Option<StreamCapture>) -
         .unwrap_or_else(|_| StatusCode::BAD_GATEWAY.into_response())
 }
 
+fn is_connected(state: &RuntimeState, provider: &str) -> bool {
+    state
+        .clients
+        .get(provider)
+        .is_some_and(crate::upstream::ProviderClient::has_key)
+}
+
 fn resolve_model(state: &RuntimeState) -> Result<(Arc<crate::config::Provider>, String), ApiError> {
     // The proxy never uses the model requested by the harness. It routes through
     // the explicitly selected active model, or the first model available from a
@@ -426,11 +433,13 @@ fn resolve_model(state: &RuntimeState) -> Result<(Arc<crate::config::Provider>, 
         model
     } else {
         let first = state.config.providers.iter().find_map(|p| {
-            let connected = state
-                .clients
-                .get(&p.name)
-                .is_some_and(crate::upstream::ProviderClient::has_key);
-            connected.then(|| p.models.first().cloned()).flatten()
+            is_connected(state, &p.name)
+                .then(|| {
+                    p.models
+                        .first()
+                        .map(|m| crate::config::qualified_id(&p.name, m))
+                })
+                .flatten()
         });
         first.ok_or_else(|| {
             ApiError::bad_request(
@@ -438,10 +447,18 @@ fn resolve_model(state: &RuntimeState) -> Result<(Arc<crate::config::Provider>, 
             )
         })?
     };
+    let is_connected = |name: &str| is_connected(state, name);
     let resolved = state
         .router
-        .resolve_model(&requested)
+        .resolve_model(&requested, &is_connected)
         .map_err(ApiError::from)?;
+    if !is_connected(&resolved.provider.name) {
+        return Err(ApiError::bad_request(format!(
+            "model '{requested}' resolves to provider '{}' which has no API key; \
+             connect it via `local-proxy connect {}` or select a connected model",
+            resolved.provider.name, resolved.provider.name
+        )));
+    }
     Ok((resolved.provider, resolved.upstream_model))
 }
 
@@ -1306,8 +1323,6 @@ mod tests {
                 crate::config::Provider {
                     name: "openai".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),
-                    api_key_env: None,
-                    api_key: Some("sk".to_string()),
                     format: ProviderFormat::Openai,
                     models: vec!["gpt-4o".to_string()],
                     headers: std::collections::HashMap::new(),
@@ -1315,8 +1330,6 @@ mod tests {
                 crate::config::Provider {
                     name: "anthropic".to_string(),
                     base_url: "https://api.anthropic.com".to_string(),
-                    api_key_env: None,
-                    api_key: None,
                     format: ProviderFormat::Anthropic,
                     models: vec!["claude-sonnet-4-5".to_string()],
                     headers: std::collections::HashMap::new(),
@@ -1334,6 +1347,18 @@ mod tests {
             },
             exec: crate::config::Exec::default(),
         });
+        let mut clients = HashMap::new();
+        let openai = cfg
+            .providers
+            .iter()
+            .find(|p| p.name == "openai")
+            .expect("openai provider")
+            .clone();
+        clients.insert(
+            "openai".to_string(),
+            crate::upstream::ProviderClient::new(&openai, false, Some("sk".to_string()))
+                .expect("client"),
+        );
         let state = RuntimeState {
             config: cfg.clone(),
             router: Arc::new(Router::new(cfg).unwrap()),
@@ -1354,8 +1379,6 @@ mod tests {
             providers: vec![crate::config::Provider {
                 name: "openai".to_string(),
                 base_url: "https://api.openai.com/v1".to_string(),
-                api_key_env: None,
-                api_key: Some("sk".to_string()),
                 format: ProviderFormat::Openai,
                 models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
                 headers: std::collections::HashMap::new(),
@@ -1367,10 +1390,22 @@ mod tests {
             },
             exec: crate::config::Exec::default(),
         });
+        let mut clients = HashMap::new();
+        let openai = cfg
+            .providers
+            .iter()
+            .find(|p| p.name == "openai")
+            .expect("openai provider")
+            .clone();
+        clients.insert(
+            "openai".to_string(),
+            crate::upstream::ProviderClient::new(&openai, false, Some("sk".to_string()))
+                .expect("client"),
+        );
         let state = RuntimeState {
             config: cfg.clone(),
-            router: Arc::new(Router::new(cfg.clone()).unwrap()),
-            clients: Arc::new(build_clients(&cfg).expect("clients")),
+            router: Arc::new(Router::new(cfg).unwrap()),
+            clients: Arc::new(clients),
             config_path: PathBuf::new(),
         };
         let (provider, upstream) = resolve_model(&state).expect("resolves");
@@ -1385,8 +1420,6 @@ mod tests {
             providers: vec![crate::config::Provider {
                 name: "openai".to_string(),
                 base_url: "https://api.openai.com/v1".to_string(),
-                api_key_env: None,
-                api_key: None,
                 format: ProviderFormat::Openai,
                 models: vec!["gpt-4o".to_string()],
                 headers: std::collections::HashMap::new(),
@@ -1476,5 +1509,33 @@ mod tests {
     fn exec_messages_response_carries_output() {
         let resp = exec_messages_response("hello\nworld", "gpt-4o");
         assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    #[test]
+    fn active_model_to_unconnected_provider_errors_clearly() {
+        let cfg = Arc::new(Config {
+            server: crate::config::Server::default(),
+            providers: vec![crate::config::Provider {
+                name: "neuralwatt".to_string(),
+                base_url: "https://api.neuralwatt.com/v1".to_string(),
+                format: ProviderFormat::Openai,
+                models: vec!["glm-5.2".to_string()],
+                headers: std::collections::HashMap::new(),
+            }],
+            routes: Vec::new(),
+            defaults: crate::config::Defaults {
+                provider: "neuralwatt".to_string(),
+                active_model: Some("glm-5.2".to_string()),
+            },
+            exec: crate::config::Exec::default(),
+        });
+        let state = RuntimeState {
+            config: cfg.clone(),
+            router: Arc::new(Router::new(cfg).unwrap()),
+            clients: Arc::new(HashMap::new()),
+            config_path: PathBuf::new(),
+        };
+        let err = resolve_model(&state).expect_err("unconnected provider is an error");
+        assert!(err.message.contains("no API key"), "got: {}", err.message);
     }
 }

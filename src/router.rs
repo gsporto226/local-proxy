@@ -84,11 +84,22 @@ impl Router {
 
     /// Resolve `model` to the provider and upstream model that should serve it.
     ///
+    /// `is_connected` reports whether a provider currently has a resolvable key;
+    /// it is used to prefer connected providers when several serve the same
+    /// model. An explicit route, `provider/model` syntax, or prefix always wins;
+    /// among the native-model-list matches a connected provider is preferred, and
+    /// an unconnected match is returned only so the caller can surface a clear
+    /// error instead of forwarding without a key.
+    ///
     /// # Errors
     ///
     /// Returns [`RouterError::ModelNotFound`] if no route, provider, or default
     /// matches `model`.
-    pub fn resolve_model(&self, model: &str) -> Result<ResolvedRoute, RouterError> {
+    pub fn resolve_model(
+        &self,
+        model: &str,
+        is_connected: &dyn Fn(&str) -> bool,
+    ) -> Result<ResolvedRoute, RouterError> {
         if let Some(&route_idx) = self.exact.get(model) {
             return Ok(self.resolve_route(route_idx, model));
         }
@@ -114,13 +125,26 @@ impl Router {
             return Ok(self.resolve_route(route_idx, model));
         }
 
+        let mut unconnected: Option<Arc<Provider>> = None;
         for provider in &self.config.providers {
             if provider.models.iter().any(|m| m == model) {
-                return Ok(ResolvedRoute {
-                    provider: Arc::new(provider.clone()),
-                    upstream_model: model.to_string(),
-                });
+                let p = Arc::new(provider.clone());
+                if is_connected(&provider.name) {
+                    return Ok(ResolvedRoute {
+                        provider: p,
+                        upstream_model: model.to_string(),
+                    });
+                }
+                if unconnected.is_none() {
+                    unconnected = Some(p);
+                }
             }
+        }
+        if let Some(provider) = unconnected {
+            return Ok(ResolvedRoute {
+                provider,
+                upstream_model: model.to_string(),
+            });
         }
 
         if let Some(provider_idx) = self.default_provider {
@@ -180,8 +204,6 @@ mod tests {
                 Provider {
                     name: "anthropic".to_string(),
                     base_url: "https://api.anthropic.com".to_string(),
-                    api_key_env: Some("ANTHROPIC_API_KEY".to_string()),
-                    api_key: None,
                     format: ProviderFormat::Anthropic,
                     models: vec!["claude-native-1".to_string()],
                     headers: std::collections::HashMap::new(),
@@ -189,8 +211,6 @@ mod tests {
                 Provider {
                     name: "openai".to_string(),
                     base_url: "https://api.openai.com/v1".to_string(),
-                    api_key_env: Some("OPENAI_API_KEY".to_string()),
-                    api_key: None,
                     format: ProviderFormat::Openai,
                     models: vec!["gpt-native-1".to_string()],
                     headers: std::collections::HashMap::new(),
@@ -237,7 +257,7 @@ mod tests {
     #[test]
     fn exact_route_match_wins() {
         let router = router_for(config());
-        let resolved = router.resolve_model("gpt-4o").unwrap();
+        let resolved = router.resolve_model("gpt-4o", &|_| true).unwrap();
         assert_eq!(resolved.provider.name, "openai");
         assert_eq!(resolved.upstream_model, "gpt-4o");
     }
@@ -247,14 +267,16 @@ mod tests {
         let mut c = config();
         c.routes[0].upstream_model = Some("gpt-4o-mini".to_string());
         let router = router_for(c);
-        let resolved = router.resolve_model("gpt-4o").unwrap();
+        let resolved = router.resolve_model("gpt-4o", &|_| true).unwrap();
         assert_eq!(resolved.upstream_model, "gpt-4o-mini");
     }
 
     #[test]
     fn provider_slash_model_syntax() {
         let router = router_for(config());
-        let resolved = router.resolve_model("openai/gpt-anything").unwrap();
+        let resolved = router
+            .resolve_model("openai/gpt-anything", &|_| true)
+            .unwrap();
         assert_eq!(resolved.provider.name, "openai");
         assert_eq!(resolved.upstream_model, "gpt-anything");
     }
@@ -262,7 +284,7 @@ mod tests {
     #[test]
     fn provider_slash_model_unknown_provider_ignored() {
         let router = router_for(config());
-        let resolved = router.resolve_model("nope/foo").unwrap();
+        let resolved = router.resolve_model("nope/foo", &|_| true).unwrap();
         assert_eq!(resolved.provider.name, "anthropic");
         assert_eq!(resolved.upstream_model, "nope/foo");
     }
@@ -270,11 +292,13 @@ mod tests {
     #[test]
     fn prefix_longest_match_wins() {
         let router = router_for(config());
-        let resolved = router.resolve_model("claude-sonnet-4-5").unwrap();
+        let resolved = router
+            .resolve_model("claude-sonnet-4-5", &|_| true)
+            .unwrap();
         assert_eq!(resolved.provider.name, "openai");
         assert_eq!(resolved.upstream_model, "kimi-k2.6");
 
-        let resolved = router.resolve_model("claude-opus-3").unwrap();
+        let resolved = router.resolve_model("claude-opus-3", &|_| true).unwrap();
         assert_eq!(resolved.provider.name, "anthropic");
         assert_eq!(resolved.upstream_model, "claude-opus-4-1");
     }
@@ -282,15 +306,36 @@ mod tests {
     #[test]
     fn native_models_list_match() {
         let router = router_for(config());
-        let resolved = router.resolve_model("gpt-native-1").unwrap();
+        let resolved = router.resolve_model("gpt-native-1", &|_| true).unwrap();
         assert_eq!(resolved.provider.name, "openai");
         assert_eq!(resolved.upstream_model, "gpt-native-1");
     }
 
     #[test]
+    fn native_list_prefers_connected_provider() {
+        let mut c = config();
+        // both anthropic and openai list the same native model
+        c.providers[0].models = vec!["shared".to_string()];
+        c.providers[1].models = vec!["shared".to_string()];
+        let router = router_for(c);
+
+        // openai is connected -> it wins even though anthropic is listed first
+        let resolved = router
+            .resolve_model("shared", &|name| name == "openai")
+            .unwrap();
+        assert_eq!(resolved.provider.name, "openai");
+
+        // no connected provider -> falls back to the first (unconnected) match
+        let resolved = router.resolve_model("shared", &|_| false).unwrap();
+        assert_eq!(resolved.provider.name, "anthropic");
+    }
+
+    #[test]
     fn default_provider_fallback() {
         let router = router_for(config());
-        let resolved = router.resolve_model("totally-unknown-model").unwrap();
+        let resolved = router
+            .resolve_model("totally-unknown-model", &|_| true)
+            .unwrap();
         assert_eq!(resolved.provider.name, "anthropic");
         assert_eq!(resolved.upstream_model, "totally-unknown-model");
     }
@@ -298,7 +343,9 @@ mod tests {
     #[test]
     fn model_not_found_without_default() {
         let router = router_for(no_default_config());
-        let err = router.resolve_model("totally-unknown-model").unwrap_err();
+        let err = router
+            .resolve_model("totally-unknown-model", &|_| true)
+            .unwrap_err();
         assert!(matches!(err, RouterError::ModelNotFound { .. }));
     }
 

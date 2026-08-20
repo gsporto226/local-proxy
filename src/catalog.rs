@@ -78,12 +78,10 @@ mod tests {
             r"providers:
   - name: anthropic
     base_url: https://api.anthropic.com
-    api_key_env: ANTHROPIC_API_KEY
     format: anthropic
     models: [claude-sonnet-4-5]
   - name: openai
     base_url: https://api.openai.com/v1
-    api_key_env: OPENAI_API_KEY
     format: openai
     models: [gpt-4o]
 routes:
