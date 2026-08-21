@@ -168,7 +168,7 @@ impl From<RouterError> for ApiError {
     fn from(e: RouterError) -> Self {
         match e {
             RouterError::ModelNotFound { model } => {
-                Self::not_found(format!("model not found: {model}"))
+                Self::not_found(format!("proxy: unknown model {model}"))
             }
             RouterError::ProviderNotFound { provider } => {
                 Self::internal(format!("provider not configured: {provider}"))
@@ -232,5 +232,6 @@ mod tests {
         });
         assert_eq!(err.status, 404);
         assert_eq!(err.kind, "not_found_error");
+        assert_eq!(err.message, "proxy: unknown model nope");
     }
 }

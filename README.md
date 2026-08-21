@@ -162,7 +162,9 @@ Per request, the key resolution reads `auth.json[provider]`. That is the only so
 
 ### Active model
 
-The proxy never uses the model the harness asks for, for example `ANTHROPIC_MODEL` from Claude Code. It routes by the active model, written as `provider/model`: the explicitly selected model, else the first model from a connected provider, else an error. A provider counts as connected when it has a key in `auth.json`.
+**The model the client sends in the request wins.** Each request resolves the client's model through the router — exact route, `provider/model` syntax, longest prefix, then the provider's native model list. A client model that matches none of these is rejected with `proxy: unknown model <model>`; the proxy does not silently route it elsewhere.
+
+When the client sends **no model** (or an empty one), the proxy falls back to its own override: the explicitly selected active model, else the first model from a connected provider, else an error. This override can be pinned for a specific instance with `serve --model <model>` (or `launch ... --model <model>`), which sets it in memory without persisting it. A provider counts as connected when it has a key in `auth.json`.
 
 Selection and query happen through the CLI or through `$proxy`, with the same validation logic:
 
@@ -219,7 +221,7 @@ local-proxy launch cursor               # runs the `cursor` binary against the p
 local-proxy launch cursor --dry-run     # print the env without running it
 ```
 
-`launch cursor` sets `ANTHROPIC_BASE_URL` (and `OPENAI_API_BASE`, `OPENAI_API_KEY` as a convenience) and prints the target `Override OpenAI Base URL` for Cursor's Settings. Since Cursor has no `--model` flag of its own, pin the proxy's active model first with `local-proxy model <provider>/<model>`; the `--model` flag is ignored for the cursor target. If you prefer to configure Cursor through its UI instead of environment variables, set **Settings → Models → Override OpenAI Base URL** to the printed `http://127.0.0.1:<port>/v1` URL.
+`launch cursor` sets `ANTHROPIC_BASE_URL` (and `OPENAI_API_BASE`, `OPENAI_API_KEY` as a convenience) and prints the target `Override OpenAI Base URL` for Cursor's Settings. Since Cursor has no `--model` flag of its own, the model Cursor requests routes directly through the proxy (client model wins). To force a fallback for requests that send no model, pass `launch cursor --model <provider>/<model>` — it seeds the proxy instance's override (`serve --model`) without persisting it. If you prefer to configure Cursor through its UI instead of environment variables, set **Settings → Models → Override OpenAI Base URL** to the printed `http://127.0.0.1:<port>/v1` URL.
 
 ## The `$proxy` executor
 

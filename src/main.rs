@@ -38,6 +38,9 @@ enum Command {
         /// Check once at startup for a newer release and warn in the log
         #[arg(long)]
         check_update: bool,
+        /// Override model used when the client sends none (instance-only)
+        #[arg(long)]
+        model: Option<String>,
         /// Managed instance: skip the shared pid file (used by `launch`)
         #[arg(long, hide = true)]
         ephemeral: bool,
@@ -159,12 +162,13 @@ fn main() -> miette::Result<()> {
     let cli = Cli::parse();
     let config = cli::resolve_config_path(cli.config);
     match cli.command {
-        None => block_on(cli::serve(config, None, None, false, false, false)),
+        None => block_on(cli::serve(config, None, None, false, false, false, None)),
         Some(Command::Serve {
             host,
             port,
             background,
             check_update,
+            model,
             ephemeral,
         }) => block_on(cli::serve(
             config,
@@ -173,6 +177,7 @@ fn main() -> miette::Result<()> {
             background,
             check_update,
             ephemeral,
+            model,
         )),
         Some(Command::Launch {
             tool,

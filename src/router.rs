@@ -91,6 +91,12 @@ impl Router {
     /// an unconnected match is returned only so the caller can surface a clear
     /// error instead of forwarding without a key.
     ///
+    /// When `strict` is true the default-provider fallback is skipped, so an
+    /// unmatched model returns [`RouterError::ModelNotFound`]. Strict mode is
+    /// used for client-provided model names: a client must send a model the
+    /// proxy knows how to route, and sending an unknown one is an error rather
+    /// than a silent default.
+    ///
     /// # Errors
     ///
     /// Returns [`RouterError::ModelNotFound`] if no route, provider, or default
@@ -99,6 +105,29 @@ impl Router {
         &self,
         model: &str,
         is_connected: &dyn Fn(&str) -> bool,
+    ) -> Result<ResolvedRoute, RouterError> {
+        self.resolve_model_impl(model, is_connected, false)
+    }
+
+    /// Resolve a client-provided model strictly: no default-provider fallback.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`RouterError::ModelNotFound`] if no route, provider, or native
+    /// model matches `model`.
+    pub fn resolve_client_model(
+        &self,
+        model: &str,
+        is_connected: &dyn Fn(&str) -> bool,
+    ) -> Result<ResolvedRoute, RouterError> {
+        self.resolve_model_impl(model, is_connected, true)
+    }
+
+    fn resolve_model_impl(
+        &self,
+        model: &str,
+        is_connected: &dyn Fn(&str) -> bool,
+        strict: bool,
     ) -> Result<ResolvedRoute, RouterError> {
         if let Some(&route_idx) = self.exact.get(model) {
             return Ok(self.resolve_route(route_idx, model));
@@ -147,11 +176,13 @@ impl Router {
             });
         }
 
-        if let Some(provider_idx) = self.default_provider {
-            return Ok(ResolvedRoute {
-                provider: Arc::new(self.config.providers[provider_idx].clone()),
-                upstream_model: model.to_string(),
-            });
+        if !strict {
+            if let Some(provider_idx) = self.default_provider {
+                return Ok(ResolvedRoute {
+                    provider: Arc::new(self.config.providers[provider_idx].clone()),
+                    upstream_model: model.to_string(),
+                });
+            }
         }
 
         Err(RouterError::ModelNotFound {
@@ -339,6 +370,24 @@ mod tests {
             .unwrap();
         assert_eq!(resolved.provider.name, "anthropic");
         assert_eq!(resolved.upstream_model, "totally-unknown-model");
+    }
+
+    #[test]
+    fn client_strict_resolution_skips_default_fallback() {
+        let router = router_for(config());
+        // The default provider (anthropic) is set, but strict client resolution
+        // must not fall back to it for an unknown model.
+        let err = router
+            .resolve_client_model("totally-unknown-model", &|_| true)
+            .unwrap_err();
+        assert!(matches!(err, RouterError::ModelNotFound { .. }));
+
+        // A known native model still resolves in strict mode.
+        let resolved = router
+            .resolve_client_model("gpt-native-1", &|_| true)
+            .unwrap();
+        assert_eq!(resolved.provider.name, "openai");
+        assert_eq!(resolved.upstream_model, "gpt-native-1");
     }
 
     #[test]

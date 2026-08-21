@@ -5,6 +5,7 @@ use std::io;
 use std::net::{TcpListener, TcpStream, ToSocketAddrs};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::sync::Arc;
 use std::time::Duration;
 
 use std::collections::HashMap;
@@ -304,6 +305,7 @@ pub async fn serve(
     background: bool,
     check_update: bool,
     ephemeral: bool,
+    model_override: Option<String>,
 ) -> miette::Result<()> {
     if background {
         let mut args = vec![
@@ -324,6 +326,10 @@ pub async fn serve(
         }
         if ephemeral {
             args.push("--ephemeral".to_string());
+        }
+        if let Some(m) = model_override {
+            args.push("--model".to_string());
+            args.push(m);
         }
         let child = spawn_background(&args).map_err(CliError::from)?;
         println!(
@@ -347,8 +353,17 @@ pub async fn serve(
             );
         }
     }
-    let runtime = handlers::build_runtime_state(&config_path).map_err(CliError::from)?;
+    let mut runtime = handlers::build_runtime_state(&config_path).map_err(CliError::from)?;
     tracing::info!(target: crate::LOG_TARGET, path = %config_path.display(), "loaded config");
+
+    // `serve --model <model>` seeds this instance's override model in memory
+    // (never persisted). It acts as the fallback used when a client sends no
+    // model; a client-sent model always wins.
+    if let Some(m) = model_override.filter(|m| !m.is_empty()) {
+        let mut cfg = (*runtime.config).clone();
+        cfg.defaults.active_model = Some(m);
+        runtime.config = Arc::new(cfg);
+    }
 
     let host = host_flag.unwrap_or_else(|| runtime.config.server.host.clone());
     let port = port_flag.unwrap_or(runtime.config.server.port);
@@ -476,16 +491,21 @@ fn start_ephemeral_proxy(
     host: &str,
     port: u16,
     config_path: &Path,
+    model: Option<&str>,
 ) -> Result<std::process::Child, CliError> {
-    let mut child = spawn_launch_proxy(&[
+    let mut args = vec![
         "serve".to_string(),
         "--config".to_string(),
         config_path.display().to_string(),
         "--port".to_string(),
         port.to_string(),
         "--ephemeral".to_string(),
-    ])
-    .map_err(CliError::from)?;
+    ];
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        args.push("--model".to_string());
+        args.push(m.to_string());
+    }
+    let mut child = spawn_launch_proxy(&args).map_err(CliError::from)?;
     println!("proxy started in background (pid {})", child.id());
 
     let mut up = false;
@@ -537,7 +557,7 @@ pub fn launch(
     let proxy = if dry_run {
         None
     } else {
-        Some(start_ephemeral_proxy(&host, port, &config_path)?)
+        Some(start_ephemeral_proxy(&host, port, &config_path, model)?)
     };
 
     let (env, oai_base) = tool_launch_env(&config, port, model, tool_cmd);

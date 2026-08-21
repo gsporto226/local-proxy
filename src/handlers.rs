@@ -436,11 +436,18 @@ fn is_connected(state: &RuntimeState, provider: &str) -> bool {
         .is_some_and(crate::upstream::ProviderClient::has_key)
 }
 
-fn resolve_model(state: &RuntimeState) -> Result<(Arc<crate::config::Provider>, String), ApiError> {
-    // The proxy never uses the model requested by the harness. It routes through
-    // the explicitly selected active model, or the first model available from a
-    // connected provider, or errors if no model is available.
-    let requested = if let Some(model) = state.config.defaults.active_model.clone() {
+fn resolve_model(
+    state: &RuntimeState,
+    client_model: Option<&str>,
+) -> Result<(Arc<crate::config::Provider>, String), ApiError> {
+    // The client's requested model wins: it is resolved through the router and
+    // must match a configured route/provider/native model. When the client sends
+    // no model, the proxy falls back to its own override (active model), then
+    // the first model available from a connected provider.
+    let client_sent = client_model.is_some_and(|m| !m.is_empty());
+    let requested = if client_sent {
+        client_model.unwrap_or_default().to_string()
+    } else if let Some(model) = state.config.defaults.active_model.clone() {
         model
     } else {
         let first = state.config.providers.iter().find_map(|p| {
@@ -459,10 +466,20 @@ fn resolve_model(state: &RuntimeState) -> Result<(Arc<crate::config::Provider>, 
         })?
     };
     let is_connected = |name: &str| is_connected(state, name);
-    let resolved = state
-        .router
-        .resolve_model(&requested, &is_connected)
-        .map_err(ApiError::from)?;
+    // A client-provided model is resolved strictly (no default-provider
+    // fallback), so an unknown model fails loudly instead of silently routing
+    // elsewhere. The proxy-override path keeps the default fallback.
+    let resolved = if client_sent {
+        state
+            .router
+            .resolve_client_model(&requested, &is_connected)
+            .map_err(ApiError::from)?
+    } else {
+        state
+            .router
+            .resolve_model(&requested, &is_connected)
+            .map_err(ApiError::from)?
+    };
     if !is_connected(&resolved.provider.name) {
         return Err(ApiError::bad_request(format!(
             "model '{requested}' resolves to provider '{}' which has no API key; \
@@ -741,7 +758,8 @@ async fn handle_messages(
     }
 
     let streaming = wants_stream(&body);
-    let (provider, upstream_model) = resolve_model(state)?;
+    let client_model = body.get("model").and_then(Value::as_str);
+    let (provider, upstream_model) = resolve_model(state, client_model)?;
     tracing::info!(
         target: crate::LOG_TARGET,
         endpoint = "/v1/messages",
@@ -902,7 +920,8 @@ async fn handle_chat_completions(
     }
 
     let streaming = wants_stream(&body);
-    let (provider, upstream_model) = resolve_model(state)?;
+    let client_model = body.get("model").and_then(Value::as_str);
+    let (provider, upstream_model) = resolve_model(state, client_model)?;
     tracing::info!(
         target: crate::LOG_TARGET,
         endpoint = "/v1/chat/completions",
@@ -1063,7 +1082,8 @@ async fn handle_responses(
     }
 
     let streaming = wants_stream(&body);
-    let (provider, upstream_model) = resolve_model(state)?;
+    let client_model = body.get("model").and_then(Value::as_str);
+    let (provider, upstream_model) = resolve_model(state, client_model)?;
     tracing::info!(
         target: crate::LOG_TARGET,
         endpoint = "/v1/responses",
@@ -1350,7 +1370,7 @@ mod tests {
     }
 
     #[test]
-    fn active_model_overrides_harness_model_in_routing() {
+    fn client_unknown_model_fails_even_with_active_model() {
         let cfg = Arc::new(Config {
             server: crate::config::Server::default(),
             providers: vec![
@@ -1401,8 +1421,66 @@ mod tests {
             config_path: PathBuf::new(),
         };
 
-        // The harness asks for an unknown model, but active_model forces gpt-4o.
-        let (provider, upstream) = resolve_model(&state).expect("resolves");
+        // A client-sent model that does not resolve fails with `proxy: unknown
+        // model`, regardless of the configured active_model fallback.
+        let err = resolve_model(&state, Some("totally-unknown")).expect_err("unknown model");
+        assert_eq!(err.message, "proxy: unknown model totally-unknown");
+    }
+
+    #[test]
+    fn client_model_wins_over_active_model() {
+        let cfg = Arc::new(Config {
+            server: crate::config::Server::default(),
+            providers: vec![
+                crate::config::Provider {
+                    name: "openai".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    format: ProviderFormat::Openai,
+                    models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
+                    headers: std::collections::HashMap::new(),
+                },
+                crate::config::Provider {
+                    name: "anthropic".to_string(),
+                    base_url: "https://api.anthropic.com".to_string(),
+                    format: ProviderFormat::Anthropic,
+                    models: vec!["claude-sonnet-4-5".to_string()],
+                    headers: std::collections::HashMap::new(),
+                },
+            ],
+            routes: Vec::new(),
+            defaults: crate::config::Defaults {
+                provider: "openai".to_string(),
+                active_model: Some("gpt-4o".to_string()),
+            },
+            exec: crate::config::Exec::default(),
+            statusline: crate::config::StatuslineConfig::default(),
+        });
+        let mut clients = HashMap::new();
+        let openai = cfg
+            .providers
+            .iter()
+            .find(|p| p.name == "openai")
+            .expect("openai provider")
+            .clone();
+        clients.insert(
+            "openai".to_string(),
+            crate::upstream::ProviderClient::new(&openai, false, Some("sk".to_string()))
+                .expect("client"),
+        );
+        let state = RuntimeState {
+            config: cfg.clone(),
+            router: Arc::new(Router::new(cfg).unwrap()),
+            clients: Arc::new(clients),
+            config_path: PathBuf::new(),
+        };
+
+        // Active model is gpt-4o, but the client asks for gpt-4o-mini: client wins.
+        let (provider, upstream) = resolve_model(&state, Some("gpt-4o-mini")).expect("resolves");
+        assert_eq!(provider.name, "openai");
+        assert_eq!(upstream, "gpt-4o-mini");
+
+        // Client sends no model: the active_model fallback applies.
+        let (provider, upstream) = resolve_model(&state, None).expect("resolves");
         assert_eq!(provider.name, "openai");
         assert_eq!(upstream, "gpt-4o");
     }
@@ -1444,7 +1522,7 @@ mod tests {
             clients: Arc::new(clients),
             config_path: PathBuf::new(),
         };
-        let (provider, upstream) = resolve_model(&state).expect("resolves");
+        let (provider, upstream) = resolve_model(&state, None).expect("resolves");
         assert_eq!(provider.name, "openai");
         assert_eq!(upstream, "gpt-4o");
     }
@@ -1474,7 +1552,7 @@ mod tests {
             clients: Arc::new(HashMap::new()),
             config_path: PathBuf::new(),
         };
-        assert!(resolve_model(&state).is_err());
+        assert!(resolve_model(&state, None).is_err());
     }
 
     fn block_on<F: std::future::Future>(fut: F) -> F::Output {
@@ -1573,7 +1651,7 @@ mod tests {
             clients: Arc::new(HashMap::new()),
             config_path: PathBuf::new(),
         };
-        let err = resolve_model(&state).expect_err("unconnected provider is an error");
+        let err = resolve_model(&state, None).expect_err("unconnected provider is an error");
         assert!(err.message.contains("no API key"), "got: {}", err.message);
     }
 }

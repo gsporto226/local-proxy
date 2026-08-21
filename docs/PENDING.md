@@ -1,8 +1,25 @@
 # PENDING / status de trabalho
 
-Estado atual do proxy `local-proxy`. Última atualização: 2026-08-20.
+Estado atual do proxy `local-proxy`. Última atualização: 2026-08-21.
 
 ## ✅ TODAS AS TASKS CONCLUÍDAS (kanban: backend 001-004 + 006-009, qa 005 + 010 — todas `done`)
+
+### Nova rodada — modelo do cliente vence; override vira flag do proxy
+- **Inversão de precedência**: o modelo enviado pelo **cliente no corpo da request vence** e é roteado
+  pela router (rota exata, `provider/model`, prefixo, lista nativa). Modelo de cliente que não resolve
+  falha com `proxy: unknown model <model>` (404) — **sem** fallback para o provider default.
+- O override do proxy (`defaults.active_model`, `$proxy model`, `local-proxy model`) virou **fallback**
+  usado **somente quando o cliente não envia modelo** (campo ausente/vazio), com a mesma cadeia de antes
+  (ativo → primeiro de provider conectado → erro).
+- Nova flag **`serve --model <model>`** e **`launch ... --model <model>`**: semeia o override em memória
+  da instância (nunca persiste), repassada no respawn de background e no `launch`. Para Cursor, o modelo
+  que o cliente pede decide; a flag só força o fallback de requests sem modelo.
+- `Router::{resolve_model, resolve_client_model}`: `resolve_client_model` é **estrito** (sem fallback do
+  provider default), usado no caminho de modelo do cliente; `resolve_model` mantém o fallback para o
+  caminho do override.
+- Testes: 3 unit novos (client wins, unknown fail, strict skip-default) e 3 e2e novos (precedência,
+  fallback sem modelo, unknown 404). **153** unit verdes; fmt/clippy limpos; e2e mock **19** verdes.
+
 
 ### Commits
 - `3483446` — (001) scaffold: cargo, config YAML/JSON, router, CLI skeleton

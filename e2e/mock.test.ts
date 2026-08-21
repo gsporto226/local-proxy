@@ -49,8 +49,8 @@ afterAll(() => {
 
 /**
  * Start a mock upstream plus a proxy whose active model routes to a specific
- * provider. Under the active-model semantics the proxy ignores the requested
- * model and routes every request to the configured `activeModel`.
+ * provider. A client-sent model wins and routes via the defined routes; the
+ * configured `activeModel` is only the fallback used when a client sends none.
  */
 async function startScenario(activeModel: string, opts: { apiKeys?: string[] } = {}) {
   const mock = await startMockUpstream();
@@ -105,7 +105,7 @@ describe("e2e: proxy against a mock upstream (openai upstream)", () => {
 
   test("messages streaming via openai upstream -> Anthropic events", async () => {
     const r = await postJson(proxy.base, "/v1/messages", {
-      model: "ignored",
+      model: "claude-via-openai",
       max_tokens: 10,
       messages: [{ role: "user", content: "hi" }],
       stream: true,
@@ -134,7 +134,7 @@ describe("e2e: proxy against a mock upstream (openai upstream)", () => {
 
   test("responses streaming via openai upstream emits full sequence", async () => {
     const r = await postJson(proxy.base, "/v1/responses", {
-      model: "ignored",
+      model: "claude-via-openai",
       input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
       stream: true,
     });
@@ -157,7 +157,7 @@ describe("e2e: proxy against a mock upstream (openai upstream)", () => {
 
   test("messages non-streaming translates openai response to anthropic", async () => {
     const r = await postJson(proxy.base, "/v1/messages", {
-      model: "ignored",
+      model: "claude-via-openai",
       max_tokens: 10,
       messages: [{ role: "user", content: "hi" }],
     });
@@ -193,7 +193,7 @@ describe("e2e: proxy against a mock upstream (anthropic upstream)", () => {
 
   test("chat completions streaming via anthropic upstream -> OpenAI chunks", async () => {
     const r = await postJson(proxy.base, "/v1/chat/completions", {
-      model: "ignored",
+      model: "gpt-via-anthropic",
       messages: [{ role: "user", content: "hi" }],
       stream: true,
     });
@@ -215,7 +215,7 @@ describe("e2e: proxy against a mock upstream (anthropic upstream)", () => {
 
   test("responses streaming via anthropic upstream emits full sequence", async () => {
     const r = await postJson(proxy.base, "/v1/responses", {
-      model: "ignored",
+      model: "gpt-via-anthropic",
       input: [{ role: "user", content: [{ type: "input_text", text: "hi" }] }],
       stream: true,
     });
@@ -234,7 +234,7 @@ describe("e2e: proxy against a mock upstream (anthropic upstream)", () => {
 
   test("messages passthrough to anthropic upstream keeps raw events", async () => {
     const r = await postJson(proxy.base, "/v1/messages", {
-      model: "ignored",
+      model: "gpt-via-anthropic",
       max_tokens: 5,
       messages: [{ role: "user", content: "hi" }],
       stream: true,
@@ -248,7 +248,7 @@ describe("e2e: proxy against a mock upstream (anthropic upstream)", () => {
 
   test("chat completions non-streaming translates anthropic response to openai", async () => {
     const r = await postJson(proxy.base, "/v1/chat/completions", {
-      model: "ignored",
+      model: "gpt-via-anthropic",
       messages: [{ role: "user", content: "hi" }],
     });
     expect(r.status).toBe(200);
@@ -272,7 +272,7 @@ describe("e2e: upstream error is reformatted to client shape", () => {
 
   test("anthropic client sees the upstream error reformatted", async () => {
     const a = await postJson(proxy.base, "/v1/messages", {
-      model: "ignored",
+      model: "err",
       max_tokens: 5,
       messages: [{ role: "user", content: "hi" }],
     });
@@ -284,7 +284,7 @@ describe("e2e: upstream error is reformatted to client shape", () => {
 
   test("openai client sees the upstream error reformatted", async () => {
     const o = await postJson(proxy.base, "/v1/chat/completions", {
-      model: "ignored",
+      model: "err",
       messages: [{ role: "user", content: "hi" }],
     });
     expect(o.status).toBe(401);
@@ -317,7 +317,7 @@ describe("e2e: auth with configured api_keys", () => {
     const r = await postJson(
       proxy.base,
       "/v1/chat/completions",
-      { model: "ignored", messages: [{ role: "user", content: "hi" }] },
+      { model: "gpt-via-anthropic", messages: [{ role: "user", content: "hi" }] },
       { "x-api-key": "sk-proxy" },
     );
     expect(r.status).toBe(200);
@@ -327,9 +327,66 @@ describe("e2e: auth with configured api_keys", () => {
     const r = await postJson(
       proxy.base,
       "/v1/chat/completions",
-      { model: "ignored", messages: [{ role: "user", content: "hi" }] },
+      { model: "gpt-via-anthropic", messages: [{ role: "user", content: "hi" }] },
       { authorization: "Bearer sk-proxy" },
     );
     expect(r.status).toBe(200);
+  });
+});
+
+describe("e2e: client-provided model takes precedence", () => {
+  let mock: MockUpstream;
+  let proxy: ProxyHandle;
+
+  beforeAll(async () => {
+    // Active model points at the anthropic upstream; the client will ask for a
+    // different route to prove the client wins.
+    const s = await startScenario("gpt-via-anthropic");
+    mock = s.mock;
+    proxy = s.proxy;
+  });
+
+  afterAll(() => stopScenario({ mock, proxy }));
+
+  test("can route to a different route than the active model", async () => {
+    // Active model = gpt-via-anthropic, but client asks for claude-via-openai.
+    const r = await postJson(proxy.base, "/v1/messages", {
+      model: "claude-via-openai",
+      max_tokens: 10,
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+    });
+    expect(r.status).toBe(200);
+    // openai upstream -> anthropic events (not the anthropic passthrough).
+    const frames = parseSse(await readBody(r));
+    expect(eventNames(frames).slice(0, 3)).toEqual([
+      "message_start",
+      "content_block_start",
+      "content_block_delta",
+    ]);
+  });
+
+  test("falls back to the active model when client sends no model", async () => {
+    const r = await postJson(proxy.base, "/v1/messages", {
+      max_tokens: 5,
+      messages: [{ role: "user", content: "hi" }],
+      stream: true,
+    });
+    expect(r.status).toBe(200);
+    // Active model gpt-via-anthropic -> anthropic passthrough raw events.
+    const text = await readBody(r);
+    expect(text).toContain("message_start");
+    expect(text).toContain("oi");
+  });
+
+  test("unknown client model is rejected with proxy: unknown model", async () => {
+    const r = await postJson(proxy.base, "/v1/messages", {
+      model: "no-such-route",
+      max_tokens: 10,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(r.status).toBe(404);
+    const body = JSON.parse(await readBody(r));
+    expect(body.error.message).toContain("proxy: unknown model no-such-route");
   });
 });
