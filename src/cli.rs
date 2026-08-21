@@ -298,6 +298,7 @@ fn load_config(config_path: &Path) -> Result<Config, CliError> {
 ///
 /// Returns an error if the config cannot be loaded, the router or clients
 /// cannot be built, the listener cannot bind, or serving fails.
+#[allow(clippy::too_many_arguments, clippy::fn_params_excessive_bools)]
 pub async fn serve(
     config_path: PathBuf,
     host_flag: Option<String>,
@@ -306,6 +307,7 @@ pub async fn serve(
     check_update: bool,
     ephemeral: bool,
     model_override: Option<String>,
+    enforce_active_model: bool,
 ) -> miette::Result<()> {
     if background {
         let mut args = vec![
@@ -358,11 +360,16 @@ pub async fn serve(
 
     // `serve --model <model>` seeds this instance's override model in memory
     // (never persisted). It acts as the fallback used when a client sends no
-    // model; a client-sent model always wins.
+    // model. `enforce_active_model` makes that override authoritative: a
+    // client-sent model is ignored, so the launched tool can never override the
+    // user's selection.
     if let Some(m) = model_override.filter(|m| !m.is_empty()) {
         let mut cfg = (*runtime.config).clone();
         cfg.defaults.active_model = Some(m);
         runtime.config = Arc::new(cfg);
+    }
+    if enforce_active_model {
+        runtime.enforce_active_model = true;
     }
 
     let host = host_flag.unwrap_or_else(|| runtime.config.server.host.clone());
@@ -492,6 +499,7 @@ fn start_ephemeral_proxy(
     port: u16,
     config_path: &Path,
     model: Option<&str>,
+    enforce_active_model: bool,
 ) -> Result<std::process::Child, CliError> {
     let mut args = vec![
         "serve".to_string(),
@@ -504,6 +512,9 @@ fn start_ephemeral_proxy(
     if let Some(m) = model.filter(|m| !m.is_empty()) {
         args.push("--model".to_string());
         args.push(m.to_string());
+    }
+    if enforce_active_model {
+        args.push("--enforce-active-model".to_string());
     }
     let mut child = spawn_launch_proxy(&args).map_err(CliError::from)?;
     println!("proxy started in background (pid {})", child.id());
@@ -557,7 +568,18 @@ pub fn launch(
     let proxy = if dry_run {
         None
     } else {
-        Some(start_ephemeral_proxy(&host, port, &config_path, model)?)
+        // Only Anthropic-compatible tools (claude, design) send their own model
+        // and must be pinned to the active model. Cursor is pinned via the
+        // `OPENAI_API_BASE` override and the shared `local-proxy model` setting,
+        // so it keeps client-driven selection.
+        let enforce = tool_cmd == "claude" || tool_cmd == "design";
+        Some(start_ephemeral_proxy(
+            &host,
+            port,
+            &config_path,
+            model,
+            enforce,
+        )?)
     };
 
     let (env, oai_base) = tool_launch_env(&config, port, model, tool_cmd);

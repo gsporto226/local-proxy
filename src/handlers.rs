@@ -36,6 +36,10 @@ pub struct RuntimeState {
     pub router: Arc<Router>,
     /// The built upstream clients, keyed by provider name.
     pub clients: Arc<HashMap<String, ProviderClient>>,
+    /// When true, requests that carry a client-sent model are forced to use the
+    /// proxy's `active_model` instead. Used by `local-proxy launch claude` so the
+    /// launched tool's own model selection never overrides the user's choice.
+    pub enforce_active_model: bool,
     /// The config file this instance was started with (used by `$proxy model`
     /// to persist the selection).
     pub config_path: PathBuf,
@@ -128,6 +132,7 @@ pub fn build_runtime_state(config_path: &Path) -> Result<RuntimeState, RuntimeEr
         config,
         router,
         clients,
+        enforce_active_model: false,
         config_path: config_path.to_path_buf(),
     })
 }
@@ -440,11 +445,15 @@ fn resolve_model(
     state: &RuntimeState,
     client_model: Option<&str>,
 ) -> Result<(Arc<crate::config::Provider>, String), ApiError> {
-    // The client's requested model wins: it is resolved through the router and
-    // must match a configured route/provider/native model. When the client sends
-    // no model, the proxy falls back to its own override (active model), then
-    // the first model available from a connected provider.
-    let client_sent = client_model.is_some_and(|m| !m.is_empty());
+    // Normally the client's requested model wins: it is resolved through the
+    // router and must match a configured route/provider/native model. When the
+    // client sends no model, the proxy falls back to its own override (active
+    // model), then the first model available from a connected provider.
+    //
+    // When `enforce_active_model` is set (e.g. via `local-proxy launch claude`),
+    // a client-sent model is ignored entirely so the user's active model is
+    // always the one routed, regardless of what the launched tool selects.
+    let client_sent = !state.enforce_active_model && client_model.is_some_and(|m| !m.is_empty());
     let requested = if client_sent {
         client_model.unwrap_or_default().to_string()
     } else if let Some(model) = state.config.defaults.active_model.clone() {
@@ -1298,6 +1307,7 @@ mod tests {
             config: Arc::new(cfg),
             router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
             clients: Arc::new(HashMap::new()),
+            enforce_active_model: false,
             config_path: PathBuf::new(),
         };
         let mut headers = HeaderMap::new();
@@ -1321,6 +1331,7 @@ mod tests {
             config: Arc::new(cfg),
             router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
             clients: Arc::new(HashMap::new()),
+            enforce_active_model: false,
             config_path: PathBuf::new(),
         };
         assert_eq!(authenticate(&state, &HeaderMap::new()).unwrap(), None);
@@ -1418,6 +1429,7 @@ mod tests {
             config: cfg.clone(),
             router: Arc::new(Router::new(cfg).unwrap()),
             clients: Arc::new(clients),
+            enforce_active_model: false,
             config_path: PathBuf::new(),
         };
 
@@ -1471,6 +1483,7 @@ mod tests {
             config: cfg.clone(),
             router: Arc::new(Router::new(cfg).unwrap()),
             clients: Arc::new(clients),
+            enforce_active_model: false,
             config_path: PathBuf::new(),
         };
 
@@ -1480,6 +1493,66 @@ mod tests {
         assert_eq!(upstream, "gpt-4o-mini");
 
         // Client sends no model: the active_model fallback applies.
+        let (provider, upstream) = resolve_model(&state, None).expect("resolves");
+        assert_eq!(provider.name, "openai");
+        assert_eq!(upstream, "gpt-4o");
+    }
+
+    #[test]
+    fn enforce_active_model_ignores_client_model() {
+        let cfg = Arc::new(Config {
+            server: crate::config::Server::default(),
+            providers: vec![
+                crate::config::Provider {
+                    name: "openai".to_string(),
+                    base_url: "https://api.openai.com/v1".to_string(),
+                    format: ProviderFormat::Openai,
+                    models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
+                    headers: std::collections::HashMap::new(),
+                },
+                crate::config::Provider {
+                    name: "anthropic".to_string(),
+                    base_url: "https://api.anthropic.com".to_string(),
+                    format: ProviderFormat::Anthropic,
+                    models: vec!["claude-sonnet-4-5".to_string()],
+                    headers: std::collections::HashMap::new(),
+                },
+            ],
+            routes: Vec::new(),
+            defaults: crate::config::Defaults {
+                provider: "openai".to_string(),
+                active_model: Some("gpt-4o".to_string()),
+            },
+            exec: crate::config::Exec::default(),
+            statusline: crate::config::StatuslineConfig::default(),
+        });
+        let mut clients = HashMap::new();
+        let openai = cfg
+            .providers
+            .iter()
+            .find(|p| p.name == "openai")
+            .expect("openai provider")
+            .clone();
+        clients.insert(
+            "openai".to_string(),
+            crate::upstream::ProviderClient::new(&openai, false, Some("sk".to_string()))
+                .expect("client"),
+        );
+        let state = RuntimeState {
+            config: cfg.clone(),
+            router: Arc::new(Router::new(cfg).unwrap()),
+            clients: Arc::new(clients),
+            enforce_active_model: true,
+            config_path: PathBuf::new(),
+        };
+
+        // Even though the client asks for gpt-4o-mini, the enforced active model
+        // (gpt-4o) wins and the client-sent model is ignored.
+        let (provider, upstream) = resolve_model(&state, Some("gpt-4o-mini")).expect("resolves");
+        assert_eq!(provider.name, "openai");
+        assert_eq!(upstream, "gpt-4o");
+
+        // With no client model it naturally uses the active model too.
         let (provider, upstream) = resolve_model(&state, None).expect("resolves");
         assert_eq!(provider.name, "openai");
         assert_eq!(upstream, "gpt-4o");
@@ -1520,6 +1593,7 @@ mod tests {
             config: cfg.clone(),
             router: Arc::new(Router::new(cfg).unwrap()),
             clients: Arc::new(clients),
+            enforce_active_model: false,
             config_path: PathBuf::new(),
         };
         let (provider, upstream) = resolve_model(&state, None).expect("resolves");
@@ -1550,6 +1624,7 @@ mod tests {
             config: cfg.clone(),
             router: Arc::new(Router::new(cfg).unwrap()),
             clients: Arc::new(HashMap::new()),
+            enforce_active_model: false,
             config_path: PathBuf::new(),
         };
         assert!(resolve_model(&state, None).is_err());
@@ -1569,6 +1644,7 @@ mod tests {
             config: Arc::new(Config::default()),
             router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
             clients: Arc::new(HashMap::new()),
+            enforce_active_model: false,
             config_path: PathBuf::new(),
         });
         block_on(async {
@@ -1589,6 +1665,7 @@ mod tests {
             config: Arc::new(cfg),
             router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
             clients: Arc::new(HashMap::new()),
+            enforce_active_model: false,
             config_path: PathBuf::new(),
         });
         let body = json!({"messages": [{"role": "user", "content": "$proxy status"}]});
@@ -1608,6 +1685,7 @@ mod tests {
             config: Arc::new(Config::default()),
             router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
             clients: Arc::new(HashMap::new()),
+            enforce_active_model: false,
             config_path: PathBuf::new(),
         });
         let body = json!({"messages": [{"role": "user", "content": "$proxy model"}]});
@@ -1649,6 +1727,7 @@ mod tests {
             config: cfg.clone(),
             router: Arc::new(Router::new(cfg).unwrap()),
             clients: Arc::new(HashMap::new()),
+            enforce_active_model: false,
             config_path: PathBuf::new(),
         };
         let err = resolve_model(&state, None).expect_err("unconnected provider is an error");

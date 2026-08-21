@@ -44,6 +44,10 @@ enum Command {
         /// Managed instance: skip the shared pid file (used by `launch`)
         #[arg(long, hide = true)]
         ephemeral: bool,
+        /// Ignore any client-sent model and always route through the active
+        /// model (set by `launch claude`)
+        #[arg(long, hide = true)]
+        enforce_active_model: bool,
     },
     /// Start the proxy (if needed) and launch a compatible tool against it
     Launch {
@@ -162,7 +166,9 @@ fn main() -> miette::Result<()> {
     let cli = Cli::parse();
     let config = cli::resolve_config_path(cli.config);
     match cli.command {
-        None => block_on(cli::serve(config, None, None, false, false, false, None)),
+        None => block_on(cli::serve(
+            config, None, None, false, false, false, None, false,
+        )),
         Some(Command::Serve {
             host,
             port,
@@ -170,6 +176,7 @@ fn main() -> miette::Result<()> {
             check_update,
             model,
             ephemeral,
+            enforce_active_model,
         }) => block_on(cli::serve(
             config,
             host,
@@ -178,6 +185,7 @@ fn main() -> miette::Result<()> {
             check_update,
             ephemeral,
             model,
+            enforce_active_model,
         )),
         Some(Command::Launch {
             tool,
