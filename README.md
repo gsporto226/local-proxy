@@ -87,7 +87,7 @@ Claude Code sends `/v1/messages`; the proxy routes to a connected provider and t
 | Command | Purpose |
 | --- | --- |
 | `serve` | Run the proxy server, foreground by default. `--host`, `--port`, `--background`, `--check-update`. |
-| `launch <claude\|design>` | Start a dedicated instance on a random free port, run the tool against it, kill the proxy when the tool exits. `--model`, `--yes`, `--dry-run`, `-- args...`. |
+| `launch <claude\|design\|cursor>` | Start a dedicated instance on a random free port, run the tool against it, kill the proxy when the tool exits. `--model`, `--yes`, `--dry-run`, `-- args...`. |
 | `status` | Show whether the background proxy is running. |
 | `stop` | Stop the background proxy. |
 | `models` | List models from connected providers, as `provider/model`. |
@@ -209,6 +209,17 @@ Claude Code talks `/v1/messages`; the proxy routes to the configured provider an
 ```bash
 local-proxy launch claude --model kimi-k2.6 --yes
 ```
+
+## Using with Cursor
+
+Cursor reads a custom base URL from `ANTHROPIC_BASE_URL` (like Claude Code), which sends it straight to the proxy's `/v1/messages` endpoint; the proxy routes and translates from there. The same dedicated-launch flow works with a Cursor target, which also sets the OpenAI-compatible overrides:
+
+```bash
+local-proxy launch cursor               # runs the `cursor` binary against the proxy
+local-proxy launch cursor --dry-run     # print the env without running it
+```
+
+`launch cursor` sets `ANTHROPIC_BASE_URL` (and `OPENAI_API_BASE`, `OPENAI_API_KEY` as a convenience) and prints the target `Override OpenAI Base URL` for Cursor's Settings. Since Cursor has no `--model` flag of its own, pin the proxy's active model first with `local-proxy model <provider>/<model>`; the `--model` flag is ignored for the cursor target. If you prefer to configure Cursor through its UI instead of environment variables, set **Settings → Models → Override OpenAI Base URL** to the printed `http://127.0.0.1:<port>/v1` URL.
 
 ## The `$proxy` executor
 

@@ -432,8 +432,35 @@ pub fn launch_environment(
 fn tool_command_name(tool: &str) -> &'static str {
     match tool {
         "design" | "cd" => "design",
+        "cursor" | "cr" => "cursor",
         _ => "claude",
     }
+}
+
+/// The env vars that make a tool point at this proxy, per tool.
+///
+/// Anthropic-compatible tools (Claude Code, Design) read `ANTHROPIC_BASE_URL`.
+/// Cursor respects the same override, which sends it to the proxy's
+/// `/v1/messages` endpoint and leaves the proxy to route and translate.
+/// Returns `(env, oai_base)` where the second element is the base URL with a
+/// trailing `/v1` for OpenAI-compatible tools that expect it, or `None`.
+fn tool_launch_env(
+    config: &Config,
+    port: u16,
+    model: Option<&str>,
+    tool: &str,
+) -> (Vec<(String, String)>, Option<String>) {
+    let base = format!("http://{}:{}", config.server.host, port);
+    let mut env = launch_environment(config, port, model);
+    // Cursor has no `--model` flag of its own; pinning the proxy's active model
+    // happens through `local-proxy model <provider>/<model>` instead.
+    if tool == "cursor" || tool == "cr" {
+        env.retain(|(k, _)| k != "ANTHROPIC_MODEL" && k != "ANTHROPIC_SMALL_FAST_MODEL");
+        env.push(("OPENAI_API_BASE".to_string(), format!("{base}/v1")));
+        env.push(("OPENAI_API_KEY".to_string(), "unused".to_string()));
+        return (env, Some(format!("{base}/v1")));
+    }
+    (env, None)
 }
 
 /// Spawn a dedicated, ephemeral proxy instance on `port` and wait until it
@@ -513,14 +540,14 @@ pub fn launch(
         Some(start_ephemeral_proxy(&host, port, &config_path)?)
     };
 
-    let env = launch_environment(&config, port, model);
+    let (env, oai_base) = tool_launch_env(&config, port, model, tool_cmd);
 
     if dry_run {
         for (k, v) in &env {
             println!("{k}={v}");
         }
         let mut cmdline = String::from(tool_cmd);
-        if yes {
+        if yes && tool_cmd != "cursor" {
             cmdline.push_str(" --yes");
         }
         if !args.is_empty() {
@@ -528,6 +555,12 @@ pub fn launch(
             cmdline.push_str(&args.join(" "));
         }
         println!("command: {cmdline}");
+        if tool_cmd == "cursor" {
+            println!(
+                "also set in Cursor: Settings → Models → Override OpenAI Base URL → {}",
+                oai_base.as_deref().unwrap_or("")
+            );
+        }
         return Ok(());
     }
 
@@ -535,7 +568,7 @@ pub fn launch(
     for (k, v) in &env {
         cmd.env(k, v);
     }
-    if yes {
+    if yes && tool_cmd != "cursor" {
         cmd.arg("--yes");
     }
     cmd.args(&args);
@@ -1833,6 +1866,32 @@ mod tests {
         assert_eq!(tool_command_name("cc"), "claude");
         assert_eq!(tool_command_name("design"), "design");
         assert_eq!(tool_command_name("cd"), "design");
+        assert_eq!(tool_command_name("cursor"), "cursor");
+        assert_eq!(tool_command_name("cr"), "cursor");
+    }
+
+    #[test]
+    fn cursor_env_sets_openai_and_strips_anthropic_model() {
+        let cfg = config_with(vec!["sk-proxy".to_string()]);
+        let (env, oai_base) = tool_launch_env(&cfg, 8787, Some("kimi-k2.6"), "cursor");
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(oai_base.as_deref(), Some("http://127.0.0.1:8787/v1"));
+        assert_eq!(map["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787");
+        assert_eq!(map["OPENAI_API_BASE"], "http://127.0.0.1:8787/v1");
+        assert_eq!(map["OPENAI_API_KEY"], "unused");
+        assert_eq!(map["ANTHROPIC_API_KEY"], "sk-proxy");
+        assert!(!map.contains_key("ANTHROPIC_MODEL"));
+        assert!(!map.contains_key("ANTHROPIC_SMALL_FAST_MODEL"));
+    }
+
+    #[test]
+    fn claude_env_has_no_openai_overrides() {
+        let cfg = config_with(vec![]);
+        let (env, oai_base) = tool_launch_env(&cfg, 8787, None, "claude");
+        let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert!(oai_base.is_none());
+        assert!(!map.contains_key("OPENAI_API_BASE"));
+        assert!(!map.contains_key("OPENAI_API_KEY"));
     }
 
     #[test]

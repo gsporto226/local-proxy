@@ -42,9 +42,9 @@ enum Command {
         #[arg(long, hide = true)]
         ephemeral: bool,
     },
-    /// Start the proxy (if needed) and launch an Anthropic-compatible tool
+    /// Start the proxy (if needed) and launch a compatible tool against it
     Launch {
-        /// Tool: claude (default) | design
+        /// Tool: claude (default) | design | cursor
         tool: Option<String>,
         /// Model to route Claude to (sets `ANTHROPIC_MODEL` / `_SMALL_FAST_MODEL`)
         #[arg(long)]
