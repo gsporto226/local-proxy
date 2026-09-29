@@ -61,33 +61,22 @@ pub fn last_user_text(messages: &Value) -> Option<String> {
     None
 }
 
-/// Concatenate the text of a content value that is either a string or an array
-/// of `{ "type": "text", "text": ... }` blocks.
+/// The text of a content value: the string itself, or the last `text` block
+/// of a block array. Only the last block is the user's latest input: Claude
+/// Code prepends `<system-reminder>` blocks and merges consecutive user turns
+/// (e.g. after an API error) into one message, so earlier blocks would hide a
+/// `$proxy` prefix.
 #[must_use]
 fn content_text(content: Option<&Value>) -> Option<String> {
     match content {
         Some(Value::String(s)) => Some(s.clone()),
-        Some(Value::Array(blocks)) => {
-            let mut out = String::new();
-            for block in blocks {
-                if block.get("type").and_then(Value::as_str) == Some("text") {
-                    // Claude Code prepends `<system-reminder>` blocks to the
-                    // user's text; they would hide a `$proxy` prefix.
-                    if let Some(t) = block
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .filter(|t| !t.trim_start().starts_with("<system-reminder>"))
-                    {
-                        out.push_str(t);
-                    }
-                }
-            }
-            if out.is_empty() {
-                None
-            } else {
-                Some(out)
-            }
-        }
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .rev()
+            .filter(|b| b.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|b| b.get("text").and_then(Value::as_str))
+            .find(|t| !t.trim_start().starts_with("<system-reminder>"))
+            .map(str::to_string),
         _ => None,
     }
 }
@@ -278,8 +267,8 @@ mod tests {
             {"role": "user", "content": "hi"},
             {"role": "assistant", "content": "hello"},
             {"role": "user", "content": [
-                {"type": "text", "text": "$proxy "},
-                {"type": "text", "text": "models"}
+                {"type": "text", "text": "$models"},
+                {"type": "text", "text": "$proxy models"}
             ]}
         ]);
         assert_eq!(last_user_text(&v).as_deref(), Some("$proxy models"));

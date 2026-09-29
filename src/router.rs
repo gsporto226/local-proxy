@@ -238,6 +238,7 @@ mod tests {
                     format: ProviderFormat::Anthropic,
                     models: vec!["claude-native-1".to_string()],
                     headers: std::collections::HashMap::new(),
+                    session_header: None,
                 },
                 Provider {
                     name: "openai".to_string(),
@@ -245,6 +246,7 @@ mod tests {
                     format: ProviderFormat::Openai,
                     models: vec!["gpt-native-1".to_string()],
                     headers: std::collections::HashMap::new(),
+                    session_header: None,
                 },
             ],
             routes: vec![

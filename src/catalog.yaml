@@ -13,9 +13,11 @@ providers:
   - name: opencode-go
     base_url: https://opencode.ai/zen/go
     format: openai
+    session_header: x-opencode-session
   - name: zen
     base_url: https://opencode.ai/zen
     format: openai
+    session_header: x-opencode-session
   - name: groq
     base_url: https://api.groq.com/openai/v1
     format: openai

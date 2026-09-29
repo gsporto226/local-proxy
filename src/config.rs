@@ -79,6 +79,10 @@ pub struct Provider {
     /// Headers with the same name override the format/auth defaults.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// Header that carries the client session id upstream, for providers that
+    /// require one to route requests (e.g. `OpenCode`'s `x-opencode-session`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_header: Option<String>,
 }
 
 /// Maps a requested model to a provider (exact match or prefix).

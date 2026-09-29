@@ -854,7 +854,7 @@ async fn handle_messages(
     }
 
     let resp = client
-        .chat_request(client.default_path(), upstream_body, client_key)
+        .chat_request(client.default_path(), upstream_body, client_key, session_id)
         .await
         .map_err(ApiError::from)?;
     let status = resp.status().as_u16();
@@ -1016,7 +1016,7 @@ async fn handle_chat_completions(
     }
 
     let resp = client
-        .chat_request(client.default_path(), upstream_body, client_key)
+        .chat_request(client.default_path(), upstream_body, client_key, session_id)
         .await
         .map_err(ApiError::from)?;
     let status = resp.status().as_u16();
@@ -1178,7 +1178,7 @@ async fn handle_responses(
     }
 
     let resp = client
-        .chat_request(client.default_path(), upstream_body, client_key)
+        .chat_request(client.default_path(), upstream_body, client_key, session_id)
         .await
         .map_err(ApiError::from)?;
     let status = resp.status().as_u16();
@@ -1483,6 +1483,7 @@ mod tests {
                     format: ProviderFormat::Openai,
                     models: vec!["gpt-4o".to_string()],
                     headers: std::collections::HashMap::new(),
+                    session_header: None,
                 },
                 crate::config::Provider {
                     name: "anthropic".to_string(),
@@ -1490,6 +1491,7 @@ mod tests {
                     format: ProviderFormat::Anthropic,
                     models: vec!["claude-sonnet-4-5".to_string()],
                     headers: std::collections::HashMap::new(),
+                    session_header: None,
                 },
             ],
             routes: vec![crate::config::Route {
@@ -1543,6 +1545,7 @@ mod tests {
                     format: ProviderFormat::Openai,
                     models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
                     headers: std::collections::HashMap::new(),
+                    session_header: None,
                 },
                 crate::config::Provider {
                     name: "anthropic".to_string(),
@@ -1550,6 +1553,7 @@ mod tests {
                     format: ProviderFormat::Anthropic,
                     models: vec!["claude-sonnet-4-5".to_string()],
                     headers: std::collections::HashMap::new(),
+                    session_header: None,
                 },
             ],
             routes: Vec::new(),
@@ -1603,6 +1607,7 @@ mod tests {
                     format: ProviderFormat::Openai,
                     models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
                     headers: std::collections::HashMap::new(),
+                    session_header: None,
                 },
                 crate::config::Provider {
                     name: "anthropic".to_string(),
@@ -1610,6 +1615,7 @@ mod tests {
                     format: ProviderFormat::Anthropic,
                     models: vec!["claude-sonnet-4-5".to_string()],
                     headers: std::collections::HashMap::new(),
+                    session_header: None,
                 },
             ],
             routes: Vec::new(),
@@ -1663,6 +1669,7 @@ mod tests {
                 format: ProviderFormat::Openai,
                 models: vec!["gpt-4o".to_string(), "gpt-4o-mini".to_string()],
                 headers: std::collections::HashMap::new(),
+                session_header: None,
             }],
             routes: Vec::new(),
             defaults: crate::config::Defaults {
@@ -1707,6 +1714,7 @@ mod tests {
                 format: ProviderFormat::Openai,
                 models: vec!["gpt-4o".to_string()],
                 headers: std::collections::HashMap::new(),
+                session_header: None,
             }],
             routes: Vec::new(),
             defaults: crate::config::Defaults {
@@ -1811,6 +1819,7 @@ mod tests {
                 format: ProviderFormat::Openai,
                 models: vec!["glm-5.2".to_string()],
                 headers: std::collections::HashMap::new(),
+                session_header: None,
             }],
             routes: Vec::new(),
             defaults: crate::config::Defaults {

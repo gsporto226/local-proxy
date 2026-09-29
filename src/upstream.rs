@@ -47,6 +47,7 @@ pub struct ProviderClient {
     auth_key: Option<String>,
     passthrough: bool,
     headers: std::collections::HashMap<String, String>,
+    session_header: Option<String>,
     http: reqwest::Client,
 }
 
@@ -74,6 +75,7 @@ impl ProviderClient {
             auth_key,
             passthrough,
             headers: provider.headers.clone(),
+            session_header: provider.session_header.clone(),
             http,
         })
     }
@@ -140,6 +142,7 @@ impl ProviderClient {
         path: &str,
         body: Value,
         client_key: Option<&str>,
+        session_id: &str,
     ) -> Result<reqwest::Response, UpstreamError> {
         let key = self.effective_key(client_key);
         if key.is_none() {
@@ -175,6 +178,20 @@ impl ProviderClient {
                 ProviderFormat::Openai => {
                     headers.insert(AUTHORIZATION, Self::header_value(&format!("Bearer {key}"))?);
                 }
+            }
+        }
+        if let Some(name) = &self.session_header {
+            // Clients without a session id share one stable id per process.
+            let session = if session_id.is_empty() {
+                format!("local-proxy-{}", std::process::id())
+            } else {
+                session_id.to_string()
+            };
+            if let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(&session),
+            ) {
+                headers.insert(name, value);
             }
         }
         // Provider-configured static headers override the format/auth defaults.
@@ -316,6 +333,7 @@ mod tests {
             format,
             models: Vec::new(),
             headers: std::collections::HashMap::new(),
+            session_header: None,
         }
     }
 
@@ -342,7 +360,7 @@ mod tests {
         let client =
             ProviderClient::new(&provider(ProviderFormat::Anthropic), false, None).unwrap();
         let err = client
-            .chat_request("/v1/messages", json!({}), None)
+            .chat_request("/v1/messages", json!({}), None, "")
             .await
             .unwrap_err();
         assert!(matches!(err, UpstreamError::MissingApiKey { .. }));
@@ -445,7 +463,7 @@ mod tests {
         ]);
         let client = ProviderClient::new(&p, false, Some("key".to_string())).unwrap();
         client
-            .chat_request("/v1/chat/completions", json!({}), None)
+            .chat_request("/v1/chat/completions", json!({}), None, "")
             .await
             .unwrap();
 
@@ -466,6 +484,30 @@ mod tests {
 
     #[tokio::test]
     #[allow(clippy::await_holding_lock)]
+    async fn session_header_carries_client_session() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+
+        let (base, rx) = header_capture_server().await;
+        let mut p = provider(ProviderFormat::Openai);
+        p.base_url = base.clone();
+        p.session_header = Some("x-opencode-session".to_string());
+        let client = ProviderClient::new(&p, false, Some("key".to_string())).unwrap();
+        client
+            .chat_request("/v1/chat/completions", json!({}), None, "sess-1")
+            .await
+            .unwrap();
+
+        let received = rx.await.unwrap();
+        assert_eq!(
+            received
+                .get("x-opencode-session")
+                .and_then(|v| v.to_str().ok()),
+            Some("sess-1")
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
     async fn provider_headers_override_auth_default() {
         let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
 
@@ -478,7 +520,7 @@ mod tests {
         )]);
         let client = ProviderClient::new(&p, false, Some("key".to_string())).unwrap();
         client
-            .chat_request("/v1/chat/completions", json!({}), None)
+            .chat_request("/v1/chat/completions", json!({}), None, "")
             .await
             .unwrap();
 
