@@ -104,7 +104,7 @@ defaults:
         assert!(!config.providers.is_empty());
         assert!(config.providers.iter().any(|p| p.name == "opencode-go"));
         assert!(config.providers.iter().any(|p| p.name == "anthropic"));
-        assert!(!config.routes.is_empty());
+        assert!(config.providers.iter().all(|p| p.models.is_empty()));
         assert!(config.defaults.provider.is_empty());
     }
 

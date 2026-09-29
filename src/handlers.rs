@@ -125,7 +125,9 @@ pub fn build_runtime_state(config_path: &Path) -> Result<RuntimeState, RuntimeEr
         path: "<catalog>".to_string(),
         source,
     })?;
-    let config = Arc::new(crate::catalog::effective_config(base, overlay));
+    let mut config = crate::catalog::effective_config(base, overlay);
+    crate::upstream::discover_models(&mut config);
+    let config = Arc::new(config);
     let router = Arc::new(Router::new(config.clone()).map_err(RuntimeError::Router)?);
     let clients = Arc::new(build_clients(&config).map_err(RuntimeError::Clients)?);
     Ok(RuntimeState {

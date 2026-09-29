@@ -210,6 +210,92 @@ pub fn provider_has_key(provider: &Provider, auth_key: Option<&str>) -> bool {
     auth_key.is_some_and(|k| !k.is_empty())
 }
 
+/// Fill `models` for connected providers that don't list them explicitly.
+///
+/// Asks each upstream's `GET /v1/models`. Providers that fail
+/// or time out are left empty. Blocks the caller (runs on its own thread and
+/// runtime, so it is safe to call from inside an async context).
+pub fn discover_models(config: &mut crate::config::Config) {
+    let auth = crate::auth::read_auth().unwrap_or_default();
+    let targets: Vec<(usize, ProviderClient)> = config
+        .providers
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.models.is_empty())
+        .filter_map(|(i, p)| {
+            let key = auth.get(&p.name).map(|e| e.key.clone());
+            let client = ProviderClient::new(p, false, key).ok()?;
+            client.has_key().then_some((i, client))
+        })
+        .collect();
+    if targets.is_empty() {
+        return;
+    }
+    let found = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .ok()?;
+        Some(
+            rt.block_on(futures_util::future::join_all(
+                targets
+                    .into_iter()
+                    .map(|(i, c)| async move { (i, c.list_models().await) }),
+            )),
+        )
+    })
+    .join()
+    .ok()
+    .flatten()
+    .unwrap_or_default();
+    for (i, models) in found {
+        config.providers[i].models = models;
+    }
+}
+
+impl ProviderClient {
+    /// Model IDs from the upstream's `GET /v1/models` (both `OpenAI` and
+    /// Anthropic return `{"data": [{"id": ...}]}`). Empty on any failure.
+    async fn list_models(&self) -> Vec<String> {
+        let Some(key) = self.configured_key() else {
+            return Vec::new();
+        };
+        let url = format!("{}/v1/models", self.base_url);
+        let req = match self.format {
+            ProviderFormat::Anthropic => self
+                .http
+                .get(&url)
+                .header("x-api-key", key)
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .query(&[("limit", "1000")]),
+            ProviderFormat::Openai => self.http.get(&url).bearer_auth(key),
+        };
+        let req = self
+            .headers
+            .iter()
+            .fold(req, |r, (k, v)| r.header(k.as_str(), v.as_str()));
+        let body = match req.timeout(Duration::from_secs(10)).send().await {
+            Ok(resp) if resp.status().is_success() => {
+                resp.json::<Value>().await.unwrap_or(Value::Null)
+            }
+            Ok(resp) => {
+                tracing::warn!(target: crate::LOG_TARGET, provider = %self.name, status = %resp.status(), "model discovery failed");
+                return Vec::new();
+            }
+            Err(e) => {
+                tracing::warn!(target: crate::LOG_TARGET, provider = %self.name, error = %e, "model discovery failed");
+                return Vec::new();
+            }
+        };
+        body["data"]
+            .as_array()
+            .into_iter()
+            .flatten()
+            .filter_map(|m| m["id"].as_str().map(str::to_string))
+            .collect()
+    }
+}
+
 /// Read a completed upstream response into `(status, json_body)`, tolerating a
 /// non-JSON body (yields `Value::Null`).
 pub async fn send_and_read(resp: reqwest::Response) -> (u16, Value) {
@@ -400,6 +486,37 @@ mod tests {
         assert_eq!(
             received.get("authorization").and_then(|v| v.to_str().ok()),
             Some("Bearer custom")
+        );
+    }
+
+    #[tokio::test]
+    async fn list_models_reads_upstream_ids() {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 4096];
+            let n = sock.read(&mut buf).await.unwrap();
+            assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /v1/models"));
+            let body = br#"{"data":[{"id":"new-model-1"},{"id":"new-model-2"}]}"#;
+            let head = format!(
+                "HTTP/1.1 200 OK
+content-length: {}
+connection: close
+
+",
+                body.len()
+            );
+            sock.write_all(head.as_bytes()).await.unwrap();
+            sock.write_all(body).await.unwrap();
+        });
+        let mut p = provider(ProviderFormat::Openai);
+        p.base_url = format!("http://{addr}");
+        let client = ProviderClient::new(&p, false, Some("key".to_string())).unwrap();
+        assert_eq!(
+            client.list_models().await,
+            vec!["new-model-1", "new-model-2"]
         );
     }
 }

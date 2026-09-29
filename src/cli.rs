@@ -687,7 +687,8 @@ pub fn stop(config_path: PathBuf) -> miette::Result<()> {
 /// Returns a [`CliError`] if the catalog or config cannot be loaded.
 #[allow(clippy::result_large_err)]
 pub fn connected_models(config_path: &Path) -> Result<Vec<String>, CliError> {
-    let config = effective_config(config_path)?;
+    let mut config = effective_config(config_path)?;
+    crate::upstream::discover_models(&mut config);
     let auth = crate::auth::read_auth().unwrap_or_default();
     let mut models = Vec::new();
     for provider in &config.providers {

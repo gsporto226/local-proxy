@@ -1,111 +1,40 @@
-﻿# CatÃ¡logo de providers embutido no binÃ¡rio (base).
+# CatÃ¡logo de providers embutido no binÃ¡rio (base).
 # O config.yaml do usuÃ¡rio sÃ³ adiciona ou sobrescreve o que estÃ¡ aqui.
 # Suportamos dois wire formats: anthropic (Messages API) e openai (Chat Completions).
+# Os modelos não ficam aqui: são buscados em GET /v1/models de cada provider conectado.
 
 providers:
   - name: anthropic
     base_url: https://api.anthropic.com
     format: anthropic
-    models:
-      - claude-sonnet-4-5
-      - claude-opus-4-1
   - name: openai
     base_url: https://api.openai.com/v1
     format: openai
-    models:
-      - gpt-4o
-      - gpt-5.1
   - name: opencode-go
     base_url: https://opencode.ai/zen/go
     format: openai
-    models:
-      - opencode-go/deepseek-v4-flash
-      - opencode-go/deepseek-v4-pro
-      - opencode-go/kimi-k2.6
-      - opencode-go/glm-5.1
-      - opencode-go/gpt-5.6-luna
-      - opencode-go/grok-4.5
-      - opencode-go/kimi-k2.7-code
-      - opencode-go/kimi-k3
-      - opencode-go/mimo-v2.5-pro
-      - opencode-go/minimax-m3
-      - opencode-go/qwen3.7-max
   - name: zen
     base_url: https://opencode.ai/zen
     format: openai
-    models:
-      - deepseek-v4-flash-free
-      - claude-sonnet-4-5
-      - gpt-5.1
   - name: groq
     base_url: https://api.groq.com/openai/v1
     format: openai
-    models:
-      - llama-3.3-70b-versatile
   - name: xai
     base_url: https://api.x.ai/v1
     format: openai
-    models:
-      - grok-4
   - name: google
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
     format: openai
-    models:
-      - gemini-2.5-pro
-      - gemini-2.5-flash
   - name: deepseek
     base_url: https://api.deepseek.com
     format: openai
-    models:
-      - deepseek-chat
-      - deepseek-reasoner
   - name: openrouter
     base_url: https://openrouter.ai/api/v1
     format: openai
     headers:
       HTTP-Referer: https://github.com/gsporto226/local-proxy
       X-Title: local-proxy
-    models:
-      - openrouter/auto
   - name: neuralwatt
     base_url: https://api.neuralwatt.com/v1
     format: openai
-    models:
-      - gemma-4-31b
-      - glm-5.2
-      - glm-5.2-fast
-      - glm-5.2-flex
-      - glm-5.2-short
-      - glm-5.2-short-fast
-      - glm-5.2-short-flex
-      - glm-5.2-short-fast-flex
-      - kimi-k2.7-code
-      - kimi-k2.7-code-fast
-      - kimi-k2.7-code-flex
-      - qwen3.6-35b
-      - qwen3.6-35b-fast
-      - kimi-k3
-      - kimi-k3-fast
-      - kimi-k3-flex
-      - deepseek-v4-flash
-      - deepseek-v4-flash-flex
-      - deepseek-ai/DeepSeek-V4-Flash
 
-routes:
-  - model: claude-sonnet
-    provider: anthropic
-    prefix: true
-    upstream_model: claude-sonnet-4-5
-  - model: claude-opus
-    provider: anthropic
-    prefix: true
-    upstream_model: claude-opus-4-1
-  - model: gpt-4o
-    provider: openai
-  - model: deepseek-free
-    provider: zen
-    upstream_model: deepseek-v4-flash-free
-  - model: deepseek-v4-flash
-    provider: opencode-go
-  - model: deepseek-v4-pro
-    provider: opencode-go
