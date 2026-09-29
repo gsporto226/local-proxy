@@ -705,6 +705,53 @@ pub fn stop(config_path: PathBuf) -> miette::Result<()> {
     Ok(())
 }
 
+/// Default number of lines `local-proxy logs` / `$proxy logs` prints.
+pub const DEFAULT_LOG_LINES: usize = 50;
+
+/// The last `lines` lines of the proxy log file, lossily decoded as UTF-8.
+///
+/// # Errors
+///
+/// Returns the underlying I/O error when the log file cannot be read (for
+/// example, no proxy has run yet and the file does not exist).
+pub fn logs_text(lines: usize) -> io::Result<String> {
+    tail_lines(&log_file(), lines)
+}
+
+/// The last `lines` lines of a text file, joined without a trailing newline.
+/// Invalid UTF-8 bytes are replaced rather than failing the read.
+fn tail_lines(path: &Path, lines: usize) -> io::Result<String> {
+    // ponytail: reads the whole file; the log is truncated on every start, so
+    // a reverse block read is only worth it if logs ever grow huge.
+    let raw = std::fs::read(path)?;
+    let text = String::from_utf8_lossy(&raw);
+    let all: Vec<&str> = text.lines().collect();
+    let start = all.len().saturating_sub(lines);
+    Ok(all[start..].join("\n"))
+}
+
+/// CLI entry for `logs`: print the tail of the proxy's log file.
+///
+/// # Errors
+///
+/// Returns [`CliError::Io`] if the log file exists but cannot be read.
+#[allow(clippy::needless_pass_by_value)]
+pub fn logs(config_path: PathBuf, lines: usize) -> miette::Result<()> {
+    // The log lives in the runtime dir, not next to the config.
+    let _ = config_path;
+    match logs_text(lines) {
+        Ok(text) => println!("{text}"),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => {
+            println!(
+                "nenhum log em {} (proxy ainda não rodou?)",
+                log_file().display()
+            );
+        }
+        Err(e) => return Err(CliError::Io(e).into()),
+    }
+    Ok(())
+}
+
 /// Print the list of models the proxy can route to.
 ///
 /// Models available from providers that have a resolvable key (are "connected"),
@@ -2080,6 +2127,23 @@ mod tests {
     #[test]
     fn config_dir_is_global() {
         assert_eq!(config_dir(), crate::config::global_config_dir());
+    }
+
+    #[test]
+    fn tail_lines_returns_last_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("local-proxy.log");
+        std::fs::write(&path, "one\ntwo\nthree\n").unwrap();
+        assert_eq!(tail_lines(&path, 2).unwrap(), "two\nthree");
+        assert_eq!(tail_lines(&path, 9).unwrap(), "one\ntwo\nthree");
+        assert_eq!(tail_lines(&path, 0).unwrap(), "");
+    }
+
+    #[test]
+    fn tail_lines_missing_file_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let err = tail_lines(&dir.path().join("nope.log"), 5).unwrap_err();
+        assert_eq!(err.kind(), io::ErrorKind::NotFound);
     }
 
     #[test]

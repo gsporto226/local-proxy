@@ -70,6 +70,12 @@ enum Command {
     Status,
     /// Stop the background proxy
     Stop,
+    /// Show the tail of the proxy log file
+    Logs {
+        /// Number of lines to print
+        #[arg(short = 'n', long, default_value_t = cli::DEFAULT_LOG_LINES)]
+        lines: usize,
+    },
     /// List models available from connected providers
     Models,
     /// Get or set the active model (selected, else first available)
@@ -208,6 +214,7 @@ fn main() -> miette::Result<()> {
         ),
         Some(Command::Status) => cli::status(config),
         Some(Command::Stop) => cli::stop(config),
+        Some(Command::Logs { lines }) => cli::logs(config, lines),
         Some(Command::Models) => cli::models(config),
         Some(Command::Model { model }) => cli::model(config, model),
         Some(Command::Effort { level }) => cli::effort(config, level),

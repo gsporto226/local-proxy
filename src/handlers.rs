@@ -606,8 +606,49 @@ async fn maybe_exec(
         Some(handle_model_exec(app, state, &args).await)
     } else if args.first().map(String::as_str) == Some("effort") {
         Some(handle_effort_exec(app, state, &args).await)
+    } else if args.first().map(String::as_str) == Some("logs") {
+        Some(handle_logs_exec(&args))
     } else {
         Some(crate::exec::run(&exec.command, &args, Duration::from_secs(exec.timeout_secs)).await)
+    }
+}
+
+/// The line count for `$proxy logs`: the value after `-n`/`--lines`, or the
+/// shared CLI default when the flag is absent or malformed.
+fn logs_lines_arg(args: &[String]) -> usize {
+    args.iter()
+        .position(|a| a == "-n" || a == "--lines")
+        .and_then(|i| args.get(i + 1))
+        .and_then(|v| v.parse::<usize>().ok())
+        .unwrap_or(crate::cli::DEFAULT_LOG_LINES)
+}
+
+/// Handle `$proxy logs [-n N]` in-process: read the tail of the proxy's own
+/// log file, without spawning the CLI binary.
+fn handle_logs_exec(args: &[String]) -> crate::exec::ExecOutput {
+    let lines = logs_lines_arg(args);
+    match crate::cli::logs_text(lines) {
+        Ok(stdout) => crate::exec::ExecOutput {
+            stdout,
+            stderr: String::new(),
+            code: 0,
+            timed_out: false,
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => crate::exec::ExecOutput {
+            stdout: String::new(),
+            stderr: format!(
+                "nenhum log em {} (proxy ainda não rodou?)",
+                crate::cli::log_file().display()
+            ),
+            code: 1,
+            timed_out: false,
+        },
+        Err(e) => crate::exec::ExecOutput {
+            stdout: String::new(),
+            stderr: e.to_string(),
+            code: 1,
+            timed_out: false,
+        },
     }
 }
 
@@ -1801,6 +1842,21 @@ mod tests {
             assert_eq!(out.code, 0);
             assert_eq!(app.snapshot().await.config.defaults.active_model, None);
         });
+    }
+
+    #[test]
+    fn logs_lines_arg_reads_flag_or_defaults() {
+        let parse = crate::exec::parse_args;
+        assert_eq!(
+            logs_lines_arg(&parse("logs")),
+            crate::cli::DEFAULT_LOG_LINES
+        );
+        assert_eq!(logs_lines_arg(&parse("logs -n 100")), 100);
+        assert_eq!(logs_lines_arg(&parse("logs --lines 3")), 3);
+        assert_eq!(
+            logs_lines_arg(&parse("logs -n nope")),
+            crate::cli::DEFAULT_LOG_LINES
+        );
     }
 
     #[test]
