@@ -531,6 +531,45 @@ pub fn session_on(
     Ok(first)
 }
 
+/// Remember the reasoning effort `session_id` last requested, best-effort.
+///
+/// Feeds the status line's `effort` param; failures are logged and ignored.
+pub fn record_effort(session_id: &str, effort: &str) {
+    let res = open(&stats_db()).and_then(|conn| {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS session_effort (
+                session_id TEXT PRIMARY KEY, effort TEXT NOT NULL)",
+        )
+        .and_then(|()| {
+            conn.execute(
+                "INSERT OR REPLACE INTO session_effort VALUES (?1, ?2)",
+                [session_id, effort],
+            )
+        })
+        .map_err(|source| StatsError::Query { source })
+    });
+    if let Err(e) = res {
+        tracing::warn!(target: "local_proxy", error = %e, "falhou ao registrar effort");
+    }
+}
+
+/// The reasoning effort `session_id` last requested, if recorded.
+#[must_use]
+pub fn session_effort(session_id: &str) -> Option<String> {
+    let path = stats_db();
+    if session_id.is_empty() || !path.exists() {
+        return None;
+    }
+    open(&path)
+        .ok()?
+        .query_row(
+            "SELECT effort FROM session_effort WHERE session_id = ?1",
+            [session_id],
+            |r| r.get(0),
+        )
+        .ok()
+}
+
 /// Sum of reported cost (USD) over a time window, or `None` when the database
 /// does not exist. Used for the month/total cost params in the status line.
 ///

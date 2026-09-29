@@ -39,15 +39,30 @@ pub fn default_template<S: std::hash::BuildHasher>(
     let mut segs: Vec<String> = Vec::new();
     let has = |name: &str| params.get(name).is_some_and(|v| v != NO_DATA);
     if has("model") {
-        segs.push("${model}".to_string());
+        if has("effort") {
+            segs.push("${model} (${effort})".to_string());
+        } else {
+            segs.push("${model}".to_string());
+        }
     }
-    if has("context_pct") {
-        segs.push("${context_pct}% ctx".to_string());
+    match (has("ctx_tokens"), has("context_pct")) {
+        (true, true) => segs.push("${ctx_tokens} (${context_pct}%)".to_string()),
+        (true, false) => segs.push("${ctx_tokens}".to_string()),
+        (false, true) => segs.push("${context_pct}% ctx".to_string()),
+        (false, false) => {}
     }
-    if has("cost_session") {
+    if has("rate_5h") {
+        segs.push("5h ${rate_5h}%".to_string());
+    }
+    if has("rate_week") {
+        segs.push("week ${rate_week}%".to_string());
+    }
+    // Claude-fed lines (ctx_tokens present) stay compact: no cost/token totals.
+    let legacy = !has("ctx_tokens");
+    if legacy && has("cost_session") {
         segs.push("${cost_session}".to_string());
     }
-    if has("tokens_in") || has("tokens_out") {
+    if legacy && (has("tokens_in") || has("tokens_out")) {
         let tin = if has("tokens_in") {
             "${tokens_in}".to_string()
         } else {
@@ -64,6 +79,57 @@ pub fn default_template<S: std::hash::BuildHasher>(
         return "`local-proxy: sem dados`".to_string();
     }
     format!("`{}`", segs.join(" · "))
+}
+
+/// Extract status-line params from the JSON Claude Code pipes to a command.
+///
+/// Params:
+/// `session_id`, `context_pct`, `ctx_tokens` (current
+/// context size, e.g. `45.2k`), `rate_5h` and `rate_week` (subscription usage
+/// percent, only present for Claude.ai plans). Absent fields are skipped.
+#[must_use]
+pub fn params_from_claude_json(v: &serde_json::Value) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut put = |k: &str, val: String| out.push((k.to_string(), val));
+    let pct = |p: &str| v.pointer(p).and_then(serde_json::Value::as_f64);
+    if let Some(s) = v["session_id"].as_str() {
+        put("session_id", s.to_string());
+    }
+    let used = pct("/context_window/used_percentage");
+    if let Some(p) = used {
+        put("context_pct", format!("{}", p.round()));
+    }
+    let cur = &v["context_window"]["current_usage"];
+    let tokens = if cur.is_object() {
+        Some(
+            [
+                "input_tokens",
+                "cache_creation_input_tokens",
+                "cache_read_input_tokens",
+            ]
+            .iter()
+            .filter_map(|k| cur[*k].as_f64())
+            .sum::<f64>(),
+        )
+    } else {
+        used.zip(pct("/context_window/context_window_size"))
+            .map(|(p, size)| p / 100.0 * size)
+    };
+    if let Some(t) = tokens {
+        let s = if t >= 1000.0 {
+            format!("{:.1}k", t / 1000.0)
+        } else {
+            format!("{t}")
+        };
+        put("ctx_tokens", s);
+    }
+    if let Some(p) = pct("/rate_limits/five_hour/used_percentage") {
+        put("rate_5h", format!("{}", p.round()));
+    }
+    if let Some(p) = pct("/rate_limits/seven_day/used_percentage") {
+        put("rate_week", format!("{}", p.round()));
+    }
+    out
 }
 
 /// Render `template` (a Rhai script) with `params` bound as variables.
@@ -554,6 +620,31 @@ mod tests {
         let tpl = super::default_template(&p);
         assert_eq!(tpl, "`${model} · ${context_pct}% ctx`");
         assert_eq!(super::render(&tpl, &p), "claude-x · 10% ctx");
+    }
+
+    #[test]
+    fn claude_json_renders_full_line() {
+        let v = serde_json::json!({
+            "session_id": "s1",
+            "context_window": {
+                "used_percentage": 22.6,
+                "context_window_size": 200_000,
+                "current_usage": { "input_tokens": 200, "cache_read_input_tokens": 45000 }
+            },
+            "rate_limits": {
+                "five_hour": { "used_percentage": 12.4 },
+                "seven_day": { "used_percentage": 40 }
+            }
+        });
+        let mut p: HashMap<String, String> =
+            super::params_from_claude_json(&v).into_iter().collect();
+        p.insert("model".into(), "kimi-k2.6".into());
+        p.insert("effort".into(), "high".into());
+        let tpl = super::default_template(&p);
+        assert_eq!(
+            super::render(&tpl, &p),
+            "kimi-k2.6 (high) · 45.2k (23%) · 5h 12% · week 40%"
+        );
     }
 
     #[test]

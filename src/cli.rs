@@ -540,6 +540,25 @@ fn start_ephemeral_proxy(
     Ok(child)
 }
 
+/// `--settings` JSON that overrides Claude's status line with
+/// `local-proxy statusline`, which reads Claude's status JSON from stdin.
+///
+/// Paths use forward slashes since Claude runs the command through a POSIX
+/// shell (Git Bash on Windows). `None` if the current exe path is unknown.
+fn claude_statusline_settings(config_path: &Path, model: Option<&str>) -> Option<String> {
+    let slash = |p: &Path| p.display().to_string().replace('\\', "/");
+    let exe = std::env::current_exe().ok()?;
+    let mut command = format!(
+        "\"{}\" statusline --config \"{}\"",
+        slash(&exe),
+        slash(config_path)
+    );
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        command = format!("{command} --model \"{m}\"");
+    }
+    Some(serde_json::json!({ "statusLine": { "type": "command", "command": command } }).to_string())
+}
+
 /// Launch the given CLI tool against this proxy, starting the proxy in the
 /// background first if it is not already serving.
 ///
@@ -612,6 +631,11 @@ pub fn launch(
     }
     if yes && tool_cmd != "cursor" {
         cmd.arg("--yes");
+    }
+    if tool_cmd == "claude" {
+        if let Some(settings) = claude_statusline_settings(&config_path, model) {
+            cmd.arg("--settings").arg(settings);
+        }
     }
     cmd.args(&args);
     let status = cmd.status().map_err(|e| CliError::Tool {
@@ -871,6 +895,68 @@ pub fn set_default_model(config_path: &Path, model: Option<&str>) -> Result<(), 
     Ok(())
 }
 
+/// Reasoning effort levels accepted by `local-proxy effort`.
+pub const EFFORT_LEVELS: [&str; 5] = ["low", "medium", "high", "xhigh", "max"];
+
+/// CLI entry for `effort`: print the result of [`effort_result`].
+///
+/// # Errors
+///
+/// Returns an error if the level is unknown or the config cannot be written.
+#[allow(clippy::needless_pass_by_value)]
+pub fn effort(config_path: PathBuf, level: Option<String>) -> miette::Result<()> {
+    println!("{}", effort_result(&config_path, level.as_deref())?);
+    Ok(())
+}
+
+/// Show, set (persisted in the config) or `clear` the reasoning effort the
+/// proxy forces on every request, returning the message to print. Running
+/// proxies pick the change up via hot-reload.
+///
+/// # Errors
+///
+/// Returns an error if the level is unknown or the config cannot be written.
+pub fn effort_result(config_path: &Path, level: Option<&str>) -> miette::Result<String> {
+    let config_path = config_path.to_path_buf();
+    let msg = match level {
+        None => effective_config(&config_path)?
+            .defaults
+            .active_effort
+            .unwrap_or_else(|| "none (o cliente decide)".to_string()),
+        Some(l) => {
+            let value = if l == "clear" {
+                None
+            } else if EFFORT_LEVELS.contains(&l) {
+                Some(l.to_string())
+            } else {
+                return Err(miette::miette!(
+                    "effort '{l}' invalido; use: {} ou clear",
+                    EFFORT_LEVELS.join(", ")
+                ));
+            };
+            if !config_path.exists() {
+                if let Some(parent) = config_path.parent() {
+                    std::fs::create_dir_all(parent).map_err(CliError::from)?;
+                }
+                crate::config::create_default_config(&config_path).map_err(CliError::from)?;
+            }
+            let mut config = Config::load(&config_path).map_err(CliError::from)?;
+            config.defaults.active_effort.clone_from(&value);
+            let yaml = serde_yaml::to_string(&config).map_err(|e| CliError::Connect {
+                message: format!("falha ao serializar config: {e}"),
+            })?;
+            let tmp = config_path.with_extension("yaml.tmp");
+            std::fs::write(&tmp, yaml).map_err(CliError::from)?;
+            std::fs::rename(&tmp, &config_path).map_err(CliError::from)?;
+            value.map_or_else(
+                || "effort ativo removido".to_string(),
+                |v| format!("effort ativo: {v}"),
+            )
+        }
+    };
+    Ok(msg)
+}
+
 /// Compute the message for `local-proxy model`: get, set, or clear the active
 /// model, returning the message the CLI prints and that MCP returns verbatim.
 ///
@@ -1011,7 +1097,28 @@ pub fn statusline(
     // data (see below), instead of a fixed string showing `?` everywhere.
     let config = effective_config(&config_path)?;
 
-    let session = session.unwrap_or_default();
+    // Claude Code pipes its status-line JSON on stdin when it runs the command
+    // directly (as `launch claude` configures it); a terminal means no JSON.
+    let claude_params = {
+        use std::io::{IsTerminal, Read};
+        let mut raw = String::new();
+        if std::io::stdin().is_terminal() {
+            Vec::new()
+        } else {
+            let _ = std::io::stdin().read_to_string(&mut raw);
+            serde_json::from_str::<serde_json::Value>(&raw)
+                .map(|v| crate::statusline::params_from_claude_json(&v))
+                .unwrap_or_default()
+        }
+    };
+    let session = session
+        .or_else(|| {
+            claude_params
+                .iter()
+                .find(|(k, _)| k == "session_id")
+                .map(|(_, v)| v.clone())
+        })
+        .unwrap_or_default();
     let now = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
@@ -1037,6 +1144,10 @@ pub fn statusline(
         "requests",
         "model",
         "context_pct",
+        "effort",
+        "ctx_tokens",
+        "rate_5h",
+        "rate_week",
     ]
     .iter()
     .map(|k| ((*k).to_string(), crate::statusline::NO_DATA.to_string()))
@@ -1072,6 +1183,15 @@ pub fn statusline(
         params.insert("model".to_string(), m.clone());
     } else if let Some(m) = proxy_model {
         params.insert("model".to_string(), m);
+    }
+    params.extend(claude_params);
+    if let Some(e) = config
+        .defaults
+        .active_effort
+        .clone()
+        .or_else(|| crate::stats::session_effort(&session))
+    {
+        params.insert("effort".to_string(), e);
     }
     if let Some(p) = context_pct {
         params.insert("context_pct".to_string(), p.to_string());

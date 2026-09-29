@@ -270,6 +270,7 @@ mod tests {
             defaults: Defaults {
                 provider: "anthropic".to_string(),
                 active_model: None,
+                active_effort: None,
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),

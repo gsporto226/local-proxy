@@ -77,6 +77,11 @@ enum Command {
         /// Model to set as active; omit to show current; "clear" to unset
         model: Option<String>,
     },
+    /// Show or set the reasoning effort the proxy forces on every request
+    Effort {
+        /// low | medium | high | xhigh | max; omit to show; "clear" to unset
+        level: Option<String>,
+    },
     /// Store the API key for an existing provider (catalog or config)
     Connect {
         /// Provider name (must exist in the catalog or config)
@@ -205,6 +210,7 @@ fn main() -> miette::Result<()> {
         Some(Command::Stop) => cli::stop(config),
         Some(Command::Models) => cli::models(config),
         Some(Command::Model { model }) => cli::model(config, model),
+        Some(Command::Effort { level }) => cli::effort(config, level),
         Some(Command::Connect { provider, key }) => cli::connect(config, provider, key),
         Some(Command::Disconnect { provider }) => cli::disconnect(config, provider),
         Some(Command::Providers) => cli::providers(config),

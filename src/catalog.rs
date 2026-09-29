@@ -57,6 +57,10 @@ pub fn effective_config(base: Config, overlay: Config) -> Config {
             overlay.defaults.provider.clone()
         },
         active_model: overlay.defaults.active_model.or(base.defaults.active_model),
+        active_effort: overlay
+            .defaults
+            .active_effort
+            .or(base.defaults.active_effort),
     };
 
     Config {

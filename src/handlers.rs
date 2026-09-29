@@ -598,8 +598,39 @@ async fn maybe_exec(
     let args = crate::exec::parse_args(cmd);
     if args.first().map(String::as_str) == Some("model") {
         Some(handle_model_exec(app, state, &args).await)
+    } else if args.first().map(String::as_str) == Some("effort") {
+        Some(handle_effort_exec(app, state, &args).await)
     } else {
         Some(crate::exec::run(&exec.command, &args, Duration::from_secs(exec.timeout_secs)).await)
+    }
+}
+
+/// Handle `$proxy effort [level|clear]` in-process: persist via the CLI logic
+/// and apply it to this instance right away (others follow via hot-reload).
+async fn handle_effort_exec(
+    app: &AppState,
+    state: &RuntimeState,
+    args: &[String],
+) -> crate::exec::ExecOutput {
+    let level = args.get(1).map(String::as_str);
+    let (stdout, stderr, code) = match crate::cli::effort_result(&state.config_path, level) {
+        Ok(msg) => {
+            if let Some(l) = level {
+                let value = (l != "clear").then(|| l.to_string());
+                let mut guard = app.inner.write().await;
+                let mut cfg = (*guard.config).clone();
+                cfg.defaults.active_effort = value;
+                guard.config = Arc::new(cfg);
+            }
+            (msg, String::new(), 0)
+        }
+        Err(e) => (String::new(), e.to_string(), 1),
+    };
+    crate::exec::ExecOutput {
+        stdout,
+        stderr,
+        code,
+        timed_out: false,
     }
 }
 
@@ -711,6 +742,24 @@ fn exec_responses_response(text: &str, model: &str) -> Response {
 // /v1/messages (Anthropic client)
 // ---------------------------------------------------------------------------
 
+/// The reasoning effort an Anthropic request asks for (`output_config.effort`,
+/// as Claude Code sends it), for the status line.
+fn request_effort(body: &[u8]) -> Option<String> {
+    #[derive(serde::Deserialize)]
+    struct OutputConfig {
+        effort: Option<String>,
+    }
+    #[derive(serde::Deserialize)]
+    struct Req {
+        output_config: Option<OutputConfig>,
+    }
+    serde_json::from_slice::<Req>(body)
+        .ok()?
+        .output_config?
+        .effort
+        .filter(|e| !e.is_empty())
+}
+
 async fn messages_handler(
     State(app): State<AppState>,
     headers: HeaderMap,
@@ -722,6 +771,11 @@ async fn messages_handler(
         Err(e) => return error_response(&e, true),
     };
     let session_id = extract_session_id(&headers);
+    if !session_id.is_empty() {
+        if let Some(effort) = request_effort(&body) {
+            stats::record_effort(&session_id, &effort);
+        }
+    }
     match handle_messages(&app, &state, &body, client_key.as_deref(), &session_id).await {
         Ok(r) => {
             tracing::info!(
@@ -780,6 +834,9 @@ async fn handle_messages(
         "resolved route"
     );
     body["model"] = json!(upstream_model);
+    if let Some(effort) = &state.config.defaults.active_effort {
+        body["output_config"]["effort"] = json!(effort);
+    }
     let client = client_for(state, &provider)?;
 
     let mut upstream_body = match provider.format {
@@ -1291,6 +1348,13 @@ mod tests {
     use super::*;
 
     #[test]
+    fn request_effort_reads_output_config() {
+        let body = br#"{"model":"m","output_config":{"effort":"xhigh"},"messages":[]}"#;
+        assert_eq!(request_effort(body).as_deref(), Some("xhigh"));
+        assert_eq!(request_effort(br#"{"model":"m"}"#), None);
+    }
+
+    #[test]
     fn auth_accepts_configured_keys() {
         let cfg = Config {
             server: crate::config::Server {
@@ -1411,6 +1475,7 @@ mod tests {
             defaults: crate::config::Defaults {
                 provider: "openai".to_string(),
                 active_model: Some("gpt-4o".to_string()),
+                active_effort: None,
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),
@@ -1465,6 +1530,7 @@ mod tests {
             defaults: crate::config::Defaults {
                 provider: "openai".to_string(),
                 active_model: Some("gpt-4o".to_string()),
+                active_effort: None,
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),
@@ -1524,6 +1590,7 @@ mod tests {
             defaults: crate::config::Defaults {
                 provider: "openai".to_string(),
                 active_model: Some("gpt-4o".to_string()),
+                active_effort: None,
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),
@@ -1575,6 +1642,7 @@ mod tests {
             defaults: crate::config::Defaults {
                 provider: "openai".to_string(),
                 active_model: None,
+                active_effort: None,
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),
@@ -1618,6 +1686,7 @@ mod tests {
             defaults: crate::config::Defaults {
                 provider: "openai".to_string(),
                 active_model: None,
+                active_effort: None,
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),
@@ -1721,6 +1790,7 @@ mod tests {
             defaults: crate::config::Defaults {
                 provider: "neuralwatt".to_string(),
                 active_model: Some("glm-5.2".to_string()),
+                active_effort: None,
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),

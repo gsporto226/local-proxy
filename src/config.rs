@@ -135,6 +135,10 @@ pub struct Defaults {
     /// model requested by the harness. Set via `local-proxy model` or
     /// `$proxy model`; persists across restarts.
     pub active_model: Option<String>,
+    /// Reasoning effort the proxy forces on every Anthropic request
+    /// (`output_config.effort`), ignoring the harness's. Set via
+    /// `local-proxy effort`; persists across restarts.
+    pub active_effort: Option<String>,
 }
 
 /// Template for the Claude Code status line, rendered by `local-proxy

@@ -129,7 +129,7 @@ fn normalize_effort(s: &str) -> Option<String> {
     match s.trim().to_ascii_lowercase().as_str() {
         "low" | "minimal" | "none" => Some("low".to_string()),
         "medium" | "moderate" => Some("medium".to_string()),
-        "high" | "max" | "full" => Some("high".to_string()),
+        "high" | "xhigh" | "max" | "full" => Some("high".to_string()),
         _ => None,
     }
 }
