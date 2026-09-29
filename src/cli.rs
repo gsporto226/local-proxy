@@ -482,6 +482,10 @@ fn tool_launch_env(
         env.push(("OPENAI_API_KEY".to_string(), "unused".to_string()));
         return (env, Some(format!("{base}/v1")));
     }
+    // Claude Code warns when both are set; the proxy accepts the Bearer token.
+    if tool == "claude" {
+        env.retain(|(k, _)| k != "ANTHROPIC_API_KEY");
+    }
     (env, None)
 }
 
@@ -2055,6 +2059,8 @@ mod tests {
         assert!(oai_base.is_none());
         assert!(!map.contains_key("OPENAI_API_BASE"));
         assert!(!map.contains_key("OPENAI_API_KEY"));
+        assert!(!map.contains_key("ANTHROPIC_API_KEY"));
+        assert_eq!(map["ANTHROPIC_AUTH_TOKEN"], "unused");
     }
 
     #[test]

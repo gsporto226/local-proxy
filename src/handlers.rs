@@ -139,6 +139,18 @@ pub fn build_runtime_state(config_path: &Path) -> Result<RuntimeState, RuntimeEr
     })
 }
 
+/// Carry this instance's in-memory state across a hot-reload: the active model
+/// (a model write must never leak to other proxies via the shared file) and
+/// the `--enforce-active-model` launch flag, which is not config at all.
+fn carry_instance_state(old: &RuntimeState, new: &mut RuntimeState) {
+    let mut cfg = (*new.config).clone();
+    cfg.defaults
+        .active_model
+        .clone_from(&old.config.defaults.active_model);
+    new.config = Arc::new(cfg);
+    new.enforce_active_model = old.enforce_active_model;
+}
+
 /// Spawn a file-watcher task that rebuilds `state` when the config or auth file
 /// changes (hot-reload without restart). Watches the global config dir and the
 /// parent of `config_path` when they differ.
@@ -191,14 +203,8 @@ pub fn spawn_watcher(config_path: PathBuf, app_state: &AppState) -> Result<(), R
         while brx.recv().await.is_some() {
             match build_runtime_state(&config_path) {
                 Ok(mut new_state) => {
-                    // Preserve this instance's in-memory active model: a model
-                    // write to the shared config must never leak to other
-                    // running proxies via hot-reload. Everything else (providers,
-                    // routes, auth) still reloads from the file.
-                    let current_model = state.read().await.config.defaults.active_model.clone();
-                    let mut cfg = (*new_state.config).clone();
-                    cfg.defaults.active_model = current_model;
-                    new_state.config = Arc::new(cfg);
+                    // Everything else (providers, routes, auth) reloads from the file.
+                    carry_instance_state(&*state.read().await, &mut new_state);
                     *state.write().await = new_state;
                     tracing::info!("config/auth change applied (hot-reload)");
                 }
@@ -1346,6 +1352,26 @@ fn text_len(value: &Value) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn hot_reload_keeps_enforce_and_active_model() {
+        let make = |model: Option<&str>, enforce: bool| {
+            let mut cfg = Config::default();
+            cfg.defaults.active_model = model.map(str::to_string);
+            RuntimeState {
+                config: Arc::new(cfg),
+                router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
+                clients: Arc::new(HashMap::new()),
+                enforce_active_model: enforce,
+                config_path: PathBuf::new(),
+            }
+        };
+        let old = make(Some("kimi"), true);
+        let mut new = make(None, false);
+        carry_instance_state(&old, &mut new);
+        assert!(new.enforce_active_model);
+        assert_eq!(new.config.defaults.active_model.as_deref(), Some("kimi"));
+    }
 
     #[test]
     fn request_effort_reads_output_config() {

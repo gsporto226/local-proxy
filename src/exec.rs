@@ -71,7 +71,13 @@ fn content_text(content: Option<&Value>) -> Option<String> {
             let mut out = String::new();
             for block in blocks {
                 if block.get("type").and_then(Value::as_str) == Some("text") {
-                    if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    // Claude Code prepends `<system-reminder>` blocks to the
+                    // user's text; they would hide a `$proxy` prefix.
+                    if let Some(t) = block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .filter(|t| !t.trim_start().starts_with("<system-reminder>"))
+                    {
                         out.push_str(t);
                     }
                 }
@@ -276,6 +282,17 @@ mod tests {
                 {"type": "text", "text": "models"}
             ]}
         ]);
+        assert_eq!(last_user_text(&v).as_deref(), Some("$proxy models"));
+    }
+
+    #[test]
+    fn last_user_text_skips_system_reminders() {
+        let v = serde_json::json!([{"role": "user", "content": [
+            {"type": "text", "text": "<system-reminder>
+ctx
+</system-reminder>"},
+            {"type": "text", "text": "$proxy models"}
+        ]}]);
         assert_eq!(last_user_text(&v).as_deref(), Some("$proxy models"));
     }
 
