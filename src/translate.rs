@@ -391,8 +391,11 @@ fn anthropic_image_to_openai(block: &Value) -> Result<Value, TranslateError> {
 }
 
 fn anthropic_tool_result_to_openai(block: &Value) -> Value {
+    // Anthropic tool_result blocks carry `tool_use_id`; accept `tool_call_id`
+    // too for lenient clients that already speak the OpenAI name.
     let id = block
-        .get("tool_call_id")
+        .get("tool_use_id")
+        .or_else(|| block.get("tool_call_id"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string();
@@ -1577,7 +1580,7 @@ mod tests {
             "messages": [
                 {"role": "user", "content": [
                     {"type": "text", "text": "check weather"},
-                    {"type": "tool_result", "tool_call_id": "call_1", "content": "sunny"}
+                    {"type": "tool_result", "tool_use_id": "call_1", "content": "sunny"}
                 ]},
                 {"role": "assistant", "content": [
                     {"type": "text", "text": "ok"},
