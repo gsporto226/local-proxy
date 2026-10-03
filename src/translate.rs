@@ -403,6 +403,29 @@ fn anthropic_tool_result_to_openai(block: &Value) -> Value {
     json!({"role": "tool", "tool_call_id": id, "content": text})
 }
 
+/// Recursively drop JSON Schema `pattern`/`patternProperties` keywords from a
+/// tool schema. They are advisory for chat-completions tool calls, and upstream
+/// validators can reject regexes they cannot compile (`DeepSeek` 400s on a `\0`
+/// escape, for example), which fails the whole request.
+fn strip_schema_patterns(mut value: Value) -> Value {
+    match &mut value {
+        Value::Object(map) => {
+            map.remove("pattern");
+            map.remove("patternProperties");
+            for v in map.values_mut() {
+                *v = strip_schema_patterns(std::mem::take(v));
+            }
+        }
+        Value::Array(arr) => {
+            for v in arr {
+                *v = strip_schema_patterns(std::mem::take(v));
+            }
+        }
+        _ => {}
+    }
+    value
+}
+
 fn anthropic_tools_to_openai(tools: &Value) -> Result<Value, TranslateError> {
     let arr = tools.as_array().ok_or_else(|| TranslateError::Invalid {
         field: "tools",
@@ -420,10 +443,11 @@ fn anthropic_tools_to_openai(tools: &Value) -> Result<Value, TranslateError> {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        let input_schema = tool
-            .get("input_schema")
-            .cloned()
-            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        let input_schema = strip_schema_patterns(
+            tool.get("input_schema")
+                .cloned()
+                .unwrap_or_else(|| json!({"type": "object", "properties": {}})),
+        );
         out.push(json!({
             "type": "function",
             "function": {
@@ -1601,6 +1625,36 @@ mod tests {
         assert_eq!(tcs[0]["id"], "call_1");
         assert_eq!(tcs[0]["function"]["name"], "weather");
         assert_eq!(tcs[0]["function"]["arguments"], r#"{"city":"sp"}"#);
+    }
+
+    #[test]
+    fn a_to_o_tools_drop_regex_patterns() {
+        let body = json!({
+            "tools": [{
+                "name": "artifact",
+                "description": "d",
+                "input_schema": {
+                    "type": "object",
+                    "properties": {
+                        "name": {"type": "string", "pattern": "^[^\\0]*$", "maxLength": 10},
+                        "nested": {"anyOf": [{"type": "string", "pattern": "^a$"}]},
+                        "map": {"type": "object", "patternProperties": {"^x": {"type": "string"}}}
+                    },
+                    "required": ["name"]
+                }
+            }]
+        });
+        let out = anthropic_to_openai_request(body).unwrap();
+        let schema = &out["tools"][0]["function"]["parameters"];
+        assert!(schema["properties"]["name"].get("pattern").is_none());
+        assert!(schema["properties"]["nested"]["anyOf"][0]
+            .get("pattern")
+            .is_none());
+        assert!(schema["properties"]["map"]
+            .get("patternProperties")
+            .is_none());
+        assert_eq!(schema["properties"]["name"]["maxLength"], 10);
+        assert_eq!(schema["required"], json!(["name"]));
     }
 
     #[test]
