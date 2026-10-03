@@ -151,6 +151,13 @@ fn carry_instance_state(old: &RuntimeState, new: &mut RuntimeState) {
     new.enforce_active_model = old.enforce_active_model;
 }
 
+/// Whether `path` is one of the files whose change triggers a hot-reload:
+/// the active config file or the auth store.
+fn is_reload_path(path: &Path, config_file: &std::ffi::OsStr) -> bool {
+    path.file_name()
+        .is_some_and(|name| name == config_file || name == "auth.json")
+}
+
 /// Spawn a file-watcher task that rebuilds `state` when the config or auth file
 /// changes (hot-reload without restart). Watches the global config dir and the
 /// parent of `config_path` when they differ.
@@ -160,12 +167,25 @@ fn carry_instance_state(old: &RuntimeState, new: &mut RuntimeState) {
 /// Returns an error if the file watcher cannot be created or started.
 #[allow(clippy::result_large_err)]
 pub fn spawn_watcher(config_path: PathBuf, app_state: &AppState) -> Result<(), RuntimeError> {
+    let config_file = config_path
+        .file_name()
+        .map(std::ffi::OsStr::to_os_string)
+        .unwrap_or_default();
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = notify_debouncer_full::new_debouncer(
         Duration::from_millis(300),
         None,
         move |result: notify_debouncer_full::DebounceEventResult| {
-            if result.is_ok() {
+            let Ok(events) = result else {
+                return;
+            };
+            // The config dir also holds `local-proxy.log`, `stats.db` and `pid`,
+            // which change on every request; only the reloadable files matter.
+            let relevant = events
+                .iter()
+                .flat_map(|e| e.event.paths.iter())
+                .any(|path| is_reload_path(path, &config_file));
+            if relevant {
                 let _ = tx.send(());
             }
         },
@@ -1412,6 +1432,18 @@ mod tests {
         carry_instance_state(&old, &mut new);
         assert!(new.enforce_active_model);
         assert_eq!(new.config.defaults.active_model.as_deref(), Some("kimi"));
+    }
+
+    #[test]
+    fn watcher_reacts_only_to_config_and_auth() {
+        let config = std::ffi::OsStr::new("config.yaml");
+        assert!(is_reload_path(Path::new("C:/cfg/config.yaml"), config));
+        assert!(is_reload_path(Path::new("C:/cfg/auth.json"), config));
+        assert!(!is_reload_path(Path::new("C:/cfg/other.yaml"), config));
+        assert!(!is_reload_path(Path::new("C:/cfg/local-proxy.log"), config));
+        assert!(!is_reload_path(Path::new("C:/cfg/stats.db"), config));
+        assert!(!is_reload_path(Path::new("C:/cfg/stats.db-wal"), config));
+        assert!(!is_reload_path(Path::new("C:/cfg/pid"), config));
     }
 
     #[test]

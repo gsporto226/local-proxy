@@ -86,10 +86,12 @@ impl ApiError {
 
     /// Tolerantly parse an upstream error body in either the Anthropic shape
     /// (`{"type":"error","error":{...}}`) or the `OpenAI` shape (`{"error":{...}}`).
+    /// Bodies that carry neither are surfaced verbatim (truncated) so the client
+    /// can see what the upstream actually said.
     #[must_use]
     pub fn from_upstream(status: u16, body: Value) -> Self {
         let mut kind = default_kind_for_status(status).to_string();
-        let mut message = format!("upstream error (status {status})");
+        let mut message = String::new();
 
         if let Some(err) = body.get("error") {
             if let Some(t) = err.get("type").and_then(Value::as_str) {
@@ -109,9 +111,33 @@ impl ApiError {
                 }
             }
         }
+        if message.is_empty() {
+            message = format!("upstream error (status {status}): {}", body_snippet(&body));
+        }
 
         Self::new(status, kind, message).with_upstream_body(body)
     }
+}
+
+/// Maximum number of characters of an upstream body kept in an error message.
+const BODY_SNIPPET_CHARS: usize = 300;
+
+/// Render an upstream body as a short single-line snippet for error messages.
+fn body_snippet(body: &Value) -> String {
+    let rendered = match body {
+        Value::Null => return "<empty body>".to_string(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    };
+    let trimmed = rendered.trim();
+    if trimmed.is_empty() {
+        return "<empty body>".to_string();
+    }
+    let mut snippet: String = trimmed.chars().take(BODY_SNIPPET_CHARS).collect();
+    if trimmed.chars().count() > BODY_SNIPPET_CHARS {
+        snippet.push('…');
+    }
+    snippet
 }
 
 const fn default_kind_for_status(status: u16) -> &'static str {
@@ -218,11 +244,31 @@ mod tests {
     }
 
     #[test]
-    fn falls_back_to_status_kind() {
+    fn non_standard_upstream_body_is_surfaced() {
         let err = ApiError::from_upstream(500, json!({"unexpected": true}));
         assert_eq!(err.kind, "api_error");
-        assert_eq!(err.message, "upstream error (status 500)");
+        assert_eq!(err.status, 500);
+        assert!(err.message.contains(r#"{"unexpected":true}"#));
         assert!(err.upstream_body.is_some());
+    }
+
+    #[test]
+    fn raw_empty_and_echo_upstream_bodies_are_surfaced() {
+        let err = ApiError::from_upstream(400, json!("plain failure"));
+        assert!(err.message.contains("plain failure"));
+
+        let err = ApiError::from_upstream(400, Value::Null);
+        assert!(err.message.contains("<empty body>"));
+
+        let err = ApiError::from_upstream(400, json!({"model": "deepseek-v4.1-flash"}));
+        assert!(err.message.contains(r#"{"model":"deepseek-v4.1-flash"}"#));
+    }
+
+    #[test]
+    fn upstream_body_snippet_is_truncated() {
+        let err = ApiError::from_upstream(400, json!("x".repeat(2000)));
+        assert!(err.message.chars().count() < 400);
+        assert!(err.message.ends_with('…'));
     }
 
     #[test]

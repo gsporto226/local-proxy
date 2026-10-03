@@ -205,6 +205,13 @@ impl ProviderClient {
             headers.insert(name, value);
         }
 
+        tracing::debug!(
+            target: crate::LOG_TARGET,
+            provider = %self.name,
+            body = %body,
+            "upstream request body"
+        );
+
         let resp = self
             .http
             .post(&url)
@@ -313,12 +320,32 @@ impl ProviderClient {
     }
 }
 
-/// Read a completed upstream response into `(status, json_body)`, tolerating a
-/// non-JSON body (yields `Value::Null`).
+/// Read a completed upstream response into `(status, body)`.
+///
+/// The raw body is read as text first, so a non-JSON error page is preserved
+/// as a [`Value::String`] instead of being silently dropped as [`Value::Null`].
 pub async fn send_and_read(resp: reqwest::Response) -> (u16, Value) {
     let status = resp.status().as_u16();
-    let body = resp.json::<Value>().await.unwrap_or(Value::Null);
-    (status, body)
+    let content_type = resp
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .unwrap_or("")
+        .to_string();
+    let text = resp.text().await.unwrap_or_default();
+    serde_json::from_str::<Value>(&text).map_or_else(
+        |_| {
+            tracing::warn!(
+                target: crate::LOG_TARGET,
+                status,
+                content_type = %content_type,
+                body = %text,
+                "upstream error body is not JSON"
+            );
+            (status, Value::String(text))
+        },
+        |body| (status, body),
+    )
 }
 
 #[cfg(test)]
@@ -560,5 +587,51 @@ connection: close
             client.list_models().await,
             vec!["new-model-1", "new-model-2"]
         );
+    }
+
+    /// One-shot server answering a request with `body` and `content_type`.
+    async fn body_server(body: &'static str, content_type: &'static str) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = [0u8; 1024];
+            let _ = sock.read(&mut buf).await;
+            let head = format!(
+                "HTTP/1.1 400 Bad Request\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(body.as_bytes()).await;
+        });
+        format!("http://{addr}")
+    }
+
+    #[tokio::test]
+    async fn send_and_read_keeps_non_json_error_body() {
+        let base = body_server("upstream exploded", "text/plain").await;
+        let resp = reqwest::get(&base).await.unwrap();
+        let (status, body) = send_and_read(resp).await;
+        assert_eq!(status, 400);
+        assert_eq!(body, Value::String("upstream exploded".to_string()));
+    }
+
+    #[tokio::test]
+    async fn send_and_read_parses_json_body() {
+        let base = body_server(r#"{"model":"m"}"#, "application/json").await;
+        let resp = reqwest::get(&base).await.unwrap();
+        let (status, body) = send_and_read(resp).await;
+        assert_eq!(status, 400);
+        assert_eq!(body, json!({"model": "m"}));
+    }
+
+    #[tokio::test]
+    async fn send_and_read_keeps_empty_body() {
+        let base = body_server("", "text/plain").await;
+        let resp = reqwest::get(&base).await.unwrap();
+        let (status, body) = send_and_read(resp).await;
+        assert_eq!(status, 400);
+        assert_eq!(body, Value::String(String::new()));
     }
 }
