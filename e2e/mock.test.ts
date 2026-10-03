@@ -52,7 +52,10 @@ afterAll(() => {
  * provider. A client-sent model wins and routes via the defined routes; the
  * configured `activeModel` is only the fallback used when a client sends none.
  */
-async function startScenario(activeModel: string, opts: { apiKeys?: string[] } = {}) {
+async function startScenario(
+  activeModel: string,
+  opts: { apiKeys?: string[]; autoModel?: string } = {},
+) {
   const mock = await startMockUpstream();
   const proxy = await startProxy(
     mockConfig(`http://127.0.0.1:${mock.port}`, { activeModel, ...opts }),
@@ -388,5 +391,72 @@ describe("e2e: client-provided model takes precedence", () => {
     expect(r.status).toBe(404);
     const body = JSON.parse(await readBody(r));
     expect(body.error.message).toContain("proxy: unknown model no-such-route");
+  });
+});
+
+describe("e2e: per-provider auto model", () => {
+  let mock: MockUpstream;
+  let proxy: ProxyHandle;
+
+  beforeAll(async () => {
+    const s = await startScenario("", { autoModel: "gpt-4o" });
+    mock = s.mock;
+    proxy = s.proxy;
+  });
+
+  afterAll(() => stopScenario({ mock, proxy }));
+
+  test("/v1/models lists the provider/auto alias", async () => {
+    const r = await get(proxy.base, "/v1/models");
+    expect(r.status).toBe(200);
+    const ids = JSON.parse(await readBody(r)).data.map((m: any) => m.id);
+    expect(ids).toContain("mock_openai/auto");
+    expect(ids).not.toContain("mock_anthropic/auto");
+  });
+
+  test("provider/auto resolves to the provider's auto_model", async () => {
+    const r = await postJson(proxy.base, "/v1/chat/completions", {
+      model: "mock_openai/auto",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(r.status).toBe(200);
+    const body = JSON.parse(await readBody(r));
+    expect(body.choices[0].message.content).toBe("hi");
+  });
+
+  test("bare auto resolves to a configured auto_model", async () => {
+    const r = await postJson(proxy.base, "/v1/messages", {
+      model: "auto",
+      max_tokens: 5,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(r.status).toBe(200);
+    const body = JSON.parse(await readBody(r));
+    expect(body.content[0].text).toBe("hi");
+  });
+
+  test("provider/auto without auto_model is a clear 404", async () => {
+    const r = await postJson(proxy.base, "/v1/chat/completions", {
+      model: "mock_anthropic/auto",
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(r.status).toBe(404);
+    const body = JSON.parse(await readBody(r));
+    expect(body.error.message).toContain("no auto_model configured");
+  });
+
+  test("bare auto with no configured provider is a clear 404", async () => {
+    const s = await startScenario("");
+    try {
+      const r = await postJson(s.proxy.base, "/v1/chat/completions", {
+        model: "auto",
+        messages: [{ role: "user", content: "hi" }],
+      });
+      expect(r.status).toBe(404);
+      const body = JSON.parse(await readBody(r));
+      expect(body.error.message).toContain("no provider has an auto_model configured");
+    } finally {
+      stopScenario(s);
+    }
   });
 });

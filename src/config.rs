@@ -75,6 +75,11 @@ pub struct Provider {
     pub format: ProviderFormat,
     /// Native model IDs the provider can serve.
     pub models: Vec<String>,
+    /// Model sent upstream when a request asks for `auto` (bare, or as
+    /// `<provider>/auto`). When unset, `auto` is not available for this
+    /// provider.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_model: Option<String>,
     /// Optional static HTTP headers sent with every request to this provider.
     /// Headers with the same name override the format/auth defaults.
     #[serde(default)]

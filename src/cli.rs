@@ -779,6 +779,12 @@ pub fn connected_models(config_path: &Path) -> Result<Vec<String>, CliError> {
                 models.push(qualified);
             }
         }
+        if provider.auto_model.is_some() {
+            let qualified = crate::config::qualified_id(&provider.name, "auto");
+            if !models.contains(&qualified) {
+                models.push(qualified);
+            }
+        }
     }
     Ok(models)
 }

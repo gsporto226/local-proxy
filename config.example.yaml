@@ -24,6 +24,8 @@ server:
 #     format: openai
 #     models:
 #       - gpt-4o
+#     # `auto` (bare or as `openai/auto`) sends this model upstream.
+#     auto_model: gpt-4o
 #
 # Example: add a custom provider.
 # providers:

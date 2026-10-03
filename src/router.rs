@@ -18,6 +18,15 @@ pub enum RouterError {
         /// Requested model that couldn't be resolved.
         model: String,
     },
+    /// `<provider>/auto` was requested but that provider has no `auto_model`.
+    #[error("provider has no auto_model configured: {provider}")]
+    AutoModelNotConfigured {
+        /// Provider whose auto model was requested.
+        provider: String,
+    },
+    /// Bare `auto` was requested but no provider defines an `auto_model`.
+    #[error("no provider has an auto_model configured")]
+    NoAutoModel,
 }
 
 /// A successfully resolved route to an upstream provider.
@@ -133,8 +142,15 @@ impl Router {
             return Ok(self.resolve_route(route_idx, model));
         }
 
+        if model == "auto" {
+            return self.resolve_auto(is_connected);
+        }
+
         if let Some((provider_name, upstream)) = model.split_once('/') {
             if let Some(&provider_idx) = self.providers.get(provider_name) {
+                if upstream == "auto" {
+                    return self.resolve_provider_auto(provider_idx);
+                }
                 return Ok(ResolvedRoute {
                     provider: Arc::new(self.config.providers[provider_idx].clone()),
                     upstream_model: upstream.to_string(),
@@ -206,8 +222,65 @@ impl Router {
                     models.push(model.clone());
                 }
             }
+            if provider.auto_model.is_some() {
+                let id = crate::config::qualified_id(&provider.name, "auto");
+                if !models.contains(&id) {
+                    models.push(id);
+                }
+            }
         }
         models
+    }
+
+    /// Resolve the bare `auto` keyword to a provider's `auto_model`: the
+    /// default provider when it defines one and is connected, else the first
+    /// connected provider that defines one, else the first provider that
+    /// defines one at all (so the caller can surface the no-key error).
+    fn resolve_auto(
+        &self,
+        is_connected: &dyn Fn(&str) -> bool,
+    ) -> Result<ResolvedRoute, RouterError> {
+        let mut fallback: Option<usize> = None;
+        if let Some(idx) = self.default_provider {
+            if self.config.providers[idx].auto_model.is_some() {
+                if is_connected(&self.config.providers[idx].name) {
+                    return self.resolve_provider_auto(idx);
+                }
+                fallback = Some(idx);
+            }
+        }
+        for (idx, provider) in self.config.providers.iter().enumerate() {
+            if provider.auto_model.is_none() || fallback == Some(idx) {
+                continue;
+            }
+            if is_connected(&provider.name) {
+                return self.resolve_provider_auto(idx);
+            }
+            if fallback.is_none() {
+                fallback = Some(idx);
+            }
+        }
+        fallback.map_or(Err(RouterError::NoAutoModel), |idx| {
+            self.resolve_provider_auto(idx)
+        })
+    }
+
+    /// Resolve `<provider>/auto` to that provider's configured `auto_model`.
+    fn resolve_provider_auto(&self, provider_idx: usize) -> Result<ResolvedRoute, RouterError> {
+        let provider = &self.config.providers[provider_idx];
+        provider.auto_model.as_ref().map_or_else(
+            || {
+                Err(RouterError::AutoModelNotConfigured {
+                    provider: provider.name.clone(),
+                })
+            },
+            |auto| {
+                Ok(ResolvedRoute {
+                    provider: Arc::new(provider.clone()),
+                    upstream_model: auto.clone(),
+                })
+            },
+        )
     }
 
     fn resolve_route(&self, route_idx: usize, model: &str) -> ResolvedRoute {
@@ -237,6 +310,7 @@ mod tests {
                     base_url: "https://api.anthropic.com".to_string(),
                     format: ProviderFormat::Anthropic,
                     models: vec!["claude-native-1".to_string()],
+                    auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
                 },
@@ -245,6 +319,7 @@ mod tests {
                     base_url: "https://api.openai.com/v1".to_string(),
                     format: ProviderFormat::Openai,
                     models: vec!["gpt-native-1".to_string()],
+                    auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
                 },
@@ -363,6 +438,98 @@ mod tests {
         // no connected provider -> falls back to the first (unconnected) match
         let resolved = router.resolve_model("shared", &|_| false).unwrap();
         assert_eq!(resolved.provider.name, "anthropic");
+    }
+
+    #[test]
+    fn provider_auto_resolves_to_auto_model() {
+        let mut c = config();
+        c.providers[1].auto_model = Some("gpt-auto-1".to_string());
+        let router = router_for(c);
+        let resolved = router.resolve_model("openai/auto", &|_| true).unwrap();
+        assert_eq!(resolved.provider.name, "openai");
+        assert_eq!(resolved.upstream_model, "gpt-auto-1");
+        // Client-strict resolution accepts it too.
+        let resolved = router
+            .resolve_client_model("openai/auto", &|_| true)
+            .unwrap();
+        assert_eq!(resolved.upstream_model, "gpt-auto-1");
+    }
+
+    #[test]
+    fn provider_auto_without_auto_model_fails() {
+        let router = router_for(config());
+        let err = router.resolve_model("openai/auto", &|_| true).unwrap_err();
+        assert!(matches!(err, RouterError::AutoModelNotConfigured { .. }));
+    }
+
+    #[test]
+    fn bare_auto_uses_default_provider_auto_model() {
+        let mut c = config();
+        c.providers[0].auto_model = Some("claude-auto".to_string());
+        let router = router_for(c);
+        let resolved = router.resolve_model("auto", &|_| true).unwrap();
+        assert_eq!(resolved.provider.name, "anthropic");
+        assert_eq!(resolved.upstream_model, "claude-auto");
+        // A client-sent `auto` goes through the same (strict) resolution.
+        let resolved = router.resolve_client_model("auto", &|_| true).unwrap();
+        assert_eq!(resolved.upstream_model, "claude-auto");
+    }
+
+    #[test]
+    fn bare_auto_prefers_connected_provider_over_unconnected_default() {
+        let mut c = config();
+        c.providers[0].auto_model = Some("claude-auto".to_string());
+        c.providers[1].auto_model = Some("gpt-auto-1".to_string());
+        let router = router_for(c);
+        let resolved = router
+            .resolve_model("auto", &|name| name == "openai")
+            .unwrap();
+        assert_eq!(resolved.provider.name, "openai");
+        assert_eq!(resolved.upstream_model, "gpt-auto-1");
+    }
+
+    #[test]
+    fn bare_auto_falls_back_to_unconnected_provider() {
+        let mut c = config();
+        c.providers[1].auto_model = Some("gpt-auto-1".to_string());
+        let router = router_for(c);
+        let resolved = router.resolve_model("auto", &|_| false).unwrap();
+        assert_eq!(resolved.provider.name, "openai");
+    }
+
+    #[test]
+    fn bare_auto_without_any_auto_model_fails() {
+        let router = router_for(config());
+        let err = router.resolve_model("auto", &|_| true).unwrap_err();
+        assert!(matches!(err, RouterError::NoAutoModel));
+        let err = router.resolve_client_model("auto", &|_| true).unwrap_err();
+        assert!(matches!(err, RouterError::NoAutoModel));
+    }
+
+    #[test]
+    fn exact_route_named_auto_wins() {
+        let mut c = config();
+        c.providers[0].auto_model = Some("claude-auto".to_string());
+        c.routes.push(Route {
+            model: "auto".to_string(),
+            provider: "openai".to_string(),
+            prefix: false,
+            upstream_model: Some("gpt-4o".to_string()),
+        });
+        let router = router_for(c);
+        let resolved = router.resolve_model("auto", &|_| true).unwrap();
+        assert_eq!(resolved.provider.name, "openai");
+        assert_eq!(resolved.upstream_model, "gpt-4o");
+    }
+
+    #[test]
+    fn list_models_includes_auto_alias() {
+        let mut c = config();
+        c.providers[1].auto_model = Some("gpt-auto-1".to_string());
+        let router = router_for(c);
+        let models = router.list_models();
+        assert!(models.contains(&"openai/auto".to_string()));
+        assert!(!models.contains(&"anthropic/auto".to_string()));
     }
 
     #[test]

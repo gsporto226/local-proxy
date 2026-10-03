@@ -147,6 +147,23 @@ providers:
     models: [openrouter/auto]
 ```
 
+### Auto model per provider
+
+A provider can name an `auto_model`: the model the proxy sends upstream when a request asks for `auto`, as `provider/auto` or as the bare keyword.
+
+```yaml
+providers:
+  - name: opencode-go
+    base_url: https://opencode.ai/zen/go
+    format: openai
+    auto_model: deepseek-v4-flash
+```
+
+- `opencode-go/auto` routes to `opencode-go` and sends `deepseek-v4-flash` upstream.
+- Bare `auto` uses the default provider's auto model (`defaults.provider`) when it is connected, else the first connected provider that defines one, else the first provider that defines one.
+- A provider without `auto_model` rejects `<provider>/auto` with `proxy: provider '<name>' has no auto_model configured`. Bare `auto` with no provider configured fails the same way. An exact route named `auto` always wins.
+- `local-proxy models` lists `provider/auto` for connected providers that define it, and `local-proxy model provider/auto` (or `$proxy model provider/auto`) selects and persists it.
+
 ### Keys: connect and disconnect
 
 Keys live in `auth.json`, never in the config. `connect` only accepts providers that already exist, in the catalog or added by your config.

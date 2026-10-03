@@ -359,6 +359,7 @@ mod tests {
             base_url: "http://127.0.0.1:9".to_string(),
             format,
             models: Vec::new(),
+            auto_model: None,
             headers: std::collections::HashMap::new(),
             session_header: None,
         }

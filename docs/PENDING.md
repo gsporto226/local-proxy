@@ -197,6 +197,23 @@ Estado atual do proxy `local-proxy`. Última atualização: 2026-08-21.
 - `cli.rs` `statusline`: resolve `model` de `config.defaults.active_model` / `first_available_model`
   em vez de `sess.last_model`. **146** unit tests verdes; fmt/clippy limpos.
 
+### Nova rodada — auto model por provider
+- Campo novo **`Provider.auto_model`** (opcional, `skip_serializing_if`): o modelo enviado ao
+  upstream quando a request pede `auto` — como `provider/auto` ou como palavra-chave `auto`.
+- `router.rs`: `resolve_provider_auto` (`<provider>/auto` → `auto_model`, erro
+  `AutoModelNotConfigured` quando o provider não define um) e `resolve_auto` (bare `auto`: provider
+  default conectado → primeiro conectado com `auto_model` → primeiro com `auto_model`, senão
+  `NoAutoModel`). Vale nos dois caminhos (modelo do cliente, estrito, e `active_model`); rota exata
+  chamada `auto` continua vencendo.
+- Erros novos mapeados em `error.rs` para 404 com mensagem clara (`proxy: provider 'x' has no
+  auto_model configured` / `proxy: no provider has an auto_model configured`).
+- `cli.rs` `connected_models`: lista `provider/auto` para provider conectado com `auto_model`
+  (logo `models` lista e `model provider/auto` valida/persiste); `/v1/models` (`Router::list_models`)
+  idem.
+- Testes: 7 unit novos no router + 1 de mapeamento de erro + e2e mock (novo describe com 5 testes:
+  alias em `/v1/models`, `provider/auto`, `auto` bare, e os dois 404 claros). README +
+  `config.example.yaml` documentam o campo.
+
 ### Estado de verificação (task 010)
 - `cargo test --all-features`: **122** unit tests verdes.
 - `cargo clippy --all-targets --all-features -- -D warnings`: limpo.

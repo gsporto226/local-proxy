@@ -199,6 +199,12 @@ impl From<RouterError> for ApiError {
             RouterError::ProviderNotFound { provider } => {
                 Self::internal(format!("provider not configured: {provider}"))
             }
+            RouterError::AutoModelNotConfigured { provider } => Self::not_found(format!(
+                "proxy: provider '{provider}' has no auto_model configured"
+            )),
+            RouterError::NoAutoModel => Self::not_found(
+                "proxy: no provider has an auto_model configured; set auto_model in the config",
+            ),
         }
     }
 }
@@ -279,5 +285,23 @@ mod tests {
         assert_eq!(err.status, 404);
         assert_eq!(err.kind, "not_found_error");
         assert_eq!(err.message, "proxy: unknown model nope");
+    }
+
+    #[test]
+    fn auto_model_errors_map_to_not_found() {
+        let err = ApiError::from(RouterError::AutoModelNotConfigured {
+            provider: "openai".to_string(),
+        });
+        assert_eq!(err.status, 404);
+        assert_eq!(
+            err.message,
+            "proxy: provider 'openai' has no auto_model configured"
+        );
+
+        let err = ApiError::from(RouterError::NoAutoModel);
+        assert_eq!(err.status, 404);
+        assert!(err
+            .message
+            .contains("no provider has an auto_model configured"));
     }
 }

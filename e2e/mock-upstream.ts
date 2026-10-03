@@ -111,7 +111,7 @@ export function yamlList(values: string[]): string {
 
 export function mockConfig(
   mockBase: string,
-  opts: { apiKeys?: string[]; activeModel?: string } = {},
+  opts: { apiKeys?: string[]; activeModel?: string; autoModel?: string } = {},
 ): string {
   const apiKeys =
     opts.apiKeys && opts.apiKeys.length
@@ -122,6 +122,7 @@ export function mockConfig(
   const active = opts.activeModel
     ? `  active_model: ${opts.activeModel}\n`
     : "";
+  const auto = opts.autoModel ? `    auto_model: ${opts.autoModel}\n` : "";
   return `
 server:
   host: 127.0.0.1
@@ -133,7 +134,7 @@ providers:
   - name: mock_openai
     base_url: ${mockBase}
     format: openai
-  - name: mock_anthropic
+${auto}  - name: mock_anthropic
     base_url: ${mockBase}
     format: anthropic
 
