@@ -33,6 +33,59 @@ providers:
   - name: openai
     base_url: https://api.openai.com/v1
     format: openai
+  # ChatGPT Plus/Pro subscription backend (Codex). Authenticate with
+  # `local-proxy connect chatgpt --oauth` (browser PKCE with a localhost
+  # callback); it speaks the Responses API.
+  #
+  # These are the Codex-catalog slugs, pinned here because the backend has no
+  # `/v1/models`. They are NOT the same as the ones the chat web UI uses
+  # (`/backend-api/models` returns e.g. `gpt-6.1-sol-wm`, which this backend
+  # rejects with "model is not supported when using Codex with a ChatGPT
+  # account"). The authoritative list for an account is
+  # `GET /backend-api/codex/models?client_version=<codex version>`, which needs
+  # the `chatgpt-account-id` header. Reasoning depth is a request field, not
+  # part of the name: see the `-low`/`-medium` routes below.
+  #
+  # The backend also requires `stream: true` (non-streaming upstream is
+  # rejected), which the proxy handles by streaming and aggregating.
+  - name: chatgpt
+    base_url: https://chatgpt.com/backend-api/codex
+    format: openai-responses
+    headers:
+      originator: codex_cli_rs
+      OpenAI-Beta: responses=experimental
+      User-Agent: local-proxy
+    oauth:
+      flow: callback
+      authorize_url: https://auth.openai.com/oauth/authorize
+      token_url: https://auth.openai.com/oauth/token
+      # Public Codex CLI client id.
+      client_id: app_EMoamEEZ73f0CkXaXp7hrann
+      scopes:
+        - openid
+        - profile
+        - email
+        - offline_access
+      redirect_uri: http://localhost:1455/auth/callback
+      authorize_params:
+        id_token_add_organizations: "true"
+        codex_cli_simplified_flow: "true"
+      token_encoding: form
+      account_id_claim: https://api.openai.com/auth
+      account_id_header: chatgpt-account-id
+    models:
+      - gpt-6-sol
+      - gpt-6-astra
+      - gpt-6-luna
+      - gpt-5.6-sol
+      - gpt-5.6-terra
+      - gpt-5.6-luna
+      # Reasoning-effort variants: the same model at a fixed effort. They are
+      # listed here so `local-proxy models` offers them and `local-proxy model`
+      # accepts them; the routes below map each one back to its real slug plus
+      # the effort field.
+      - gpt-6-sol-low
+      - gpt-6-sol-medium
   - name: opencode-go
     base_url: https://opencode.ai/zen/go
     format: openai
@@ -63,3 +116,13 @@ providers:
     base_url: https://api.neuralwatt.com/v1
     format: openai
 
+routes:
+  # ChatGPT effort variants: one model id, reasoning depth as a request field.
+  - model: chatgpt/gpt-6-sol-low
+    provider: chatgpt
+    upstream_model: gpt-6-sol
+    reasoning_effort: low
+  - model: chatgpt/gpt-6-sol-medium
+    provider: chatgpt
+    upstream_model: gpt-6-sol
+    reasoning_effort: medium

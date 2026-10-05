@@ -58,6 +58,7 @@ pub struct ProviderClient {
     oauth_state: Option<Arc<tokio::sync::Mutex<OAuthState>>>,
     oauth_headers: std::collections::HashMap<String, String>,
     identity: Option<String>,
+    account_header: Option<String>,
     passthrough: bool,
     headers: std::collections::HashMap<String, String>,
     session_header: Option<String>,
@@ -103,6 +104,10 @@ impl ProviderClient {
             oauth_state,
             oauth_headers,
             identity,
+            account_header: provider
+                .oauth
+                .as_ref()
+                .and_then(|c| c.account_id_header.clone()),
             passthrough,
             headers: provider.headers.clone(),
             session_header: provider.session_header.clone(),
@@ -135,6 +140,7 @@ impl ProviderClient {
         match self.format {
             ProviderFormat::Anthropic => "/v1/messages",
             ProviderFormat::Openai => "/v1/chat/completions",
+            ProviderFormat::OpenaiResponses => "/responses",
         }
     }
 
@@ -199,6 +205,19 @@ impl ProviderClient {
         (!access.is_empty()).then_some(access)
     }
 
+    /// Account id stored with the OAuth tokens, for `oauth.account_id_header`.
+    async fn oauth_account(&self) -> Option<String> {
+        match &self.oauth_state {
+            Some(state) => state.lock().await.tokens.account_id.clone(),
+            None => self
+                .auth
+                .as_ref()
+                .and_then(AuthEntry::oauth)?
+                .account_id
+                .clone(),
+        }
+    }
+
     /// Insert the provider's OAuth-only headers (beta flags, app identity).
     fn insert_oauth_headers(&self, headers: &mut HeaderMap) {
         for (name, value) in &self.oauth_headers {
@@ -230,6 +249,7 @@ impl ProviderClient {
     /// Returns [`UpstreamError::MissingApiKey`] if no credential is available,
     /// [`UpstreamError::InvalidHeader`] if a header cannot be built, or
     /// [`UpstreamError::Request`] if the HTTP request fails.
+    #[allow(clippy::too_many_lines)]
     pub async fn chat_request(
         &self,
         path: &str,
@@ -278,6 +298,17 @@ impl ProviderClient {
                 );
             }
             self.insert_oauth_headers(&mut headers);
+            if let (Some(name), Some(account)) = (&self.account_header, self.oauth_account().await)
+            {
+                headers.insert(
+                    reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|e| {
+                        UpstreamError::InvalidHeader {
+                            detail: e.to_string(),
+                        }
+                    })?,
+                    Self::header_value(&account)?,
+                );
+            }
             if self.format == ProviderFormat::Anthropic {
                 if let Some(identity) = &self.identity {
                     inject_identity(&mut body, identity);
@@ -292,7 +323,7 @@ impl ProviderClient {
                         HeaderValue::from_static(ANTHROPIC_VERSION),
                     );
                 }
-                ProviderFormat::Openai => {
+                ProviderFormat::Openai | ProviderFormat::OpenaiResponses => {
                     headers.insert(AUTHORIZATION, Self::header_value(&format!("Bearer {key}"))?);
                 }
             }
@@ -439,7 +470,7 @@ impl ProviderClient {
         } else if let Some(key) = api_key {
             req = match self.format {
                 ProviderFormat::Anthropic => req.header("x-api-key", key),
-                ProviderFormat::Openai => req.bearer_auth(key),
+                ProviderFormat::Openai | ProviderFormat::OpenaiResponses => req.bearer_auth(key),
             };
         }
         if self.format == ProviderFormat::Anthropic {
@@ -822,6 +853,7 @@ connection: close
             access: access.to_string(),
             refresh: refresh.to_string(),
             expires,
+            account_id: None,
         })
     }
 

@@ -2,13 +2,16 @@
 #
 # The provider catalog is embedded in the binary (src/catalog.yaml). This file
 # only *adds* or *overrides* providers/routes/defaults from that catalog.
-# For the full list of embedded providers (anthropic, openai, opencode-go, zen,
-# groq, xai, google, deepseek, openrouter, neuralwatt) and their models, edit
-# the catalog or run `local-proxy providers`.
+# For the full list of embedded providers (anthropic, openai, chatgpt,
+# opencode-go, zen, groq, xai, google, deepseek, openrouter, neuralwatt) and
+# their models, edit the catalog or run `local-proxy providers`.
 #
 # Provider API keys live exclusively in the global auth store (`auth.json`),
 # never in the config. Store a key with:
 #   local-proxy connect <provider> [key]
+#
+# Subscription providers (ChatGPT Plus/Pro) log in with OAuth instead:
+#   local-proxy connect chatgpt --oauth
 
 server:
   host: 127.0.0.1
@@ -34,6 +37,22 @@ server:
 #     format: openai
 #     models:
 #       - local-model
+#
+# Example: a Responses-API provider with a static key.
+# providers:
+#   - name: my-responses-host
+#     base_url: https://example.com/v1
+#     format: openai-responses
+#     models:
+#       - some-model
+#
+# Example: pin a reasoning effort to a ChatGPT model. Effort is a request field,
+# not part of the model id, so each variant is a route over the same slug.
+# routes:
+#   - model: chatgpt/gpt-6-sol-low
+#     provider: chatgpt
+#     upstream_model: gpt-6-sol
+#     reasoning_effort: low       # none | minimal | low | medium | high | xhigh | max
 #
 # routes:
 #   - model: mylocal-model

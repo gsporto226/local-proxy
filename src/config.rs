@@ -27,7 +27,7 @@ server:
   passthrough_keys: false
 ";
 
-/// Wire format a provider's API expects (`Anthropic` vs `OpenAI`).
+/// Wire format a provider's API expects.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderFormat {
@@ -36,6 +36,20 @@ pub enum ProviderFormat {
     Anthropic,
     /// `OpenAI` Chat Completions format.
     Openai,
+    /// `OpenAI` Responses API format (used by the `ChatGPT` backend).
+    #[serde(rename = "openai-responses")]
+    OpenaiResponses,
+}
+
+/// How token requests are encoded.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum TokenEncoding {
+    /// `application/json` body.
+    #[default]
+    Json,
+    /// `application/x-www-form-urlencoded` body (RFC 6749 default).
+    Form,
 }
 
 /// How the interactive OAuth login gets the authorization code.
@@ -49,6 +63,9 @@ pub enum OAuthFlow {
     /// shows from stdin (`claude setup-token` / Claude Code `/login` style).
     #[default]
     Paste,
+    /// Open the authorize URL in the browser and catch the redirect on a
+    /// local listener bound to `redirect_uri` (Codex CLI style).
+    Callback,
 }
 
 /// OAuth 2.0 client recipe for a subscription provider.
@@ -82,6 +99,15 @@ pub struct OAuthProvider {
     /// (Anthropic rejects non-Haiku OAuth calls without it).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub identity: Option<String>,
+    /// Encoding of the token endpoint request body.
+    pub token_encoding: TokenEncoding,
+    /// JWT claim namespace in the `id_token` holding `chatgpt_account_id`;
+    /// when set, the account id is stored with the tokens.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id_claim: Option<String>,
+    /// Header that carries the stored account id on OAuth requests.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id_header: Option<String>,
 }
 
 /// Network and authentication settings for the proxy server.
@@ -152,6 +178,13 @@ pub struct Route {
     pub prefix: bool,
     /// Optional model name to send upstream instead of the requested one.
     pub upstream_model: Option<String>,
+    /// Reasoning effort to request upstream (`low`, `medium`, `high`, …).
+    ///
+    /// Only meaningful for providers whose reasoning depth is a request field
+    /// rather than part of the model name — the `ChatGPT` Codex backend, where
+    /// `gpt-6-sol` at `low` and at `medium` share one model id. The proxy adds
+    /// it to the request body; providers that ignore the field are unaffected.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Configuration for the `$proxy` local-command-execution feature.
@@ -461,6 +494,7 @@ impl fmt::Display for ProviderFormat {
         match self {
             Self::Anthropic => write!(f, "anthropic"),
             Self::Openai => write!(f, "openai"),
+            Self::OpenaiResponses => write!(f, "openai-responses"),
         }
     }
 }
@@ -628,6 +662,67 @@ mod tests {
         assert!(config.providers.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_format_parses_openai_responses() {
+        let config = Config::from_str(
+            "providers:\n  - name: chatgpt\n    base_url: http://x\n    format: openai-responses\n",
+            "yaml",
+        )
+        .expect("yaml parses");
+        assert_eq!(config.providers[0].format, ProviderFormat::OpenaiResponses);
+        assert_eq!(config.providers[0].format.to_string(), "openai-responses");
+
+        // round-trips through YAML with the same spelling
+        let yaml = serde_yaml::to_string(&config.providers[0]).expect("serializes");
+        assert!(yaml.contains("openai-responses"), "{yaml}");
+    }
+
+    #[test]
+    fn route_reasoning_effort_parses_and_defaults_to_none() {
+        let config = Config::from_str(
+            r"routes:
+  - model: sol-low
+    provider: chatgpt
+    upstream_model: gpt-6-sol
+    reasoning_effort: low
+  - model: plain
+    provider: chatgpt
+",
+            "yaml",
+        )
+        .expect("yaml parses");
+        assert_eq!(config.routes[0].reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            config.routes[0].upstream_model.as_deref(),
+            Some("gpt-6-sol")
+        );
+        assert_eq!(config.routes[1].reasoning_effort, None);
+
+        // A route without an effort still serializes the field (as null), which
+        // matches how `upstream_model` already behaves; the value round-trips.
+        let yaml = serde_yaml::to_string(&config.routes[1]).expect("serializes");
+        assert!(yaml.contains("reasoning_effort: null"), "{yaml}");
+        let back: crate::config::Route = serde_yaml::from_str(&yaml).expect("parses back");
+        assert_eq!(back.reasoning_effort, None);
+    }
+
+    #[test]
+    fn chatgpt_catalog_recipe_uses_callback_and_form() {
+        let catalog = crate::catalog::load().expect("catalog parses");
+        let p = catalog
+            .providers
+            .iter()
+            .find(|p| p.name == "chatgpt")
+            .expect("chatgpt in catalog");
+        let oauth = p.oauth.as_ref().expect("chatgpt has oauth");
+        assert_eq!(oauth.flow, OAuthFlow::Callback);
+        assert_eq!(oauth.token_encoding, TokenEncoding::Form);
+        assert_eq!(
+            oauth.account_id_header.as_deref(),
+            Some("chatgpt-account-id")
+        );
     }
 
     #[test]

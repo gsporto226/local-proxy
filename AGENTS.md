@@ -45,3 +45,28 @@ bloqueante localmente.
 - O projeto usa `missing_docs = "deny"`: todo item público precisa de `///`.
 - Não rode só `cargo test` — o CI reprova em `cargo fmt`/`cargo clippy` mesmo
   com os testes verdes (foi o que causou CI vermelho em `cc1b86c`).
+
+### Testes e2e nunca tocam o `auth.json` real
+
+O store de credenciais vive em `<config dir>/auth.json`
+(`%APPDATA%\local-proxy\config\auth.json` no Windows). Um teste que escreva
+ali apaga ou sobrescreve as chaves do usuário — e se o teste falhar, der
+timeout ou for interrompido antes do `afterAll`, a restauração não acontece e
+as chaves se perdem de vez.
+
+Todo suite que precise semear credenciais usa `isolatedConfigDir()` de
+`e2e/helpers.ts`, que cria um diretório temporário e devolve o env
+`LOCAL_PROXY_CONFIG_DIR` apontando para ele (o proxy e os subcomandos da CLI
+respeitam essa variável). Passe esse env ao `startProxy` e escreva o
+`auth.json` dentro do diretório retornado:
+
+```ts
+const { dir, env } = isolatedConfigDir();
+writeFileSync(authStorePath(dir), JSON.stringify({ meu_provider: { type: "api", key: "k" } }));
+const proxy = await startProxy(cfg, undefined, env);
+```
+
+Nunca faça backup/restore do arquivo real: uma restauração que não roda é uma
+perda silenciosa de credenciais. O prefixo do diretório temporário não pode
+começar com `local-proxy-e2e-` (o `stopProxy` varre temporários com esse
+prefixo e apagaria o store de outro suite).

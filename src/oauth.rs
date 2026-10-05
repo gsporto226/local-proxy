@@ -3,10 +3,11 @@
 //! Provider-specific details (endpoints, client id, scopes, headers, identity
 //! prompt) come from the `oauth:` block of a [`crate::config::Provider`]; this
 //! module only knows the standard OAuth shape. The interactive login is driven
-//! by [`crate::config::OAuthFlow`]: today only `paste` is implemented, and a
-//! new interaction is one flow variant plus one function here.
+//! by [`crate::config::OAuthFlow`]: `paste` (read the code from stdin) and
+//! `callback` (catch the redirect on a local listener, [`callback_login`]).
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::collections::HashMap;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
 use base64::Engine as _;
@@ -14,7 +15,7 @@ use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
 
 use crate::auth::OAuthTokens;
-use crate::config::OAuthProvider;
+use crate::config::{OAuthProvider, TokenEncoding};
 
 /// Refresh the access token this long before it actually expires.
 pub const REFRESH_LEEWAY_MS: i64 = 60_000;
@@ -52,6 +53,15 @@ pub enum OAuthError {
     /// The token response carried no access token.
     #[error("resposta oauth sem access_token")]
     MissingToken,
+    /// The callback `state` did not match the value we sent.
+    #[error("estado OAuth invalido (possivel CSRF)")]
+    StateMismatch,
+    /// The local callback listener failed or the provider returned an error.
+    #[error("falha no servidor de callback: {0}")]
+    Callback(String),
+    /// No callback arrived before the deadline.
+    #[error("tempo esgotado esperando o login no navegador")]
+    Timeout,
 }
 
 /// Current unix time in milliseconds.
@@ -190,30 +200,34 @@ pub async fn refresh(
     for (key, value) in &provider.token_params {
         params.insert(key.clone(), json!(value));
     }
-    post_tokens(
-        http,
-        provider,
-        &Value::Object(params),
-        Some(&current.refresh),
-    )
-    .await
+    post_tokens(http, provider, &Value::Object(params), Some(current)).await
 }
 
+/// POST to the token endpoint; `current` supplies the refresh token and account
+/// id to keep when the response omits them.
 async fn post_tokens(
     http: &reqwest::Client,
     provider: &OAuthProvider,
     body: &Value,
-    fallback_refresh: Option<&str>,
+    current: Option<&OAuthTokens>,
 ) -> Result<OAuthTokens, OAuthError> {
-    let resp = http
-        .post(&provider.token_url)
-        .json(body)
-        .send()
-        .await
-        .map_err(|e| OAuthError::Request {
-            url: provider.token_url.clone(),
-            detail: e.to_string(),
-        })?;
+    let request = http.post(&provider.token_url);
+    let request = match provider.token_encoding {
+        TokenEncoding::Json => request.json(body),
+        TokenEncoding::Form => {
+            let pairs: Vec<(&str, &str)> = body
+                .as_object()
+                .into_iter()
+                .flatten()
+                .filter_map(|(k, v)| v.as_str().map(|v| (k.as_str(), v)))
+                .collect();
+            request.form(&pairs)
+        }
+    };
+    let resp = request.send().await.map_err(|e| OAuthError::Request {
+        url: provider.token_url.clone(),
+        detail: e.to_string(),
+    })?;
     let status = resp.status();
     let text = resp.text().await.unwrap_or_default();
     if !status.is_success() {
@@ -223,10 +237,14 @@ async fn post_tokens(
             detail: format!("HTTP {status}: {excerpt}"),
         });
     }
-    parse_tokens(&text, fallback_refresh)
+    parse_tokens(&text, provider, current)
 }
 
-fn parse_tokens(text: &str, fallback_refresh: Option<&str>) -> Result<OAuthTokens, OAuthError> {
+fn parse_tokens(
+    text: &str,
+    provider: &OAuthProvider,
+    current: Option<&OAuthTokens>,
+) -> Result<OAuthTokens, OAuthError> {
     let value: Value = serde_json::from_str(text).map_err(|source| OAuthError::Parse { source })?;
     let access = value
         .get("access_token")
@@ -235,17 +253,139 @@ fn parse_tokens(text: &str, fallback_refresh: Option<&str>) -> Result<OAuthToken
     let refresh = value
         .get("refresh_token")
         .and_then(Value::as_str)
-        .or(fallback_refresh)
+        .or_else(|| current.map(|c| c.refresh.as_str()))
         .unwrap_or_default();
     let expires_in = value
         .get("expires_in")
         .and_then(Value::as_i64)
         .unwrap_or(DEFAULT_EXPIRES_SECS);
+    let account_id = value
+        .get("id_token")
+        .and_then(Value::as_str)
+        .zip(provider.account_id_claim.as_deref())
+        .and_then(|(token, claim)| account_id_from_jwt(token, claim))
+        .or_else(|| current.and_then(|c| c.account_id.clone()));
     Ok(OAuthTokens {
         access: access.to_string(),
         refresh: refresh.to_string(),
         expires: now_ms() + expires_in.saturating_mul(1000),
+        account_id,
     })
+}
+
+/// Read `chatgpt_account_id` from an `id_token` JWT, under the `claim`
+/// namespace or at the root.
+///
+/// The signature is not verified: the token came over TLS straight from the
+/// token endpoint, and the value only fills a request header, never a trust
+/// decision. Returns `None` on malformed input.
+#[must_use]
+pub fn account_id_from_jwt(id_token: &str, claim: &str) -> Option<String> {
+    let payload = id_token.split('.').nth(1)?;
+    let claims: Value = serde_json::from_slice(&URL_SAFE_NO_PAD.decode(payload).ok()?).ok()?;
+    claims
+        .get(claim)
+        .and_then(|ns| ns.get("chatgpt_account_id"))
+        .or_else(|| claims.get("chatgpt_account_id"))?
+        .as_str()
+        .map(str::to_string)
+}
+
+/// Run the `callback` login: open the authorize URL in the browser and catch
+/// the redirect on a local listener bound to `redirect_uri`'s host and port.
+///
+/// # Errors
+///
+/// Returns [`OAuthError`] when the listener cannot bind, the state does not
+/// match, no callback arrives within 5 minutes, or the exchange fails.
+pub async fn callback_login(
+    http: &reqwest::Client,
+    provider: &OAuthProvider,
+) -> Result<OAuthTokens, OAuthError> {
+    let redirect = url::Url::parse(&provider.redirect_uri)
+        .map_err(|e| OAuthError::Callback(format!("redirect_uri invalida: {e}")))?;
+    let host = redirect.host_str().unwrap_or("localhost");
+    let port = redirect.port_or_known_default().unwrap_or(80);
+    let listener = tokio::net::TcpListener::bind((host, port))
+        .await
+        .map_err(|e| OAuthError::Callback(format!("nao consegui abrir {host}:{port}: {e}")))?;
+
+    let (verifier, challenge) = generate_pkce();
+    let state = URL_SAFE_NO_PAD.encode(uuid::Uuid::new_v4().as_bytes());
+    let url = authorize_url(provider, &challenge, &state)?;
+    println!("abra esta URL no navegador se ela nao abrir sozinha:\n  {url}");
+    if let Err(e) = open_browser(&url) {
+        eprintln!("nao consegui abrir o navegador automaticamente ({e}); abra a URL acima.");
+    }
+
+    let (tx, rx) = tokio::sync::oneshot::channel::<Result<String, OAuthError>>();
+    let sender = std::sync::Arc::new(std::sync::Mutex::new(Some(tx)));
+    let expected = state.clone();
+    let app = axum::Router::new().route(
+        redirect.path(),
+        axum::routing::get(
+            move |axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>| {
+                let outcome = callback_outcome(&params, &expected);
+                let page = if outcome.is_ok() {
+                    "<h1>Login concluido</h1><p>Pode fechar esta aba e voltar ao terminal.</p>"
+                } else {
+                    "<h1>Login falhou</h1><p>Volte ao terminal.</p>"
+                };
+                if let Some(tx) = sender.lock().ok().and_then(|mut s| s.take()) {
+                    let _ = tx.send(outcome);
+                }
+                async move { axum::response::Html(page) }
+            },
+        ),
+    );
+    let server = tokio::spawn(async move {
+        let _ = axum::serve(listener, app).await;
+    });
+
+    let code = tokio::time::timeout(Duration::from_mins(5), rx).await;
+    server.abort();
+    let code = code
+        .map_err(|_| OAuthError::Timeout)?
+        .map_err(|_| OAuthError::Callback("canal de callback fechou".to_string()))??;
+    exchange(http, provider, &code, &verifier, &state).await
+}
+
+fn callback_outcome(
+    params: &HashMap<String, String>,
+    expected: &str,
+) -> Result<String, OAuthError> {
+    if let Some(err) = params.get("error") {
+        return Err(OAuthError::Callback(err.clone()));
+    }
+    if params.get("state").map(String::as_str) != Some(expected) {
+        return Err(OAuthError::StateMismatch);
+    }
+    params
+        .get("code")
+        .cloned()
+        .ok_or_else(|| OAuthError::Callback("callback sem codigo de autorizacao".to_string()))
+}
+
+/// Open `url` in the default browser; a no-op when
+/// `LOCAL_PROXY_OAUTH_NO_BROWSER` is set (tests play the browser themselves).
+fn open_browser(url: &str) -> std::io::Result<()> {
+    if std::env::var_os("LOCAL_PROXY_OAUTH_NO_BROWSER").is_some() {
+        return Ok(());
+    }
+    #[cfg(target_os = "windows")]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn()?;
+    }
+    #[cfg(target_os = "macos")]
+    std::process::Command::new("open").arg(url).spawn()?;
+    #[cfg(all(unix, not(target_os = "macos")))]
+    std::process::Command::new("xdg-open").arg(url).spawn()?;
+    Ok(())
 }
 
 #[cfg(test)]
@@ -408,6 +548,7 @@ mod tests {
             access: "old-acc".to_string(),
             refresh: "old-ref".to_string(),
             expires: 0,
+            account_id: None,
         };
         let tokens = refresh(&reqwest::Client::new(), &p, &current)
             .await

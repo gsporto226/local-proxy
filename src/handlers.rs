@@ -368,6 +368,55 @@ fn enable_usage(body: &mut Value) {
     }
 }
 
+/// Apply the fields a Responses-API upstream needs before sending.
+///
+/// - the configured reasoning effort, when the resolved route set one and the
+///   client did not ask for its own (the Codex backend takes reasoning depth as
+///   a request field, so `gpt-6-sol` at `low` and at `medium` are the same model
+///   id — the route pin is a default, not an override, mirroring how a
+///   client-sent model wins over `active_model`);
+/// - forced streaming: that backend rejects non-streaming requests
+///   (`"Stream must be set to true"`). A client that asked for a single
+///   response still gets one — the caller reassembles the stream.
+///
+/// No-op for other formats.
+fn prepare_responses_request(
+    provider: &crate::config::Provider,
+    body: &mut Value,
+    effort: Option<&str>,
+) {
+    if provider.format != ProviderFormat::OpenaiResponses {
+        return;
+    }
+    if let Some(effort) = effort.filter(|e| !e.is_empty()) {
+        if body.get("reasoning").is_none() {
+            body["reasoning"] = json!({ "effort": effort });
+        }
+    }
+    body["stream"] = json!(true);
+}
+
+/// Read a Responses SSE response to completion and reassemble the single
+/// Response object it describes.
+///
+/// Used for a non-streaming client of a stream-only upstream. A transport error
+/// ends the read; whatever was reassembled so far is returned.
+async fn aggregate_responses_stream(resp: reqwest::Response) -> Value {
+    use futures_util::StreamExt as _;
+    let mut frames = Box::pin(crate::sse::sse_frames(resp));
+    let mut events: Vec<Value> = Vec::new();
+    while let Some(frame) = frames.next().await {
+        let Ok(frame) = frame else { break };
+        if frame.is_done() {
+            break;
+        }
+        if let Some(value) = frame.json() {
+            events.push(value);
+        }
+    }
+    translate::responses_events_to_response(&events)
+}
+
 fn sse_response(stream: UpstreamStream) -> Response {
     Sse::new(stream)
         .keep_alive(KeepAlive::new().interval(Duration::from_secs(15)))
@@ -472,7 +521,7 @@ fn is_connected(state: &RuntimeState, provider: &str) -> bool {
 fn resolve_model(
     state: &RuntimeState,
     client_model: Option<&str>,
-) -> Result<(Arc<crate::config::Provider>, String), ApiError> {
+) -> Result<(Arc<crate::config::Provider>, String, Option<String>), ApiError> {
     // Normally the client's requested model wins: it is resolved through the
     // router and must match a configured route/provider/native model. When the
     // client sends no model, the proxy falls back to its own override (active
@@ -524,7 +573,11 @@ fn resolve_model(
             resolved.provider.name, resolved.provider.name
         )));
     }
-    Ok((resolved.provider, resolved.upstream_model))
+    Ok((
+        resolved.provider,
+        resolved.upstream_model,
+        resolved.reasoning_effort,
+    ))
 }
 
 fn client_for(
@@ -891,7 +944,7 @@ async fn handle_messages(
 
     let streaming = wants_stream(&body);
     let client_model = body.get("model").and_then(Value::as_str);
-    let (provider, upstream_model) = resolve_model(state, client_model)?;
+    let (provider, upstream_model, reasoning_effort) = resolve_model(state, client_model)?;
     tracing::info!(
         target: crate::LOG_TARGET,
         endpoint = "/v1/messages",
@@ -909,10 +962,12 @@ async fn handle_messages(
     let mut upstream_body = match provider.format {
         ProviderFormat::Anthropic => translate::normalize_anthropic_request(&body),
         ProviderFormat::Openai => translate::anthropic_to_openai_request(body)?,
+        ProviderFormat::OpenaiResponses => translate::anthropic_to_responses_request(body)?,
     };
     if streaming && provider.format == ProviderFormat::Openai {
         enable_usage(&mut upstream_body);
     }
+    prepare_responses_request(&provider, &mut upstream_body, reasoning_effort.as_deref());
 
     let resp = client
         .chat_request(client.default_path(), upstream_body, client_key, session_id)
@@ -957,10 +1012,19 @@ async fn handle_messages(
                 upstream_model,
                 Some(cap),
             ))),
+            ProviderFormat::OpenaiResponses => Ok(sse_response(streams::anthropic_from_responses(
+                resp,
+                upstream_model,
+                Some(cap),
+            ))),
         };
     }
 
-    let rbody = resp.json::<Value>().await.unwrap_or(Value::Null);
+    let rbody = if provider.format == ProviderFormat::OpenaiResponses {
+        aggregate_responses_stream(resp).await
+    } else {
+        resp.json::<Value>().await.unwrap_or(Value::Null)
+    };
     match provider.format {
         ProviderFormat::Anthropic => {
             capture(
@@ -987,6 +1051,21 @@ async fn handle_messages(
                 session_id,
             );
             let translated = translate::openai_to_anthropic_response(rbody, &upstream_model)
+                .map_err(ApiError::from)?;
+            Ok(json_response(StatusCode::OK, translated))
+        }
+        ProviderFormat::OpenaiResponses => {
+            capture(
+                "/v1/messages",
+                &provider.name,
+                &upstream_model,
+                false,
+                status,
+                Some(&rbody),
+                &started,
+                session_id,
+            );
+            let translated = translate::responses_to_anthropic_response(rbody, &upstream_model)
                 .map_err(ApiError::from)?;
             Ok(json_response(StatusCode::OK, translated))
         }
@@ -1056,7 +1135,7 @@ async fn handle_chat_completions(
 
     let streaming = wants_stream(&body);
     let client_model = body.get("model").and_then(Value::as_str);
-    let (provider, upstream_model) = resolve_model(state, client_model)?;
+    let (provider, upstream_model, reasoning_effort) = resolve_model(state, client_model)?;
     tracing::info!(
         target: crate::LOG_TARGET,
         endpoint = "/v1/chat/completions",
@@ -1071,10 +1150,12 @@ async fn handle_chat_completions(
     let mut upstream_body = match provider.format {
         ProviderFormat::Openai => body,
         ProviderFormat::Anthropic => translate::openai_to_anthropic_request(body)?,
+        ProviderFormat::OpenaiResponses => translate::openai_to_responses_request(body)?,
     };
     if streaming && provider.format == ProviderFormat::Openai {
         enable_usage(&mut upstream_body);
     }
+    prepare_responses_request(&provider, &mut upstream_body, reasoning_effort.as_deref());
 
     let resp = client
         .chat_request(client.default_path(), upstream_body, client_key, session_id)
@@ -1119,10 +1200,19 @@ async fn handle_chat_completions(
                 upstream_model,
                 Some(cap),
             ))),
+            ProviderFormat::OpenaiResponses => Ok(sse_response(streams::openai_from_responses(
+                resp,
+                upstream_model,
+                Some(cap),
+            ))),
         };
     }
 
-    let rbody = resp.json::<Value>().await.unwrap_or(Value::Null);
+    let rbody = if provider.format == ProviderFormat::OpenaiResponses {
+        aggregate_responses_stream(resp).await
+    } else {
+        resp.json::<Value>().await.unwrap_or(Value::Null)
+    };
     match provider.format {
         ProviderFormat::Openai => {
             capture(
@@ -1149,6 +1239,21 @@ async fn handle_chat_completions(
                 session_id,
             );
             let translated = translate::anthropic_to_openai_response(rbody, &upstream_model)
+                .map_err(ApiError::from)?;
+            Ok(json_response(StatusCode::OK, translated))
+        }
+        ProviderFormat::OpenaiResponses => {
+            capture(
+                "/v1/chat/completions",
+                &provider.name,
+                &upstream_model,
+                false,
+                status,
+                Some(&rbody),
+                &started,
+                session_id,
+            );
+            let translated = translate::responses_to_openai_response(rbody, &upstream_model)
                 .map_err(ApiError::from)?;
             Ok(json_response(StatusCode::OK, translated))
         }
@@ -1218,7 +1323,7 @@ async fn handle_responses(
 
     let streaming = wants_stream(&body);
     let client_model = body.get("model").and_then(Value::as_str);
-    let (provider, upstream_model) = resolve_model(state, client_model)?;
+    let (provider, upstream_model, reasoning_effort) = resolve_model(state, client_model)?;
     tracing::info!(
         target: crate::LOG_TARGET,
         endpoint = "/v1/responses",
@@ -1233,10 +1338,20 @@ async fn handle_responses(
     let mut upstream_body = match provider.format {
         ProviderFormat::Openai => translate::responses_to_openai_request(body)?,
         ProviderFormat::Anthropic => translate::responses_to_anthropic_request(body)?,
+        // The ChatGPT backend rejects stored responses; make `store` explicit
+        // when the client omitted it.
+        ProviderFormat::OpenaiResponses => {
+            let mut body = body;
+            if body.get("store").is_none() {
+                body["store"] = json!(false);
+            }
+            body
+        }
     };
     if streaming && provider.format == ProviderFormat::Openai {
         enable_usage(&mut upstream_body);
     }
+    prepare_responses_request(&provider, &mut upstream_body, reasoning_effort.as_deref());
 
     let resp = client
         .chat_request(client.default_path(), upstream_body, client_key, session_id)
@@ -1285,10 +1400,15 @@ async fn handle_responses(
                 upstream_model,
                 Some(cap),
             ))),
+            ProviderFormat::OpenaiResponses => Ok(passthrough_stream(resp, Some(cap))),
         };
     }
 
-    let rbody = resp.json::<Value>().await.unwrap_or(Value::Null);
+    let rbody = if provider.format == ProviderFormat::OpenaiResponses {
+        aggregate_responses_stream(resp).await
+    } else {
+        resp.json::<Value>().await.unwrap_or(Value::Null)
+    };
     capture(
         "/v1/responses",
         &provider.name,
@@ -1306,6 +1426,7 @@ async fn handle_responses(
             translate::anthropic_to_responses_response(rbody, &upstream_model)
                 .map_err(ApiError::from)?
         }
+        ProviderFormat::OpenaiResponses => rbody,
     };
     Ok(json_response(StatusCode::OK, translated))
 }
@@ -1512,6 +1633,63 @@ mod tests {
     }
 
     #[test]
+    fn prepare_responses_request_forces_stream_and_sets_effort() {
+        let responses = crate::config::Provider {
+            name: "chatgpt".to_string(),
+            base_url: "http://x".to_string(),
+            format: ProviderFormat::OpenaiResponses,
+            models: Vec::new(),
+            auto_model: None,
+            headers: std::collections::HashMap::new(),
+            session_header: None,
+            oauth: None,
+        };
+        let mut body = json!({"model": "gpt-6-sol", "stream": false});
+        prepare_responses_request(&responses, &mut body, Some("medium"));
+        // the Codex backend rejects non-streaming, so upstream always streams
+        assert_eq!(body["stream"], true);
+        assert_eq!(body["reasoning"]["effort"], "medium");
+
+        // without a configured effort the field is not injected
+        let mut plain = json!({"model": "gpt-6-sol"});
+        prepare_responses_request(&responses, &mut plain, None);
+        assert_eq!(plain["stream"], true);
+        assert!(plain.get("reasoning").is_none());
+
+        // an empty effort string is treated as unset
+        let mut empty = json!({});
+        prepare_responses_request(&responses, &mut empty, Some(""));
+        assert!(empty.get("reasoning").is_none());
+
+        // the route pin is a default, not an override: a client that asked for
+        // its own effort keeps it
+        let mut client = json!({"reasoning": {"effort": "xhigh"}});
+        prepare_responses_request(&responses, &mut client, Some("low"));
+        assert_eq!(client["reasoning"]["effort"], "xhigh");
+    }
+
+    #[test]
+    fn prepare_responses_request_leaves_other_formats_alone() {
+        for format in [ProviderFormat::Openai, ProviderFormat::Anthropic] {
+            let provider = crate::config::Provider {
+                name: "p".to_string(),
+                base_url: "http://x".to_string(),
+                format,
+                models: Vec::new(),
+                auto_model: None,
+                headers: std::collections::HashMap::new(),
+                session_header: None,
+                oauth: None,
+            };
+            let mut body = json!({"stream": false});
+            prepare_responses_request(&provider, &mut body, Some("medium"));
+            // untouched: no forced streaming, no reasoning field
+            assert_eq!(body["stream"], false);
+            assert!(body.get("reasoning").is_none());
+        }
+    }
+
+    #[test]
     fn rebuild_merges_catalog_with_overlay_and_reapplies() {
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1576,6 +1754,7 @@ mod tests {
                 provider: "openai".to_string(),
                 prefix: false,
                 upstream_model: None,
+                reasoning_effort: None,
             }],
             defaults: crate::config::Defaults {
                 provider: "openai".to_string(),
@@ -1679,12 +1858,13 @@ mod tests {
         };
 
         // Active model is gpt-4o, but the client asks for gpt-4o-mini: client wins.
-        let (provider, upstream) = resolve_model(&state, Some("gpt-4o-mini")).expect("resolves");
+        let (provider, upstream, _effort) =
+            resolve_model(&state, Some("gpt-4o-mini")).expect("resolves");
         assert_eq!(provider.name, "openai");
         assert_eq!(upstream, "gpt-4o-mini");
 
         // Client sends no model: the active_model fallback applies.
-        let (provider, upstream) = resolve_model(&state, None).expect("resolves");
+        let (provider, upstream, _effort) = resolve_model(&state, None).expect("resolves");
         assert_eq!(provider.name, "openai");
         assert_eq!(upstream, "gpt-4o");
     }
@@ -1752,12 +1932,13 @@ mod tests {
 
         // Even though the client asks for gpt-4o-mini, the enforced active model
         // (gpt-4o) wins and the client-sent model is ignored.
-        let (provider, upstream) = resolve_model(&state, Some("gpt-4o-mini")).expect("resolves");
+        let (provider, upstream, _effort) =
+            resolve_model(&state, Some("gpt-4o-mini")).expect("resolves");
         assert_eq!(provider.name, "openai");
         assert_eq!(upstream, "gpt-4o");
 
         // With no client model it naturally uses the active model too.
-        let (provider, upstream) = resolve_model(&state, None).expect("resolves");
+        let (provider, upstream, _effort) = resolve_model(&state, None).expect("resolves");
         assert_eq!(provider.name, "openai");
         assert_eq!(upstream, "gpt-4o");
     }
@@ -1810,7 +1991,7 @@ mod tests {
             enforce_active_model: false,
             config_path: PathBuf::new(),
         };
-        let (provider, upstream) = resolve_model(&state, None).expect("resolves");
+        let (provider, upstream, _effort) = resolve_model(&state, None).expect("resolves");
         assert_eq!(provider.name, "openai");
         assert_eq!(upstream, "gpt-4o");
     }

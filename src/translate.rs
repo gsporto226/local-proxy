@@ -940,7 +940,524 @@ fn responses_tools_to_chat(
 }
 
 // ---------------------------------------------------------------------------
+// openai/anthropic request -> responses request (for Responses-API upstreams)
+// ---------------------------------------------------------------------------
+
+/// Translate an `OpenAI` chat-completions request body into a Responses API
+/// request body. Inverse of [`responses_to_openai_request`].
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object, or
+/// [`TranslateError::Invalid`] when a field has an unexpected shape.
+pub fn openai_to_responses_request(body: Value) -> Result<Value, TranslateError> {
+    let mut out = body;
+    if out.as_object().is_none() {
+        return Err(TranslateError::NotObject);
+    }
+
+    let messages = take(&mut out, "messages");
+    let tools = take(&mut out, "tools");
+    let max_tokens = take(&mut out, "max_tokens");
+    // `reasoning_effort` is the chat-completions spelling of reasoning depth.
+    // The Responses API takes a `reasoning` object instead, and forwarding the
+    // raw field is a hard error upstream ("Unsupported parameter:
+    // reasoning_effort"), so translate it. A `reasoning` the client already sent
+    // (a Responses-native client) wins.
+    let reasoning_effort = take(&mut out, "reasoning_effort");
+
+    // Chat-completions-only knobs the Responses API does not accept.
+    for key in [
+        "n",
+        "presence_penalty",
+        "frequency_penalty",
+        "logit_bias",
+        "logprobs",
+        "top_logprobs",
+        "response_format",
+        "seed",
+        "stream_options",
+        "functions",
+        "function_call",
+    ] {
+        remove(&mut out, key);
+    }
+    if let Some(effort) = reasoning_effort.filter(|e| !e.is_null()) {
+        if out.get("reasoning").is_none() {
+            insert(&mut out, "reasoning", json!({ "effort": effort }));
+        }
+    }
+
+    let mut input: Vec<Value> = Vec::new();
+    let mut instructions: Vec<String> = Vec::new();
+    if let Some(messages) = messages {
+        let arr = messages.as_array().ok_or_else(|| TranslateError::Invalid {
+            field: "messages",
+            detail: "expected array".to_string(),
+        })?;
+        for message in arr {
+            chat_message_to_responses_item(message, &mut input, &mut instructions);
+        }
+    }
+    insert(&mut out, "input", Value::Array(input));
+    if !instructions.is_empty() {
+        insert(
+            &mut out,
+            "instructions",
+            Value::String(instructions.join("\n\n")),
+        );
+    }
+    if let Some(tools) = tools {
+        insert(&mut out, "tools", chat_tools_to_responses(&tools)?);
+    }
+    if let Some(max_tokens) = max_tokens {
+        insert(&mut out, "max_output_tokens", max_tokens);
+    }
+    // The Responses API requires an explicit `store`; the ChatGPT backend
+    // rejects stored responses. Default to false unless the client set it.
+    if let Some(obj) = out.as_object_mut() {
+        obj.entry("store").or_insert(json!(false));
+    }
+    Ok(out)
+}
+
+/// Translate an Anthropic Messages request body into a Responses API request
+/// body.
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object, or
+/// [`TranslateError::Invalid`] when a field has an unexpected shape.
+pub fn anthropic_to_responses_request(body: Value) -> Result<Value, TranslateError> {
+    let chat = anthropic_to_openai_request(body)?;
+    openai_to_responses_request(chat)
+}
+
+/// Convert one chat-completions message into Responses API input items,
+/// collecting system text into `instructions`.
+fn chat_message_to_responses_item(
+    message: &Value,
+    input: &mut Vec<Value>,
+    instructions: &mut Vec<String>,
+) {
+    let role = message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user");
+
+    if let Some(tool_calls) = message.get("tool_calls").and_then(Value::as_array) {
+        for call in tool_calls {
+            let id = call.get("id").and_then(Value::as_str).unwrap_or("");
+            let name = call
+                .get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let args = call
+                .get("function")
+                .and_then(|f| f.get("arguments"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            input.push(json!({
+                "type": "function_call",
+                "call_id": id,
+                "name": name,
+                "arguments": arguments_to_string(args)
+            }));
+        }
+    }
+
+    if role == "tool" {
+        let id = message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let output = message.get("content").cloned().unwrap_or(Value::Null);
+        input.push(json!({
+            "type": "function_call_output",
+            "call_id": id,
+            "output": content_to_text(output)
+        }));
+        return;
+    }
+
+    if role == "system" || role == "developer" {
+        let text = content_to_text(message.get("content").cloned().unwrap_or(Value::Null));
+        if !text.is_empty() {
+            instructions.push(text);
+        }
+        return;
+    }
+
+    let is_assistant = role == "assistant";
+    let mut parts: Vec<Value> = Vec::new();
+    match message.get("content").cloned().unwrap_or(Value::Null) {
+        Value::String(s) => {
+            if !s.is_empty() {
+                parts.push(responses_text_part(&s, is_assistant));
+            }
+        }
+        Value::Array(arr) => {
+            for block in arr {
+                match block.get("type").and_then(Value::as_str) {
+                    Some("text" | "input_text" | "output_text") => {
+                        if let Some(t) = block.get("text").and_then(Value::as_str) {
+                            parts.push(responses_text_part(t, is_assistant));
+                        }
+                    }
+                    Some("image_url") => {
+                        let url = block
+                            .get("image_url")
+                            .and_then(|i| i.get("url"))
+                            .and_then(Value::as_str)
+                            .unwrap_or("");
+                        parts.push(json!({"type": "input_image", "image_url": url}));
+                    }
+                    Some("input_image") => parts.push(block.clone()),
+                    _ => {}
+                }
+            }
+        }
+        _ => {}
+    }
+    if !parts.is_empty() {
+        input.push(json!({"type": "message", "role": role, "content": parts}));
+    }
+}
+
+/// A Responses API text part, typed for the message role.
+fn responses_text_part(text: &str, is_assistant: bool) -> Value {
+    if is_assistant {
+        json!({"type": "output_text", "text": text, "annotations": []})
+    } else {
+        json!({"type": "input_text", "text": text})
+    }
+}
+
+/// Convert chat-completions tools (nested `function`) into Responses API tools
+/// (flat). Accepts both shapes.
+fn chat_tools_to_responses(tools: &Value) -> Result<Value, TranslateError> {
+    let arr = tools.as_array().ok_or_else(|| TranslateError::Invalid {
+        field: "tools",
+        detail: "expected array".to_string(),
+    })?;
+    let mut out = Vec::new();
+    for tool in arr {
+        if tool.get("type").and_then(Value::as_str) != Some("function") {
+            continue;
+        }
+        let func = tool.get("function").unwrap_or(tool);
+        let name = func.get("name").and_then(Value::as_str).unwrap_or("");
+        let description = func
+            .get("description")
+            .and_then(Value::as_str)
+            .unwrap_or("");
+        let parameters = func
+            .get("parameters")
+            .cloned()
+            .unwrap_or_else(|| json!({"type": "object", "properties": {}}));
+        out.push(json!({
+            "type": "function",
+            "name": name,
+            "description": description,
+            "parameters": parameters
+        }));
+    }
+    Ok(Value::Array(out))
+}
+
+/// Accumulator folding a Responses-API SSE event sequence back into one
+/// Response object.
+#[derive(Debug, Default)]
+struct ResponsesFold {
+    id: String,
+    model: String,
+    created_at: Value,
+    status: String,
+    usage: Value,
+    error: Value,
+    /// `(output_index, item)`, incremental text, incremental function arguments.
+    items: Vec<(u32, Value)>,
+    text: Vec<(u32, String)>,
+    args: Vec<(u32, String)>,
+}
+
+impl ResponsesFold {
+    /// The output index an event refers to.
+    fn index(event: &Value) -> u32 {
+        u32::try_from(
+            event
+                .get("output_index")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+        )
+        .unwrap_or(0)
+    }
+
+    /// Record a `(index, item)`, replacing any earlier item at that index.
+    fn set_item(&mut self, index: u32, item: Value) {
+        match self.items.iter_mut().find(|(i, _)| *i == index) {
+            Some((_, existing)) => *existing = item,
+            None => self.items.push((index, item)),
+        }
+    }
+
+    /// Append an incremental delta to the bucket for `index`.
+    fn push_delta(bucket: &mut Vec<(u32, String)>, index: u32, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        match bucket.iter_mut().find(|(i, _)| *i == index) {
+            Some((_, acc)) => acc.push_str(delta),
+            None => bucket.push((index, delta.to_string())),
+        }
+    }
+
+    /// The deltas accumulated for one output index.
+    fn accumulated(bucket: &[(u32, String)], index: u32) -> String {
+        bucket
+            .iter()
+            .filter(|(i, _)| *i == index)
+            .map(|(_, s)| s.as_str())
+            .collect()
+    }
+
+    /// Fold the `response` envelope of an event (present on `created`,
+    /// `completed`, `failed`, …).
+    fn observe_envelope(&mut self, response: &Value) {
+        if let Some(v) = response.get("id").and_then(Value::as_str) {
+            self.id = v.to_string();
+        }
+        if let Some(v) = response.get("model").and_then(Value::as_str) {
+            self.model = v.to_string();
+        }
+        if let Some(v) = response.get("created_at") {
+            self.created_at = v.clone();
+        }
+        if let Some(v) = response.get("status").and_then(Value::as_str) {
+            self.status = v.to_string();
+        }
+        if let Some(v) = response.get("usage").filter(|u| !u.is_null()) {
+            self.usage = v.clone();
+        }
+        if let Some(v) = response.get("error").filter(|e| !e.is_null()) {
+            self.error = v.clone();
+        }
+        // `response.completed` may carry the finished items, which are
+        // authoritative over whatever the incremental events built up.
+        if let Some(out) = response.get("output").and_then(Value::as_array) {
+            if !out.is_empty() {
+                self.items = out
+                    .iter()
+                    .enumerate()
+                    .map(|(i, item)| (u32::try_from(i).unwrap_or(u32::MAX), item.clone()))
+                    .collect();
+            }
+        }
+    }
+
+    /// Fold one SSE event.
+    fn observe(&mut self, event: &Value) {
+        if let Some(response) = event.get("response") {
+            self.observe_envelope(response);
+        }
+        let index = Self::index(event);
+        match event.get("type").and_then(Value::as_str).unwrap_or("") {
+            "response.output_item.added" | "response.output_item.done" => {
+                if let Some(item) = event.get("item") {
+                    self.set_item(index, item.clone());
+                }
+            }
+            "response.output_text.delta" => {
+                let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                Self::push_delta(&mut self.text, index, delta);
+            }
+            "response.function_call_arguments.delta" => {
+                let delta = event.get("delta").and_then(Value::as_str).unwrap_or("");
+                Self::push_delta(&mut self.args, index, delta);
+            }
+            // The `response.error` folded above is the cleaner shape; only fall
+            // back to the whole event when the envelope carried none.
+            "response.failed" | "error" if self.error.is_null() => {
+                self.error = event.clone();
+            }
+            _ => {}
+        }
+    }
+
+    /// Finalize one output item, filling in accumulated deltas where the item
+    /// itself has none.
+    fn finish_item(&self, index: u32, item: &mut Value) {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                // A finished item (from `response.completed`) carries its own
+                // text and wins; the skeleton from `output_item.added` has none,
+                // so the accumulated deltas fill it in.
+                let existing = item
+                    .pointer("/content/0/text")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let body = if existing.is_empty() {
+                    Self::accumulated(&self.text, index)
+                } else {
+                    existing.to_string()
+                };
+                item["content"] = json!([{
+                    "type": "output_text",
+                    "text": body,
+                    "annotations": []
+                }]);
+                item["status"] = json!("completed");
+            }
+            Some("function_call") => {
+                let built = Self::accumulated(&self.args, index);
+                if !built.is_empty() {
+                    item["arguments"] = json!(built);
+                }
+                item["status"] = json!("completed");
+            }
+            _ => {}
+        }
+    }
+
+    /// Build the terminal Response object.
+    fn finish(mut self) -> Value {
+        self.items.sort_by_key(|(i, _)| *i);
+        let items = std::mem::take(&mut self.items);
+        let mut output: Vec<Value> = Vec::with_capacity(items.len());
+        for (index, item) in items {
+            let mut item = item;
+            self.finish_item(index, &mut item);
+            output.push(item);
+        }
+        let mut response = json!({
+            "id": if self.id.is_empty() { "resp_".to_string() } else { self.id },
+            "object": "response",
+            "created_at": self.created_at,
+            "status": if self.status.is_empty() { "completed".to_string() } else { self.status },
+            "model": self.model,
+            "output": output,
+            "parallel_tool_calls": true,
+            "usage": self.usage
+        });
+        if !self.error.is_null() {
+            response["error"] = self.error;
+        }
+        response
+    }
+}
+
+/// Fold a Responses-API SSE event sequence into a single Response object.
+///
+/// Some Responses upstreams — the `ChatGPT` Codex backend among them — reject
+/// `stream: false` outright (`"Stream must be set to true"`). A client that
+/// asked for a non-streaming reply is served by streaming upstream and
+/// reassembling the terminal response here.
+///
+/// Tolerant by design: unknown events are ignored, and the authoritative
+/// `output`/`usage` from a `response.completed` event win over anything
+/// accumulated from the incremental events.
+#[must_use]
+pub fn responses_events_to_response(events: &[Value]) -> Value {
+    let mut fold = ResponsesFold::default();
+    for event in events {
+        fold.observe(event);
+    }
+    fold.finish()
+}
+
+// ---------------------------------------------------------------------------
 // response conversions
+
+/// Translate a Responses API response body into an `OpenAI` chat-completions
+/// response body. Inverse of [`openai_to_responses_response`].
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object.
+#[allow(clippy::needless_pass_by_value)]
+pub fn responses_to_openai_response(body: Value, model: &str) -> Result<Value, TranslateError> {
+    let obj = body.as_object().ok_or(TranslateError::NotObject)?;
+    let id = obj
+        .get("id")
+        .and_then(Value::as_str)
+        .unwrap_or("chatcmpl_")
+        .to_string();
+    let created = obj
+        .get("created_at")
+        .and_then(Value::as_u64)
+        .unwrap_or_else(now_ts);
+
+    let mut content = String::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    if let Some(output) = obj.get("output").and_then(Value::as_array) {
+        for item in output {
+            match item.get("type").and_then(Value::as_str) {
+                Some("message") => {
+                    if let Some(parts) = item.get("content").and_then(Value::as_array) {
+                        for part in parts {
+                            if part.get("type").and_then(Value::as_str) == Some("output_text") {
+                                if let Some(t) = part.get("text").and_then(Value::as_str) {
+                                    content.push_str(t);
+                                }
+                            }
+                        }
+                    }
+                }
+                Some("function_call") => {
+                    let id = item
+                        .get("call_id")
+                        .or_else(|| item.get("id"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("");
+                    let name = item.get("name").and_then(Value::as_str).unwrap_or("");
+                    let args = item.get("arguments").cloned().unwrap_or(Value::Null);
+                    tool_calls.push(json!({
+                        "id": id,
+                        "type": "function",
+                        "function": {"name": name, "arguments": arguments_to_string(args)}
+                    }));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let usage = openai_usage(&parse_usage(obj.get("usage").unwrap_or(&Value::Null)));
+    let mut message = json!({"role": "assistant", "content": content});
+    let finish_reason = if tool_calls.is_empty() {
+        "stop"
+    } else {
+        insert(&mut message, "tool_calls", Value::Array(tool_calls));
+        "tool_calls"
+    };
+
+    Ok(json!({
+        "id": id,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{
+            "index": 0,
+            "message": message,
+            "finish_reason": finish_reason
+        }],
+        "usage": usage
+    }))
+}
+
+/// Translate a Responses API response body into an Anthropic Messages response
+/// body.
+///
+/// # Errors
+///
+/// Returns [`TranslateError::NotObject`] if the body is not a JSON object.
+#[allow(clippy::needless_pass_by_value)]
+pub fn responses_to_anthropic_response(body: Value, model: &str) -> Result<Value, TranslateError> {
+    let chat = responses_to_openai_response(body, model)?;
+    openai_to_anthropic_response(chat, model)
+}
+
 // ---------------------------------------------------------------------------
 
 /// Translate an Anthropic Messages response body into an `OpenAI`
@@ -1832,6 +2349,248 @@ mod tests {
         let out = responses_to_anthropic_request(body).unwrap();
         let tools = out["tools"].as_array().unwrap();
         assert_eq!(tools[0]["name"], "web_search");
+    }
+
+    #[test]
+    fn openai_request_to_responses() {
+        let body = json!({
+            "model": "m",
+            "messages": [
+                {"role": "system", "content": "be terse"},
+                {"role": "user", "content": "hi"},
+                {"role": "assistant", "content": null, "tool_calls": [
+                    {"id": "c1", "type": "function", "function": {"name": "w", "arguments": "{\"q\":\"x\"}"}}
+                ]},
+                {"role": "tool", "tool_call_id": "c1", "content": "done"}
+            ],
+            "tools": [
+                {"type": "function", "function": {"name": "f", "description": "d",
+                    "parameters": {"type": "object", "properties": {}}}}
+            ],
+            "max_tokens": 300,
+            "n": 1,
+            "response_format": {"type": "json_object"}
+        });
+        let out = openai_to_responses_request(body).unwrap();
+        assert_eq!(out["instructions"], "be terse");
+        let input = out["input"].as_array().unwrap();
+        assert_eq!(input[0]["type"], "message");
+        assert_eq!(input[0]["role"], "user");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert_eq!(input[1]["type"], "function_call");
+        assert_eq!(input[1]["call_id"], "c1");
+        assert_eq!(input[1]["arguments"], "{\"q\":\"x\"}");
+        assert_eq!(input[2]["type"], "function_call_output");
+        assert_eq!(input[2]["output"], "done");
+        // tools flattened to the Responses shape
+        assert_eq!(out["tools"][0]["type"], "function");
+        assert_eq!(out["tools"][0]["name"], "f");
+        assert_eq!(out["max_output_tokens"], 300);
+        // chat-only knobs dropped, `store` defaulted to false
+        assert!(out.get("n").is_none());
+        assert!(out.get("response_format").is_none());
+        assert!(out.get("messages").is_none());
+        assert_eq!(out["store"], false);
+    }
+
+    #[test]
+    fn openai_request_to_responses_keeps_explicit_store() {
+        let body = json!({"model": "m", "messages": [], "store": true});
+        let out = openai_to_responses_request(body).unwrap();
+        assert_eq!(out["store"], true);
+    }
+
+    #[test]
+    fn anthropic_request_to_responses() {
+        let body = json!({
+            "model": "m",
+            "max_tokens": 100,
+            "system": "sys",
+            "messages": [{"role": "user", "content": "hi"}],
+            "tools": [{"name": "f", "description": "d", "input_schema": {"type": "object"}}]
+        });
+        let out = anthropic_to_responses_request(body).unwrap();
+        assert_eq!(out["instructions"], "sys");
+        assert_eq!(out["input"][0]["role"], "user");
+        assert_eq!(out["input"][0]["content"][0]["text"], "hi");
+        assert_eq!(out["tools"][0]["name"], "f");
+        assert_eq!(out["max_output_tokens"], 100);
+        assert_eq!(out["store"], false);
+    }
+
+    #[test]
+    fn openai_request_to_responses_translates_reasoning_effort() {
+        // The chat spelling has to become a `reasoning` object: forwarding the
+        // raw field is a hard upstream error ("Unsupported parameter:
+        // reasoning_effort").
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning_effort": "high"
+        });
+        let out = openai_to_responses_request(body).unwrap();
+        assert_eq!(out["reasoning"]["effort"], "high");
+        assert!(out.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn openai_request_to_responses_keeps_client_reasoning_object() {
+        // A Responses-native client sending `reasoning` directly is left alone.
+        let body = json!({
+            "model": "m",
+            "messages": [{"role": "user", "content": "hi"}],
+            "reasoning": {"effort": "xhigh", "summary": "auto"}
+        });
+        let out = openai_to_responses_request(body).unwrap();
+        assert_eq!(out["reasoning"]["effort"], "xhigh");
+        assert_eq!(out["reasoning"]["summary"], "auto");
+    }
+
+    #[test]
+    fn anthropic_thinking_effort_reaches_responses() {
+        // End to end through the Anthropic -> Responses chain: a client's
+        // `thinking.effort` must land as `reasoning.effort`, not be dropped or
+        // forwarded as a stray field.
+        let body = json!({
+            "model": "m",
+            "max_tokens": 10,
+            "thinking": {"type": "enabled", "effort": "medium"},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = anthropic_to_responses_request(body).unwrap();
+        assert_eq!(out["reasoning"]["effort"], "medium");
+        assert!(out.get("thinking").is_none());
+        assert!(out.get("reasoning_effort").is_none());
+    }
+
+    #[test]
+    fn responses_events_fold_into_one_response() {
+        let events = vec![
+            json!({"type": "response.created", "response": {"id": "resp_9", "model": "gpt-6-sol", "created_at": 7}}),
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "message", "id": "msg_1", "role": "assistant", "content": []}}),
+            json!({"type": "response.output_text.delta", "output_index": 0, "delta": "po"}),
+            json!({"type": "response.output_text.delta", "output_index": 0, "delta": "ng"}),
+            json!({"type": "response.completed", "response": {"id": "resp_9", "status": "completed",
+                   "usage": {"input_tokens": 3, "output_tokens": 2}}}),
+        ];
+        let out = responses_events_to_response(&events);
+        assert_eq!(out["id"], "resp_9");
+        assert_eq!(out["object"], "response");
+        assert_eq!(out["model"], "gpt-6-sol");
+        assert_eq!(out["created_at"], 7);
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["output"][0]["type"], "message");
+        assert_eq!(out["output"][0]["content"][0]["text"], "pong");
+        assert_eq!(out["output"][0]["content"][0]["type"], "output_text");
+        assert_eq!(out["usage"]["output_tokens"], 2);
+    }
+
+    #[test]
+    fn responses_events_fold_function_calls() {
+        let events = vec![
+            json!({"type": "response.output_item.added", "output_index": 0,
+                   "item": {"type": "function_call", "call_id": "c1", "name": "w", "arguments": ""}}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": "{\"q\":"}),
+            json!({"type": "response.function_call_arguments.delta", "output_index": 0, "delta": "1}"}),
+        ];
+        let out = responses_events_to_response(&events);
+        let item = &out["output"][0];
+        assert_eq!(item["type"], "function_call");
+        assert_eq!(item["name"], "w");
+        assert_eq!(item["arguments"], "{\"q\":1}");
+        assert_eq!(item["status"], "completed");
+    }
+
+    #[test]
+    fn responses_events_prefer_completed_output_over_deltas() {
+        // A completed event carrying the finished items wins over the deltas.
+        let events = vec![
+            json!({"type": "response.output_text.delta", "output_index": 0, "delta": "partial"}),
+            json!({"type": "response.completed", "response": {
+                "status": "completed",
+                "output": [{"type": "message", "content": [{"type": "output_text", "text": "final"}]}],
+                "usage": {"input_tokens": 1, "output_tokens": 1}}}),
+        ];
+        let out = responses_events_to_response(&events);
+        assert_eq!(out["output"][0]["content"][0]["text"], "final");
+    }
+
+    #[test]
+    fn responses_events_surface_errors_and_incomplete_status() {
+        let failed = vec![
+            json!({"type": "response.failed", "response": {"status": "failed",
+            "error": {"message": "boom"}}}),
+        ];
+        let out = responses_events_to_response(&failed);
+        assert_eq!(out["status"], "failed");
+        assert_eq!(out["error"]["message"], "boom");
+
+        let incomplete = vec![json!({"type": "response.completed",
+            "response": {"status": "incomplete"}})];
+        assert_eq!(
+            responses_events_to_response(&incomplete)["status"],
+            "incomplete"
+        );
+    }
+
+    #[test]
+    fn responses_events_tolerate_an_empty_stream() {
+        let out = responses_events_to_response(&[]);
+        assert_eq!(out["object"], "response");
+        assert_eq!(out["status"], "completed");
+        assert_eq!(out["output"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn responses_response_to_openai_chat() {
+        let body = json!({
+            "id": "resp_1",
+            "created_at": 42,
+            "status": "completed",
+            "output": [
+                {"type": "message", "role": "assistant",
+                 "content": [{"type": "output_text", "text": "hi", "annotations": []}]},
+                {"type": "function_call", "call_id": "c1", "name": "w", "arguments": "{\"q\":1}"}
+            ],
+            "usage": {"input_tokens": 3, "output_tokens": 2}
+        });
+        let out = responses_to_openai_response(body, "m").unwrap();
+        assert_eq!(out["id"], "resp_1");
+        assert_eq!(out["object"], "chat.completion");
+        assert_eq!(out["created"], 42);
+        assert_eq!(out["choices"][0]["message"]["content"], "hi");
+        assert_eq!(out["choices"][0]["message"]["tool_calls"][0]["id"], "c1");
+        assert_eq!(
+            out["choices"][0]["message"]["tool_calls"][0]["function"]["name"],
+            "w"
+        );
+        assert_eq!(out["choices"][0]["finish_reason"], "tool_calls");
+        assert_eq!(out["usage"]["prompt_tokens"], 3);
+        assert_eq!(out["usage"]["completion_tokens"], 2);
+    }
+
+    #[test]
+    fn responses_response_to_openai_chat_without_tools() {
+        let body = json!({
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "ok"}]}]
+        });
+        let out = responses_to_openai_response(body, "m").unwrap();
+        assert_eq!(out["choices"][0]["finish_reason"], "stop");
+        assert!(out["choices"][0]["message"].get("tool_calls").is_none());
+    }
+
+    #[test]
+    fn responses_response_to_anthropic() {
+        let body = json!({
+            "id": "resp_1",
+            "output": [{"type": "message", "content": [{"type": "output_text", "text": "hi"}]}],
+            "usage": {"input_tokens": 3, "output_tokens": 2}
+        });
+        let out = responses_to_anthropic_response(body, "m").unwrap();
+        assert_eq!(out["type"], "message");
+        assert_eq!(out["content"][0]["text"], "hi");
+        assert_eq!(out["usage"]["output_tokens"], 2);
     }
 
     #[test]

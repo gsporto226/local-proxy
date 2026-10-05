@@ -14,10 +14,11 @@ Most AI tools hardcode their vendor's API shape. The reference design here is [o
 
 - Endpoints: `/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/health`.
 - Request and response translation plus streaming SSE, event by event, in all three directions (Anthropic to OpenAI, OpenAI to Anthropic, Responses to Anthropic and OpenAI).
-- Embedded provider catalog (`anthropic`, `claude`, `openai`, `opencode-go`, `zen`, `groq`, `xai`, `google`, `deepseek`, `openrouter`, `neuralwatt`). Your `config.yaml` only adds to it or overrides entries; it never replaces the whole list.
+- Embedded provider catalog (`anthropic`, `claude`, `openai`, `chatgpt`, `opencode-go`, `zen`, `groq`, `xai`, `google`, `deepseek`, `openrouter`, `neuralwatt`). Your `config.yaml` only adds to it or overrides entries; it never replaces the whole list.
 - Hot reload. Editing the config or `auth.json` applies in runtime through a file watcher, no restart.
 - Auth store separate from the config (`auth.json`), modeled after opencode's `/connect`. Keys never live in the config.
-- OAuth subscription logins (`local-proxy connect claude --oauth`): a provider with an `oauth:` block runs a PKCE login, stores the token bundle in `auth.json`, refreshes it automatically near expiry, and the engine stays provider-agnostic.
+- OAuth subscription logins (`local-proxy connect claude --oauth`, `local-proxy connect chatgpt --oauth`): a provider with an `oauth:` block runs a PKCE login, stores the token bundle in `auth.json`, refreshes it automatically near expiry, and the engine stays provider-agnostic.
+- ChatGPT Plus/Pro support: requests go to the ChatGPT backend over the Responses API (`format: openai-responses`).
 - `$proxy` executor. When the last user message starts with `$proxy `, the proxy runs the rest as a `local-proxy` command and returns the output as the model's reply. Works with no provider connected.
 - Model routing with a clear precedence (exact route, `provider/model`, prefix, native list, default).
 - Upstream errors reformatted into the client's shape (Anthropic or OpenAI).
@@ -95,7 +96,7 @@ Claude Code sends `/v1/messages`; the proxy routes to a connected provider and t
 | `model [<m>]` | Show or set the active model. `model clear` unsets it. |
 | `connect <provider> [key]` | Store an API key for an existing provider. Prompts hidden if the key is omitted. `--oauth` runs the provider's OAuth login instead. |
 | `disconnect <provider>` | Remove the stored API key. |
-| `providers` | List effective providers (catalog plus config) with key status. |
+| `providers` | List effective providers (catalog plus config) with key status (`ok`, `oauth`, or `-`). |
 | `stats [--since day\|week\|month\|all] [--json]` | Show usage statistics from recorded requests. |
 | `statusline --session <uuid>` | Render the Claude Code status line for a session from its recorded stats. |
 | `update` | Check for and apply a newer release. |
@@ -210,7 +211,83 @@ providers:
       identity: "You are Claude Code, Anthropic's official CLI for Claude."
 ```
 
-To run a second subscription account, define another provider with the same `oauth` block under a different name (a same-named provider in your config replaces the catalog entry entirely). A provider with a new interaction style (loopback callback, device code) needs one new `flow` variant plus its function in `src/oauth.rs`; everything downstream already treats OAuth uniformly.
+To run a second subscription account, define another provider with the same `oauth` block under a different name (a same-named provider in your config replaces the catalog entry entirely). A provider with a new interaction style (device code, say) needs one new `flow` variant plus its function in `src/oauth.rs`; everything downstream already treats OAuth uniformly. Two flows exist today: `paste` (above) and `callback`, which opens the browser and catches the redirect on a local listener bound to `redirect_uri` (used by `chatgpt`). The recipe also takes `token_encoding: form` for token endpoints that want a form body instead of JSON, and `account_id_claim` / `account_id_header` to lift an account id out of the `id_token` and send it on every request.
+
+### ChatGPT Plus/Pro
+
+The `chatgpt` provider uses a ChatGPT Plus/Pro subscription instead of an API key. It speaks the Responses API against the Codex backend, so any of the three client formats reach it: Claude Code (`/v1/messages`), Codex (`/v1/responses`), and opencode (`/v1/chat/completions`) are all translated.
+
+Log in once. `connect --oauth` opens the browser, runs an OAuth PKCE flow with a callback on `localhost:1455`, and writes the tokens to `auth.json`:
+
+```bash
+local-proxy connect chatgpt --oauth
+local-proxy model chatgpt/gpt-6-sol-medium   # select it as the active model
+local-proxy providers                        # chatgpt shows key=oauth
+```
+
+The access token is short-lived. It is refreshed automatically when a request finds it expired (or within 60 seconds of expiry), and the refreshed tokens are written back to `auth.json`. The `chatgpt-account-id` header the backend requires is read from the login's `id_token` and stored with the tokens.
+
+To log out, remove the stored entry:
+
+```bash
+local-proxy disconnect chatgpt
+```
+
+### Models and reasoning effort
+
+The model ids are the ones the **Codex** backend accepts, which are not the ones the chat web UI shows. `chatgpt.com/backend-api/models` (the web UI catalog) returns slugs like `gpt-6.1-sol-wm`; the Codex backend rejects those. The authoritative list for an account comes from
+
+```
+GET https://chatgpt.com/backend-api/codex/models?client_version=<codex version>
+```
+
+which needs the `chatgpt-account-id` header (without it the endpoint answers `200` with an empty list). The embedded catalog carries the current slugs:
+
+```
+gpt-6-sol  gpt-6-astra  gpt-6-luna  gpt-5.6-sol  gpt-5.6-terra  gpt-5.6-luna
+```
+
+Reasoning depth is a **request field**, not part of the model name, so one model id serves every effort level. A client that sends its own effort (Anthropic `thinking.effort`, OpenAI `reasoning_effort`, or a Responses `reasoning` object) keeps it: the proxy translates it into the `reasoning` object the Responses API wants. Because Claude Code sends no effort, the catalog also ships `-low` and `-medium` aliases that pin one as a default:
+
+```bash
+local-proxy models                          # includes chatgpt/gpt-6-sol-low, chatgpt/gpt-6-sol-medium
+```
+
+```yaml
+routes:
+  - model: chatgpt/gpt-6-sol-high
+    provider: chatgpt
+    upstream_model: gpt-6-sol
+    reasoning_effort: high        # none | minimal | low | medium | high | xhigh | max
+```
+
+The route pin is a default, not an override: a client that asks for its own effort wins, the same way a client-sent model wins over `active_model`.
+
+Adjust the list when the provider's catalog changes; `examples/list_models.rs` prints the live one for the signed-in account:
+
+```bash
+LOCAL_PROXY_CONFIG_DIR=~/.config/local-proxy cargo run --example list_models
+```
+
+One backend quirk the proxy handles for you: it only answers in streaming mode (`stream: false` is rejected with `"Stream must be set to true"`). The proxy always streams upstream and reassembles the result, so non-streaming clients still get a single JSON response.
+
+The OAuth endpoints and client id come from the public Codex CLI and live in the catalog's `oauth:` block, so a change upstream is a config override, not a release. Set `LOCAL_PROXY_OAUTH_NO_BROWSER=1` to skip opening the browser (the URL is still printed).
+
+### Responses-API providers
+
+`format: openai-responses` is the third wire format: the upstream speaks the OpenAI Responses API, and the proxy translates the other two directions into it. `chatgpt` is one instance; any Responses-compatible host works with a static key too (the OAuth path is only taken when the auth entry is an OAuth one).
+
+```yaml
+providers:
+  - name: my-responses-host
+    base_url: https://example.com/v1
+    format: openai-responses
+    models: [some-model]
+
+routes:
+  - model: some-model
+    provider: my-responses-host
+```
 
 ### Active model
 
@@ -400,12 +477,12 @@ The CI workflow in `.github/workflows/ci.yml` runs fmt, clippy with `-D warnings
 ```
 src/
 ├── main.rs        CLI and boot (errors with miette)
-├── config.rs      Config, Provider, Route, Defaults (YAML/JSON), overlay, per-provider headers
+├── config.rs      Config, Provider, Route (headers, oauth, reasoning_effort), Defaults, overlay
 ├── catalog.rs     embedded catalog and catalog to config merge
-├── auth.rs        auth.json keys and atomic writes
+├── auth.rs        auth.json keys, OAuth tokens, and atomic writes
 ├── oauth.rs       generic OAuth 2.0 + PKCE engine (login flows, exchange, refresh)
 ├── cli.rs         serve, launch, status, stop, models, model, connect, disconnect, providers, stats, statusline, update
-├── router.rs      resolve_model to (provider, upstream_model)
+├── router.rs      resolve_model to (provider, upstream_model, reasoning_effort)
 ├── upstream.rs    HTTP calls, key resolution, per-provider headers
 ├── translate.rs   request and response translation across the three formats
 ├── sse.rs         SSE frame parser
@@ -433,7 +510,7 @@ scripts/           status line scripts (bash and PowerShell)
 The known gaps, tracked in `docs/PENDING.md`, are not in scope for the current version:
 
 - `model` rewrites the config through serde, so manual comments and formatting in `config.yaml` are lost on that write.
-- Concurrent `connect` and `disconnect` calls can race on `auth.json`. Atomic writes prevent corruption, but there is no lock.
+- Concurrent `connect`, `disconnect` and `login` calls can race on `auth.json`. Atomic writes prevent corruption, but there is no lock.
 - The launcher keeps a single pid file, so multiple background proxies overwrite each other.
 - No retry or round-robin across keys, no rate limiting, no embeddings, no cache, no container image.
 

@@ -882,7 +882,10 @@ pub fn connect_provider(
                  adicione um ou use `connect {provider} <chave>`"
             ),
         })?;
-        let tokens = oauth_paste_login(provider, &config)?;
+        let tokens = match config.flow {
+            crate::config::OAuthFlow::Paste => oauth_paste_login(provider, &config)?,
+            crate::config::OAuthFlow::Callback => oauth_callback_login(provider, &config)?,
+        };
         crate::auth::set_oauth(provider, &tokens).map_err(CliError::from)?;
         return Ok(format!(
             "oauth do provider '{provider}' conectado em auth.json (access token expira {})",
@@ -900,6 +903,26 @@ pub fn connect_provider(
         };
     crate::auth::set_key(provider, key.trim()).map_err(CliError::from)?;
     Ok(format!("chave do provider '{provider}' salva em auth.json"))
+}
+
+/// Run the `callback` OAuth flow for `provider`: browser login with the
+/// redirect caught on a local listener.
+#[allow(clippy::result_large_err)]
+fn oauth_callback_login(
+    provider: &str,
+    config: &crate::config::OAuthProvider,
+) -> Result<crate::auth::OAuthTokens, CliError> {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(CliError::from)?;
+    rt.block_on(crate::oauth::callback_login(
+        &reqwest::Client::new(),
+        config,
+    ))
+    .map_err(|e| CliError::Connect {
+        message: format!("provider '{provider}': falha no login OAuth: {e}"),
+    })
 }
 
 /// Run the interactive `paste` OAuth flow for `provider`: print the authorize
@@ -991,7 +1014,7 @@ pub fn list_providers(config_path: &Path) -> Result<String, CliError> {
             None => "-",
         };
         out.push_str(&format!(
-            "{:<16} format={:<10} key={status}\n",
+            "{:<16} format={:<16} key={status}\n",
             p.name, p.format
         ));
     }

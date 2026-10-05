@@ -36,6 +36,10 @@ pub struct OAuthTokens {
     pub refresh: String,
     /// Unix milliseconds at which `access` expires.
     pub expires: i64,
+    /// Account id from the `id_token`, for backends that route on it (`ChatGPT`
+    /// sends it as `chatgpt-account-id`).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub account_id: Option<String>,
 }
 
 impl AuthEntry {
@@ -260,6 +264,7 @@ mod tests {
             access: "sk-ant-oat01-x".to_string(),
             refresh: "sk-ant-ort01-y".to_string(),
             expires: 1_791_225_331_499,
+            account_id: None,
         };
         let mut auth = AuthMap::new();
         auth.insert("claude".to_string(), AuthEntry::OAuth(tokens.clone()));

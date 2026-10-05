@@ -1344,6 +1344,457 @@ impl Machine for O2RMachine {
 }
 
 // ---------------------------------------------------------------------------
+// OpenAI Responses upstream -> Anthropic Messages events
+// ---------------------------------------------------------------------------
+
+struct R2AMachine {
+    model: String,
+    message_id: String,
+    started: bool,
+    next_block: u32,
+    current: Option<u32>,
+    text: Option<u32>,
+    thinking: Option<u32>,
+    tools: HashMap<String, ToolBlock>,
+    tool_order: Vec<String>,
+    usage: TokenUsage,
+    incomplete: bool,
+    saw_tools: bool,
+}
+
+impl R2AMachine {
+    fn new(model: String) -> Self {
+        Self {
+            model,
+            message_id: new_id("msg_stream"),
+            started: false,
+            next_block: 0,
+            current: None,
+            text: None,
+            thinking: None,
+            tools: HashMap::new(),
+            tool_order: Vec::new(),
+            usage: TokenUsage::default(),
+            incomplete: false,
+            saw_tools: false,
+        }
+    }
+
+    fn start(&mut self, events: &mut Vec<Value>) {
+        if !self.started {
+            self.started = true;
+            events.push(anthropic_message_start(
+                &self.message_id,
+                &self.model,
+                &self.usage,
+            ));
+        }
+    }
+
+    /// Close whichever content block is currently open. Anthropic content
+    /// blocks are strictly sequential, so a new block may only start after the
+    /// previous one stopped.
+    fn close_current(&mut self, events: &mut Vec<Value>) {
+        if let Some(index) = self.current.take() {
+            events.push(anthropic_content_block_stop(index));
+        }
+    }
+
+    /// Open a new top-level content block, closing the previous one first.
+    fn open_block(&mut self, start: Value, events: &mut Vec<Value>) -> u32 {
+        self.close_current(events);
+        let index = self.next_block;
+        self.next_block += 1;
+        self.current = Some(index);
+        events.push(anthropic_content_block_start(index, start));
+        index
+    }
+
+    fn ensure_text_block(&mut self, events: &mut Vec<Value>) -> u32 {
+        if let Some(index) = self.text {
+            if self.current == Some(index) {
+                return index;
+            }
+        }
+        let index = self.open_block(json!({"type": "text", "text": ""}), events);
+        self.text = Some(index);
+        index
+    }
+
+    fn ensure_thinking_block(&mut self, events: &mut Vec<Value>) -> u32 {
+        if let Some(index) = self.thinking {
+            if self.current == Some(index) {
+                return index;
+            }
+        }
+        let index = self.open_block(json!({"type": "thinking", "thinking": ""}), events);
+        self.thinking = Some(index);
+        index
+    }
+
+    const fn map_stop_reason(&self) -> &'static str {
+        if self.incomplete {
+            "max_tokens"
+        } else if self.saw_tools {
+            "tool_use"
+        } else {
+            "end_turn"
+        }
+    }
+}
+
+impl Machine for R2AMachine {
+    #[allow(clippy::too_many_lines)]
+    fn process(&mut self, frame: &SseFrame) -> Vec<Value> {
+        let mut events = Vec::new();
+        if frame.is_done() {
+            return events;
+        }
+        let Some(value) = frame.json() else {
+            return events;
+        };
+        if let Some(u) = value.get("usage") {
+            merge_usage(&mut self.usage, parse_usage(u));
+        }
+        if let Some(response) = value.get("response") {
+            if let Some(u) = response.get("usage") {
+                merge_usage(&mut self.usage, parse_usage(u));
+            }
+            if !self.started {
+                if let Some(id) = response.get("id").and_then(Value::as_str) {
+                    self.message_id = id.to_string();
+                }
+            }
+            if response.get("status").and_then(Value::as_str) == Some("incomplete") {
+                self.incomplete = true;
+            }
+        }
+
+        let ty = value.get("type").and_then(Value::as_str).unwrap_or("");
+        match ty {
+            "response.created" | "response.in_progress" => self.start(&mut events),
+            "response.output_item.added" => {
+                self.start(&mut events);
+                let item = value.get("item").unwrap_or(&Value::Null);
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    let item_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let id = if call_id.is_empty() {
+                        item_id.clone()
+                    } else {
+                        call_id
+                    };
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    self.saw_tools = true;
+                    let block = self.open_block(
+                        json!({"type": "tool_use", "id": id, "name": name, "input": {}}),
+                        &mut events,
+                    );
+                    self.tools.insert(
+                        item_id.clone(),
+                        ToolBlock {
+                            block,
+                            id,
+                            name,
+                            args: String::new(),
+                        },
+                    );
+                    self.tool_order.push(item_id);
+                }
+            }
+            "response.output_text.delta" => {
+                self.start(&mut events);
+                if let Some(t) = value.get("delta").and_then(Value::as_str) {
+                    if !t.is_empty() {
+                        let index = self.ensure_text_block(&mut events);
+                        events.push(anthropic_content_block_delta(
+                            index,
+                            json!({"type": "text_delta", "text": t}),
+                        ));
+                    }
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let item_id = value.get("item_id").and_then(Value::as_str).unwrap_or("");
+                if let Some(a) = value.get("delta").and_then(Value::as_str) {
+                    if let Some(tool) = self.tools.get_mut(item_id) {
+                        if !a.is_empty() {
+                            tool.args.push_str(a);
+                            let block = tool.block;
+                            events.push(anthropic_content_block_delta(
+                                block,
+                                json!({"type": "input_json_delta", "partial_json": a}),
+                            ));
+                        }
+                    }
+                }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                self.start(&mut events);
+                if let Some(t) = value.get("delta").and_then(Value::as_str) {
+                    if !t.is_empty() {
+                        let index = self.ensure_thinking_block(&mut events);
+                        events.push(anthropic_content_block_delta(
+                            index,
+                            json!({"type": "thinking_delta", "thinking": t}),
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        events
+    }
+
+    fn finalize(&mut self) -> Vec<Value> {
+        let mut events = Vec::new();
+        self.start(&mut events);
+        self.close_current(&mut events);
+        let stop_reason = self.map_stop_reason().to_string();
+        events.push(anthropic_message_delta(&stop_reason, &self.usage));
+        events.push(json!({"type": "message_stop"}));
+        events
+    }
+
+    fn usage(&self) -> TokenUsage {
+        self.usage
+    }
+}
+
+// ---------------------------------------------------------------------------
+// OpenAI Responses upstream -> OpenAI chat completions events
+// ---------------------------------------------------------------------------
+
+struct R2OMachine {
+    id: String,
+    model: String,
+    created: u64,
+    started: bool,
+    next_index: u32,
+    tools: HashMap<String, ResponsesTool>,
+    usage: TokenUsage,
+    incomplete: bool,
+    saw_tools: bool,
+}
+
+impl R2OMachine {
+    fn new(model: String) -> Self {
+        Self {
+            id: new_id("chatcmpl-stream"),
+            model,
+            created: now_ts(),
+            started: false,
+            next_index: 0,
+            tools: HashMap::new(),
+            usage: TokenUsage::default(),
+            incomplete: false,
+            saw_tools: false,
+        }
+    }
+
+    fn first_chunk(&mut self, events: &mut Vec<Value>) {
+        if !self.started {
+            self.started = true;
+            events.push(openai_chunk(
+                &self.id,
+                &self.model,
+                self.created,
+                json!({"role": "assistant"}),
+                None,
+            ));
+        }
+    }
+
+    fn map_finish_reason(&self) -> String {
+        if self.saw_tools {
+            "tool_calls".to_string()
+        } else if self.incomplete {
+            "length".to_string()
+        } else {
+            "stop".to_string()
+        }
+    }
+}
+
+impl Machine for R2OMachine {
+    #[allow(clippy::cast_possible_truncation, clippy::too_many_lines)]
+    fn process(&mut self, frame: &SseFrame) -> Vec<Value> {
+        let mut events = Vec::new();
+        if frame.is_done() {
+            return events;
+        }
+        let Some(value) = frame.json() else {
+            return events;
+        };
+        if let Some(u) = value.get("usage") {
+            merge_usage(&mut self.usage, parse_usage(u));
+        }
+        if let Some(response) = value.get("response") {
+            if let Some(u) = response.get("usage") {
+                merge_usage(&mut self.usage, parse_usage(u));
+            }
+            if !self.started {
+                if let Some(id) = response.get("id").and_then(Value::as_str) {
+                    self.id = id.to_string();
+                }
+            }
+            if response.get("status").and_then(Value::as_str) == Some("incomplete") {
+                self.incomplete = true;
+            }
+        }
+
+        let ty = value.get("type").and_then(Value::as_str).unwrap_or("");
+        match ty {
+            "response.created" | "response.in_progress" => self.first_chunk(&mut events),
+            "response.output_text.delta" => {
+                self.first_chunk(&mut events);
+                if let Some(t) = value.get("delta").and_then(Value::as_str) {
+                    if !t.is_empty() {
+                        events.push(openai_chunk(
+                            &self.id,
+                            &self.model,
+                            self.created,
+                            json!({"content": t}),
+                            None,
+                        ));
+                    }
+                }
+            }
+            "response.output_item.added" => {
+                self.first_chunk(&mut events);
+                let item = value.get("item").unwrap_or(&Value::Null);
+                if item.get("type").and_then(Value::as_str) == Some("function_call") {
+                    let item_id = item
+                        .get("id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let call_id = item
+                        .get("call_id")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let id = if call_id.is_empty() {
+                        item_id.clone()
+                    } else {
+                        call_id
+                    };
+                    let name = item
+                        .get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or("")
+                        .to_string();
+                    let index = self.next_index;
+                    self.next_index += 1;
+                    self.saw_tools = true;
+                    events.push(openai_chunk(
+                        &self.id,
+                        &self.model,
+                        self.created,
+                        json!({"tool_calls": [{
+                            "index": index,
+                            "id": id,
+                            "type": "function",
+                            "function": {"name": name, "arguments": ""}
+                        }]}),
+                        None,
+                    ));
+                    self.tools.insert(
+                        item_id,
+                        ResponsesTool {
+                            item_id: id,
+                            name,
+                            args: String::new(),
+                            output_index: index,
+                        },
+                    );
+                }
+            }
+            "response.function_call_arguments.delta" => {
+                let item_id = value.get("item_id").and_then(Value::as_str).unwrap_or("");
+                if let Some(a) = value.get("delta").and_then(Value::as_str) {
+                    if let Some(tool) = self.tools.get_mut(item_id) {
+                        if !a.is_empty() {
+                            tool.args.push_str(a);
+                            let index = tool.output_index;
+                            events.push(openai_chunk(
+                                &self.id,
+                                &self.model,
+                                self.created,
+                                json!({"tool_calls": [{
+                                    "index": index,
+                                    "function": {"arguments": a}
+                                }]}),
+                                None,
+                            ));
+                        }
+                    }
+                }
+            }
+            "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
+                self.first_chunk(&mut events);
+                if let Some(t) = value.get("delta").and_then(Value::as_str) {
+                    if !t.is_empty() {
+                        events.push(openai_chunk(
+                            &self.id,
+                            &self.model,
+                            self.created,
+                            json!({"reasoning_content": t}),
+                            None,
+                        ));
+                    }
+                }
+            }
+            _ => {}
+        }
+        events
+    }
+
+    fn finalize(&mut self) -> Vec<Value> {
+        let mut events = Vec::new();
+        self.first_chunk(&mut events);
+
+        let finish = self.map_finish_reason();
+        let usage = if self.usage.input > 0 || self.usage.output > 0 {
+            Some(json!({
+                "prompt_tokens": self.usage.input,
+                "completion_tokens": self.usage.output,
+                "total_tokens": self.usage.input + self.usage.output
+            }))
+        } else {
+            None
+        };
+        let mut chunk = json!({
+            "id": self.id,
+            "object": "chat.completion.chunk",
+            "created": self.created,
+            "model": self.model,
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}]
+        });
+        if let Some(u) = usage {
+            chunk["usage"] = u;
+        }
+        events.push(chunk);
+        events.push(json!("[DONE]"));
+        events
+    }
+
+    fn usage(&self) -> TokenUsage {
+        self.usage
+    }
+}
 // public entry points
 // ---------------------------------------------------------------------------
 
@@ -1393,6 +1844,30 @@ pub fn responses_from_openai(
     capture: Option<StreamCapture>,
 ) -> UpstreamStream {
     build(resp, O2RMachine::new(model), capture)
+}
+
+/// `OpenAI` Responses upstream -> Anthropic Messages SSE stream.
+///
+/// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
+/// stream completes.
+pub fn anthropic_from_responses(
+    resp: reqwest::Response,
+    model: String,
+    capture: Option<StreamCapture>,
+) -> UpstreamStream {
+    build(resp, R2AMachine::new(model), capture)
+}
+
+/// `OpenAI` Responses upstream -> `OpenAI` chat-completions SSE stream.
+///
+/// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
+/// stream completes.
+pub fn openai_from_responses(
+    resp: reqwest::Response,
+    model: String,
+    capture: Option<StreamCapture>,
+) -> UpstreamStream {
+    build(resp, R2OMachine::new(model), capture)
 }
 
 // ---------------------------------------------------------------------------
@@ -1877,6 +2352,240 @@ mod tests {
         let out = &completed["response"]["output"][0];
         assert_eq!(out["arguments"], "{}");
         assert_eq!(out["name"], "w");
+    }
+
+    // ---- OpenAI Responses -> Anthropic ----
+
+    /// Build a `response.output_text.delta` frame.
+    fn resp_text_delta(delta: &str) -> SseFrame {
+        frame(json!({
+            "type": "response.output_text.delta",
+            "item_id": "msg_1",
+            "output_index": 0,
+            "content_index": 0,
+            "delta": delta
+        }))
+    }
+
+    #[test]
+    fn r2a_text_stream() {
+        let events = run(
+            R2AMachine::new("gpt".to_string()),
+            vec![
+                frame(json!({"type": "response.created", "response": {"id": "resp_1"}})),
+                resp_text_delta("hello"),
+                resp_text_delta(" world"),
+                frame(json!({
+                    "type": "response.completed",
+                    "response": {"id": "resp_1", "status": "completed",
+                        "usage": {"input_tokens": 3, "output_tokens": 2}}
+                })),
+            ],
+        );
+        let t = types(&events);
+        assert_eq!(
+            t,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(events[0]["message"]["id"], "resp_1");
+        assert_eq!(events[0]["message"]["model"], "gpt");
+        assert_eq!(events[2]["delta"]["text"], "hello");
+        assert_eq!(events[3]["delta"]["text"], " world");
+        // stop reason defaults to end_turn with no tools
+        assert_eq!(events[5]["delta"]["stop_reason"], "end_turn");
+        assert_eq!(events[5]["usage"]["output_tokens"], 2);
+    }
+
+    #[test]
+    fn r2a_tool_call_stream() {
+        let events = run(
+            R2AMachine::new("gpt".to_string()),
+            vec![
+                frame(json!({
+                    "type": "response.output_item.added",
+                    "output_index": 0,
+                    "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "weather"}
+                })),
+                frame(json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_1",
+                    "delta": "{\"city\":"
+                })),
+                frame(json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_1",
+                    "delta": "\"sp\"}"
+                })),
+                frame(json!({
+                    "type": "response.completed",
+                    "response": {"status": "completed"}
+                })),
+            ],
+        );
+        let t = types(&events);
+        assert_eq!(
+            t,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        let start = &events[1]["content_block"];
+        assert_eq!(start["type"], "tool_use");
+        assert_eq!(start["id"], "call_1");
+        assert_eq!(start["name"], "weather");
+        assert_eq!(events[2]["delta"]["partial_json"], "{\"city\":");
+        assert_eq!(events[3]["delta"]["partial_json"], "\"sp\"}");
+        assert_eq!(events[5]["delta"]["stop_reason"], "tool_use");
+    }
+
+    #[test]
+    fn r2a_interleaves_thinking_then_text_closing_blocks() {
+        let events = run(
+            R2AMachine::new("gpt".to_string()),
+            vec![
+                frame(json!({"type": "response.reasoning_summary_text.delta", "delta": "hmm"})),
+                resp_text_delta("ok"),
+            ],
+        );
+        let t = types(&events);
+        assert_eq!(
+            t,
+            [
+                "message_start",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "content_block_start",
+                "content_block_delta",
+                "content_block_stop",
+                "message_delta",
+                "message_stop",
+            ]
+        );
+        assert_eq!(events[1]["content_block"]["type"], "thinking");
+        assert_eq!(events[2]["delta"]["type"], "thinking_delta");
+        assert_eq!(events[4]["content_block"]["type"], "text");
+    }
+
+    #[test]
+    fn r2a_incomplete_reports_max_tokens() {
+        let events = run(
+            R2AMachine::new("gpt".to_string()),
+            vec![frame(json!({
+                "type": "response.completed",
+                "response": {"status": "incomplete"}
+            }))],
+        );
+        let delta = events
+            .iter()
+            .find(|e| e["type"] == "message_delta")
+            .expect("message_delta");
+        assert_eq!(delta["delta"]["stop_reason"], "max_tokens");
+    }
+
+    // ---- OpenAI Responses -> OpenAI chat ----
+
+    #[test]
+    fn r2o_text_stream() {
+        let events = run(
+            R2OMachine::new("gpt".to_string()),
+            vec![
+                frame(json!({"type": "response.created", "response": {"id": "resp_1"}})),
+                resp_text_delta("hi"),
+                resp_text_delta(" there"),
+                frame(json!({
+                    "type": "response.completed",
+                    "response": {"status": "completed",
+                        "usage": {"input_tokens": 5, "output_tokens": 4}}
+                })),
+            ],
+        );
+        assert_eq!(events[0]["choices"][0]["delta"]["role"], "assistant");
+        assert_eq!(events[0]["id"], "resp_1");
+        assert_eq!(events[1]["choices"][0]["delta"]["content"], "hi");
+        assert_eq!(events[2]["choices"][0]["delta"]["content"], " there");
+        let last = events.last().unwrap();
+        assert_eq!(last, &json!("[DONE]"));
+        let final_chunk = &events[events.len() - 2];
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "stop");
+        assert_eq!(final_chunk["usage"]["prompt_tokens"], 5);
+        assert_eq!(final_chunk["usage"]["completion_tokens"], 4);
+    }
+
+    #[test]
+    fn r2o_tool_call_stream() {
+        let events = run(
+            R2OMachine::new("gpt".to_string()),
+            vec![
+                frame(json!({
+                    "type": "response.output_item.added",
+                    "item": {"type": "function_call", "id": "fc_1", "call_id": "call_1", "name": "weather"}
+                })),
+                frame(json!({
+                    "type": "response.function_call_arguments.delta",
+                    "item_id": "fc_1",
+                    "delta": "{\"c\":1}"
+                })),
+            ],
+        );
+        let start = events
+            .iter()
+            .find(|e| e["choices"][0]["delta"]["tool_calls"].is_array())
+            .expect("tool call chunk");
+        let call = &start["choices"][0]["delta"]["tool_calls"][0];
+        assert_eq!(call["index"], 0);
+        assert_eq!(call["id"], "call_1");
+        assert_eq!(call["function"]["name"], "weather");
+        let args = events
+            .iter()
+            .filter_map(|e| {
+                e["choices"][0]["delta"]["tool_calls"][0]["function"]["arguments"].as_str()
+            })
+            .find(|a| !a.is_empty())
+            .expect("arguments delta");
+        assert_eq!(args, "{\"c\":1}");
+        let final_chunk = &events[events.len() - 2];
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "tool_calls");
+    }
+
+    #[test]
+    fn r2o_incomplete_reports_length() {
+        let events = run(
+            R2OMachine::new("gpt".to_string()),
+            vec![frame(json!({
+                "type": "response.completed",
+                "response": {"status": "incomplete"}
+            }))],
+        );
+        let final_chunk = &events[events.len() - 2];
+        assert_eq!(final_chunk["choices"][0]["finish_reason"], "length");
+    }
+
+    #[test]
+    fn r2_empty_streams_still_terminate() {
+        let a = run(R2AMachine::new("m".to_string()), vec![]);
+        assert_eq!(
+            types(&a),
+            ["message_start", "message_delta", "message_stop"]
+        );
+
+        let o = run(R2OMachine::new("m".to_string()), vec![]);
+        assert_eq!(o.last().unwrap(), &json!("[DONE]"));
+        assert_eq!(o[o.len() - 2]["choices"][0]["finish_reason"], "stop");
     }
 
     // ---- empty stream still emits a valid terminal sequence ----

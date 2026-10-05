@@ -36,6 +36,10 @@ pub struct ResolvedRoute {
     pub provider: Arc<Provider>,
     /// Model name to send to the upstream provider.
     pub upstream_model: String,
+    /// Reasoning effort to request when the upstream supports it (e.g. the
+    /// `ChatGPT` Codex backend, where `low`/`medium`/`high` is a request field
+    /// rather than part of the model name).
+    pub reasoning_effort: Option<String>,
 }
 
 /// Resolves requested model names to upstream providers using configured
@@ -154,6 +158,7 @@ impl Router {
                 return Ok(ResolvedRoute {
                     provider: Arc::new(self.config.providers[provider_idx].clone()),
                     upstream_model: upstream.to_string(),
+                    reasoning_effort: None,
                 });
             }
         }
@@ -178,6 +183,7 @@ impl Router {
                     return Ok(ResolvedRoute {
                         provider: p,
                         upstream_model: model.to_string(),
+                        reasoning_effort: None,
                     });
                 }
                 if unconnected.is_none() {
@@ -189,6 +195,7 @@ impl Router {
             return Ok(ResolvedRoute {
                 provider,
                 upstream_model: model.to_string(),
+                reasoning_effort: None,
             });
         }
 
@@ -197,6 +204,7 @@ impl Router {
                 return Ok(ResolvedRoute {
                     provider: Arc::new(self.config.providers[provider_idx].clone()),
                     upstream_model: model.to_string(),
+                    reasoning_effort: None,
                 });
             }
         }
@@ -278,6 +286,7 @@ impl Router {
                 Ok(ResolvedRoute {
                     provider: Arc::new(provider.clone()),
                     upstream_model: auto.clone(),
+                    reasoning_effort: None,
                 })
             },
         )
@@ -292,6 +301,7 @@ impl Router {
                 .upstream_model
                 .clone()
                 .unwrap_or_else(|| model.to_string()),
+            reasoning_effort: route.reasoning_effort.clone(),
         }
     }
 }
@@ -332,18 +342,21 @@ mod tests {
                     provider: "openai".to_string(),
                     prefix: false,
                     upstream_model: None,
+                    reasoning_effort: None,
                 },
                 Route {
                     model: "claude".to_string(),
                     provider: "anthropic".to_string(),
                     prefix: true,
                     upstream_model: Some("claude-opus-4-1".to_string()),
+                    reasoning_effort: None,
                 },
                 Route {
                     model: "claude-sonnet".to_string(),
                     provider: "openai".to_string(),
                     prefix: true,
                     upstream_model: Some("kimi-k2.6".to_string()),
+                    reasoning_effort: None,
                 },
             ],
             defaults: Defaults {
@@ -517,6 +530,7 @@ mod tests {
             provider: "openai".to_string(),
             prefix: false,
             upstream_model: Some("gpt-4o".to_string()),
+            reasoning_effort: None,
         });
         let router = router_for(c);
         let resolved = router.resolve_model("auto", &|_| true).unwrap();
@@ -579,6 +593,7 @@ mod tests {
             provider: "does-not-exist".to_string(),
             prefix: false,
             upstream_model: None,
+            reasoning_effort: None,
         });
         let err = Router::new(Arc::new(c)).unwrap_err();
         assert!(matches!(err, RouterError::ProviderNotFound { .. }));
