@@ -14,9 +14,10 @@ Most AI tools hardcode their vendor's API shape. The reference design here is [o
 
 - Endpoints: `/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/health`.
 - Request and response translation plus streaming SSE, event by event, in all three directions (Anthropic to OpenAI, OpenAI to Anthropic, Responses to Anthropic and OpenAI).
-- Embedded provider catalog (`anthropic`, `openai`, `opencode-go`, `zen`, `groq`, `xai`, `google`, `deepseek`, `openrouter`, `neuralwatt`). Your `config.yaml` only adds to it or overrides entries; it never replaces the whole list.
+- Embedded provider catalog (`anthropic`, `claude`, `openai`, `opencode-go`, `zen`, `groq`, `xai`, `google`, `deepseek`, `openrouter`, `neuralwatt`). Your `config.yaml` only adds to it or overrides entries; it never replaces the whole list.
 - Hot reload. Editing the config or `auth.json` applies in runtime through a file watcher, no restart.
 - Auth store separate from the config (`auth.json`), modeled after opencode's `/connect`. Keys never live in the config.
+- OAuth subscription logins (`local-proxy connect claude --oauth`): a provider with an `oauth:` block runs a PKCE login, stores the token bundle in `auth.json`, refreshes it automatically near expiry, and the engine stays provider-agnostic.
 - `$proxy` executor. When the last user message starts with `$proxy `, the proxy runs the rest as a `local-proxy` command and returns the output as the model's reply. Works with no provider connected.
 - Model routing with a clear precedence (exact route, `provider/model`, prefix, native list, default).
 - Upstream errors reformatted into the client's shape (Anthropic or OpenAI).
@@ -92,7 +93,7 @@ Claude Code sends `/v1/messages`; the proxy routes to a connected provider and t
 | `stop` | Stop the background proxy. |
 | `models` | List models from connected providers, as `provider/model`. |
 | `model [<m>]` | Show or set the active model. `model clear` unsets it. |
-| `connect <provider> [key]` | Store an API key for an existing provider. Prompts hidden if the key is omitted. |
+| `connect <provider> [key]` | Store an API key for an existing provider. Prompts hidden if the key is omitted. `--oauth` runs the provider's OAuth login instead. |
 | `disconnect <provider>` | Remove the stored API key. |
 | `providers` | List effective providers (catalog plus config) with key status. |
 | `stats [--since day\|week\|month\|all] [--json]` | Show usage statistics from recorded requests. |
@@ -176,6 +177,40 @@ local-proxy disconnect opencode-go       # remove the key
 ```
 
 Per request, the key resolution reads `auth.json[provider]`. That is the only source.
+
+### OAuth subscription logins
+
+A provider with an `oauth:` block accepts `connect --oauth`. The catalog ships one for Claude subscriptions (Pro, Max, Team, Enterprise), separate from the API-key `anthropic` provider so both can be connected at once:
+
+```bash
+local-proxy connect claude --oauth
+```
+
+The command prints the authorize URL (it does not open a browser), you approve access on claude.ai, and paste the `code#state` shown on the callback page — the same flow Claude Code's own `/login` uses. The tokens land in `auth.json` as `{"type":"oauth","access":...,"refresh":...,"expires":...}`, the proxy sends `Authorization: Bearer` (never `x-api-key`) with the provider's `oauth.headers` (Anthropic beta flags), and refreshes the access token automatically one minute before expiry, persisting the new bundle. The Claude entry also injects the required `You are Claude Code, Anthropic's official CLI for Claude.` block as the first `system` entry on every request; Anthropic rejects OAuth-authenticated non-Haiku requests without it.
+
+Nothing about Anthropic lives in the Rust code: a future OAuth provider with the same `paste` interaction is a config block alone. The login engine only needs the descriptor:
+
+```yaml
+providers:
+  - name: claude
+    base_url: https://api.anthropic.com
+    format: anthropic
+    oauth:
+      flow: paste                          # interactive login style
+      authorize_url: https://claude.ai/oauth/authorize
+      token_url: https://console.anthropic.com/v1/oauth/token
+      client_id: 9d1c250a-e61b-44d9-88ed-5944d1962f5e
+      scopes: [org:create_api_key, user:profile, user:inference]
+      redirect_uri: https://console.anthropic.com/oauth/code/callback
+      authorize_params: { code: "true" }   # extra authorize query params
+      token_params: {}                     # extra token fields (e.g. client_secret)
+      headers:                             # sent only on OAuth requests
+        anthropic-beta: oauth-2025-04-20,claude-code-20250219
+        x-app: cli
+      identity: "You are Claude Code, Anthropic's official CLI for Claude."
+```
+
+To run a second subscription account, define another provider with the same `oauth` block under a different name (a same-named provider in your config replaces the catalog entry entirely). A provider with a new interaction style (loopback callback, device code) needs one new `flow` variant plus its function in `src/oauth.rs`; everything downstream already treats OAuth uniformly.
 
 ### Active model
 
@@ -368,6 +403,7 @@ src/
 ├── config.rs      Config, Provider, Route, Defaults (YAML/JSON), overlay, per-provider headers
 ├── catalog.rs     embedded catalog and catalog to config merge
 ├── auth.rs        auth.json keys and atomic writes
+├── oauth.rs       generic OAuth 2.0 + PKCE engine (login flows, exchange, refresh)
 ├── cli.rs         serve, launch, status, stop, models, model, connect, disconnect, providers, stats, statusline, update
 ├── router.rs      resolve_model to (provider, upstream_model)
 ├── upstream.rs    HTTP calls, key resolution, per-provider headers

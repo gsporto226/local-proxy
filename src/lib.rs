@@ -33,6 +33,9 @@ pub mod handlers;
 /// Model-to-provider routing logic.
 pub mod router;
 
+/// Generic OAuth 2.0 + PKCE engine for subscription providers.
+pub mod oauth;
+
 /// Server-Sent Events helpers.
 pub mod sse;
 

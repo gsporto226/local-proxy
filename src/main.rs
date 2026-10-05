@@ -88,12 +88,16 @@ enum Command {
         /// low | medium | high | xhigh | max; omit to show; "clear" to unset
         level: Option<String>,
     },
-    /// Store the API key for an existing provider (catalog or config)
+    /// Store credentials for an existing provider (API key, or OAuth login)
     Connect {
         /// Provider name (must exist in the catalog or config)
         provider: String,
         /// API key; prompted hidden if omitted
         key: Option<String>,
+        /// Run the provider's OAuth login flow instead of storing an API key
+        /// (requires an `oauth:` block in the provider config)
+        #[arg(long)]
+        oauth: bool,
     },
     /// Remove the stored API key for a provider
     Disconnect {
@@ -218,7 +222,11 @@ fn main() -> miette::Result<()> {
         Some(Command::Models) => cli::models(config),
         Some(Command::Model { model }) => cli::model(config, model),
         Some(Command::Effort { level }) => cli::effort(config, level),
-        Some(Command::Connect { provider, key }) => cli::connect(config, provider, key),
+        Some(Command::Connect {
+            provider,
+            key,
+            oauth,
+        }) => cli::connect(config, provider, key, oauth),
         Some(Command::Disconnect { provider }) => cli::disconnect(config, provider),
         Some(Command::Providers) => cli::providers(config),
         Some(Command::Stats { since, json }) => {

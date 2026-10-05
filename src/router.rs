@@ -313,6 +313,7 @@ mod tests {
                     auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
+                    oauth: None,
                 },
                 Provider {
                     name: "openai".to_string(),
@@ -322,6 +323,7 @@ mod tests {
                     auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
+                    oauth: None,
                 },
             ],
             routes: vec![

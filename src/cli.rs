@@ -767,10 +767,7 @@ pub fn connected_models(config_path: &Path) -> Result<Vec<String>, CliError> {
     let auth = crate::auth::read_auth().unwrap_or_default();
     let mut models = Vec::new();
     for provider in &config.providers {
-        if !crate::upstream::provider_has_key(
-            provider,
-            auth.get(&provider.name).map(|e| e.key.as_str()),
-        ) {
+        if !crate::upstream::provider_has_key(auth.get(&provider.name)) {
             continue;
         }
         for model in &provider.models {
@@ -851,28 +848,46 @@ fn effective_config(config_path: &Path) -> Result<Config, CliError> {
     Ok(crate::catalog::effective_config(base, overlay))
 }
 
-/// Validate that `provider` exists in the effective provider set (catalog or
-/// config), storing its API key in `auth.json`. Prompts hidden if no key given.
-/// Returns the success message.
+/// Validate that `provider` exists and store its credential in `auth.json`.
+///
+/// The credential is the API key given (or prompted hidden), or, with
+/// `oauth`, the result of the provider's OAuth login flow. Returns the success
+/// message.
 ///
 /// # Errors
 ///
-/// Returns a [`CliError`] if the provider is unknown, the prompt fails, or the
-/// auth store cannot be written.
+/// Returns a [`CliError`] if the provider is unknown, lacks an `oauth:` block
+/// when `--oauth` is used, the prompt fails, or the auth store cannot be
+/// written.
 #[allow(clippy::result_large_err)]
 pub fn connect_provider(
     config_path: &Path,
     provider: &str,
     key: Option<String>,
+    oauth: bool,
 ) -> Result<String, CliError> {
     let effective = effective_config(config_path)?;
-    if !effective.providers.iter().any(|p| p.name == provider) {
+    let Some(found) = effective.providers.iter().find(|p| p.name == provider) else {
         return Err(CliError::Connect {
             message: format!(
                 "provider '{provider}' nao existe no catalogo nem no config; \
                  use `local-proxy providers` ou adicione-o no config"
             ),
         });
+    };
+    if oauth {
+        let config = found.oauth.clone().ok_or_else(|| CliError::Connect {
+            message: format!(
+                "provider '{provider}' nao tem bloco `oauth:` no config; \
+                 adicione um ou use `connect {provider} <chave>`"
+            ),
+        })?;
+        let tokens = oauth_paste_login(provider, &config)?;
+        crate::auth::set_oauth(provider, &tokens).map_err(CliError::from)?;
+        return Ok(format!(
+            "oauth do provider '{provider}' conectado em auth.json (access token expira {})",
+            remaining_lifetime(tokens.expires)
+        ));
     }
     let key =
         match key.filter(|k| !k.trim().is_empty()) {
@@ -885,6 +900,60 @@ pub fn connect_provider(
         };
     crate::auth::set_key(provider, key.trim()).map_err(CliError::from)?;
     Ok(format!("chave do provider '{provider}' salva em auth.json"))
+}
+
+/// Run the interactive `paste` OAuth flow for `provider`: print the authorize
+/// URL, read the `code#state` from stdin, and exchange it for tokens. The state
+/// carries the PKCE verifier, matching the reference Claude Code flow.
+#[allow(clippy::result_large_err)]
+fn oauth_paste_login(
+    provider: &str,
+    config: &crate::config::OAuthProvider,
+) -> Result<crate::auth::OAuthTokens, CliError> {
+    use std::io::Write as _;
+
+    let (verifier, challenge) = crate::oauth::generate_pkce();
+    let url = crate::oauth::authorize_url(config, &challenge, &verifier).map_err(|e| {
+        CliError::Connect {
+            message: format!("provider '{provider}': {e}"),
+        }
+    })?;
+    println!("abra esta URL no navegador e autorize o acesso:\n\n{url}\n");
+    print!("cole o codigo (code#state) mostrado na pagina: ");
+    io::stdout().flush().map_err(CliError::from)?;
+    let mut input = String::new();
+    io::stdin().read_line(&mut input).map_err(CliError::from)?;
+    let (code, pasted_state) =
+        crate::oauth::parse_code_input(&input).map_err(|e| CliError::Connect {
+            message: format!("codigo invalido: {e}"),
+        })?;
+    let state = pasted_state.unwrap_or_else(|| verifier.clone());
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .map_err(CliError::from)?;
+    rt.block_on(crate::oauth::exchange(
+        &reqwest::Client::new(),
+        config,
+        &code,
+        &verifier,
+        &state,
+    ))
+    .map_err(|e| CliError::Connect {
+        message: format!("falha ao trocar o codigo por tokens: {e}"),
+    })
+}
+
+/// Render the token's remaining lifetime in coarse units (`~7h`, `~12d`).
+fn remaining_lifetime(expires_ms: i64) -> String {
+    let remaining = expires_ms.saturating_sub(crate::oauth::now_ms()) / 1000;
+    if remaining >= 86_400 {
+        format!("em ~{}d", remaining / 86_400)
+    } else if remaining >= 3_600 {
+        format!("em ~{}h", remaining / 3_600)
+    } else {
+        format!("em ~{}min", (remaining / 60).max(1))
+    }
 }
 
 /// Remove the stored API key for `provider` from `auth.json`. Returns the
@@ -916,8 +985,11 @@ pub fn list_providers(config_path: &Path) -> Result<String, CliError> {
     let auth = crate::auth::read_auth().unwrap_or_default();
     let mut out = String::new();
     for p in &effective.providers {
-        let has_key = auth.contains_key(&p.name);
-        let status = if has_key { "ok" } else { "-" };
+        let status = match auth.get(&p.name) {
+            Some(crate::auth::AuthEntry::OAuth(_)) => "oauth",
+            Some(_) => "ok",
+            None => "-",
+        };
         out.push_str(&format!(
             "{:<16} format={:<10} key={status}\n",
             p.name, p.format
@@ -1078,14 +1150,20 @@ pub fn model(config_path: PathBuf, model: Option<String>) -> miette::Result<()> 
     Ok(())
 }
 
-/// CLI entry for `connect`: store the API key for an existing provider.
+/// CLI entry for `connect`: store the API key (or OAuth login) for a provider.
 ///
 /// # Errors
 ///
 /// Returns a [`CliError`] if the provider is unknown or the auth store fails.
 #[allow(clippy::needless_pass_by_value)]
-pub fn connect(config_path: PathBuf, provider: String, key: Option<String>) -> miette::Result<()> {
-    let msg = connect_provider(&config_path, &provider, key).map_err(miette::Report::from)?;
+pub fn connect(
+    config_path: PathBuf,
+    provider: String,
+    key: Option<String>,
+    oauth: bool,
+) -> miette::Result<()> {
+    let msg =
+        connect_provider(&config_path, &provider, key, oauth).map_err(miette::Report::from)?;
     println!("{msg}");
     Ok(())
 }

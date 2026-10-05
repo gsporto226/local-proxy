@@ -246,8 +246,8 @@ pub fn build_clients(config: &Config) -> Result<HashMap<String, ProviderClient>,
     let mut map = HashMap::new();
     let mut connected = Vec::new();
     for provider in &config.providers {
-        let auth_key = auth.get(&provider.name).map(|e| e.key.clone());
-        let client = ProviderClient::new(provider, passthrough, auth_key)?;
+        let auth_entry = auth.get(&provider.name).cloned();
+        let client = ProviderClient::new(provider, passthrough, auth_entry)?;
         if client.has_key() {
             connected.push(provider.name.clone());
         }
@@ -1558,6 +1558,7 @@ mod tests {
                     auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
+                    oauth: None,
                 },
                 crate::config::Provider {
                     name: "anthropic".to_string(),
@@ -1567,6 +1568,7 @@ mod tests {
                     auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
+                    oauth: None,
                 },
             ],
             routes: vec![crate::config::Route {
@@ -1592,8 +1594,14 @@ mod tests {
             .clone();
         clients.insert(
             "openai".to_string(),
-            crate::upstream::ProviderClient::new(&openai, false, Some("sk".to_string()))
-                .expect("client"),
+            crate::upstream::ProviderClient::new(
+                &openai,
+                false,
+                Some(crate::auth::AuthEntry::Api {
+                    key: "sk".to_string(),
+                }),
+            )
+            .expect("client"),
         );
         let state = RuntimeState {
             config: cfg.clone(),
@@ -1622,6 +1630,7 @@ mod tests {
                     auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
+                    oauth: None,
                 },
                 crate::config::Provider {
                     name: "anthropic".to_string(),
@@ -1631,6 +1640,7 @@ mod tests {
                     auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
+                    oauth: None,
                 },
             ],
             routes: Vec::new(),
@@ -1651,8 +1661,14 @@ mod tests {
             .clone();
         clients.insert(
             "openai".to_string(),
-            crate::upstream::ProviderClient::new(&openai, false, Some("sk".to_string()))
-                .expect("client"),
+            crate::upstream::ProviderClient::new(
+                &openai,
+                false,
+                Some(crate::auth::AuthEntry::Api {
+                    key: "sk".to_string(),
+                }),
+            )
+            .expect("client"),
         );
         let state = RuntimeState {
             config: cfg.clone(),
@@ -1686,6 +1702,7 @@ mod tests {
                     auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
+                    oauth: None,
                 },
                 crate::config::Provider {
                     name: "anthropic".to_string(),
@@ -1695,6 +1712,7 @@ mod tests {
                     auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
+                    oauth: None,
                 },
             ],
             routes: Vec::new(),
@@ -1715,8 +1733,14 @@ mod tests {
             .clone();
         clients.insert(
             "openai".to_string(),
-            crate::upstream::ProviderClient::new(&openai, false, Some("sk".to_string()))
-                .expect("client"),
+            crate::upstream::ProviderClient::new(
+                &openai,
+                false,
+                Some(crate::auth::AuthEntry::Api {
+                    key: "sk".to_string(),
+                }),
+            )
+            .expect("client"),
         );
         let state = RuntimeState {
             config: cfg.clone(),
@@ -1750,6 +1774,7 @@ mod tests {
                 auto_model: None,
                 headers: std::collections::HashMap::new(),
                 session_header: None,
+                oauth: None,
             }],
             routes: Vec::new(),
             defaults: crate::config::Defaults {
@@ -1769,8 +1794,14 @@ mod tests {
             .clone();
         clients.insert(
             "openai".to_string(),
-            crate::upstream::ProviderClient::new(&openai, false, Some("sk".to_string()))
-                .expect("client"),
+            crate::upstream::ProviderClient::new(
+                &openai,
+                false,
+                Some(crate::auth::AuthEntry::Api {
+                    key: "sk".to_string(),
+                }),
+            )
+            .expect("client"),
         );
         let state = RuntimeState {
             config: cfg.clone(),
@@ -1796,6 +1827,7 @@ mod tests {
                 auto_model: None,
                 headers: std::collections::HashMap::new(),
                 session_header: None,
+                oauth: None,
             }],
             routes: Vec::new(),
             defaults: crate::config::Defaults {
@@ -1917,6 +1949,7 @@ mod tests {
                 auto_model: None,
                 headers: std::collections::HashMap::new(),
                 session_header: None,
+                oauth: None,
             }],
             routes: Vec::new(),
             defaults: crate::config::Defaults {

@@ -38,6 +38,52 @@ pub enum ProviderFormat {
     Openai,
 }
 
+/// How the interactive OAuth login gets the authorization code.
+///
+/// The engine in [`crate::oauth`] implements one function per flow; adding a
+/// provider with a new interaction is a new variant here plus that function.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum OAuthFlow {
+    /// Print the authorize URL, then read the `code#state` the callback page
+    /// shows from stdin (`claude setup-token` / Claude Code `/login` style).
+    #[default]
+    Paste,
+}
+
+/// OAuth 2.0 client recipe for a subscription provider.
+///
+/// Everything provider-specific lives here (endpoints, client id, scopes,
+/// extra headers, identity prompt), so the OAuth engine stays generic and a
+/// new provider is a config block, not Rust code.
+#[derive(Debug, Clone, Default, Deserialize, Serialize)]
+#[serde(default)]
+pub struct OAuthProvider {
+    /// Interactive login flow used by `connect --oauth`.
+    pub flow: OAuthFlow,
+    /// Authorization endpoint opened in the browser.
+    pub authorize_url: String,
+    /// Token endpoint, used for both code exchange and refresh.
+    pub token_url: String,
+    /// Public OAuth client id.
+    pub client_id: String,
+    /// Requested scopes (joined with spaces in the authorize URL).
+    pub scopes: Vec<String>,
+    /// Redirect URI registered for the client.
+    pub redirect_uri: String,
+    /// Extra query parameters appended to the authorize URL.
+    pub authorize_params: HashMap<String, String>,
+    /// Extra fields sent in token requests (e.g. a `client_secret`).
+    pub token_params: HashMap<String, String>,
+    /// Static headers sent only on OAuth-authenticated requests (beta flags,
+    /// app identity). Provider-level `headers` still override these.
+    pub headers: HashMap<String, String>,
+    /// System prompt block the upstream requires first on every request
+    /// (Anthropic rejects non-Haiku OAuth calls without it).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub identity: Option<String>,
+}
+
 /// Network and authentication settings for the proxy server.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(default)]
@@ -88,6 +134,10 @@ pub struct Provider {
     /// require one to route requests (e.g. `OpenCode`'s `x-opencode-session`).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub session_header: Option<String>,
+    /// OAuth 2.0 subscription recipe. Providers with this block accept
+    /// `connect <name> --oauth` and refresh their tokens automatically.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<OAuthProvider>,
 }
 
 /// Maps a requested model to a provider (exact match or prefix).

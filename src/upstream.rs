@@ -1,16 +1,18 @@
+use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
-use serde_json::Value;
+use serde_json::{json, Value};
 
-use crate::config::{Provider, ProviderFormat};
+use crate::auth::{AuthEntry, OAuthTokens};
+use crate::config::{OAuthProvider, Provider, ProviderFormat};
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
 /// Errors that can occur while building clients or talking to upstreams.
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
     /// The provider has no API key in the auth store.
-    #[error("provider {provider} has no API key; store one via `local-proxy connect {provider}`")]
+    #[error("provider {provider} has no credentials; store a key with `local-proxy connect {provider}` or run `local-proxy connect {provider} --oauth` for a subscription")]
     MissingApiKey {
         /// Name of the provider missing a key.
         provider: String,
@@ -37,6 +39,14 @@ pub enum UpstreamError {
     },
 }
 
+/// Mutable OAuth state shared by every clone of a provider's client: the token
+/// bundle plus the recipe needed to refresh it.
+#[derive(Debug)]
+struct OAuthState {
+    tokens: OAuthTokens,
+    config: OAuthProvider,
+}
+
 /// A per-provider HTTP client that knows how to authenticate against the
 /// upstream (Anthropic or `OpenAI`) and honors the passthrough-keys policy.
 #[derive(Debug, Clone)]
@@ -44,7 +54,10 @@ pub struct ProviderClient {
     name: String,
     base_url: String,
     format: ProviderFormat,
-    auth_key: Option<String>,
+    auth: Option<AuthEntry>,
+    oauth_state: Option<Arc<tokio::sync::Mutex<OAuthState>>>,
+    oauth_headers: std::collections::HashMap<String, String>,
+    identity: Option<String>,
     passthrough: bool,
     headers: std::collections::HashMap<String, String>,
     session_header: Option<String>,
@@ -53,7 +66,8 @@ pub struct ProviderClient {
 
 impl ProviderClient {
     /// Build a client for `provider` honoring the given `passthrough` policy.
-    /// `auth_key` is the provider's API key resolved from the auth store.
+    /// `auth` is the provider's entry from the auth store: an API key or an
+    /// OAuth token bundle.
     ///
     /// # Errors
     ///
@@ -62,17 +76,33 @@ impl ProviderClient {
     pub fn new(
         provider: &Provider,
         passthrough: bool,
-        auth_key: Option<String>,
+        auth: Option<AuthEntry>,
     ) -> Result<Self, UpstreamError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_mins(10))
             .build()
             .map_err(|source| UpstreamError::ClientBuild { source })?;
+        let oauth_state = match (&auth, &provider.oauth) {
+            (Some(AuthEntry::OAuth(tokens)), Some(config)) => {
+                Some(Arc::new(tokio::sync::Mutex::new(OAuthState {
+                    tokens: tokens.clone(),
+                    config: config.clone(),
+                })))
+            }
+            _ => None,
+        };
+        let (oauth_headers, identity) = provider.oauth.as_ref().map_or_else(
+            || (std::collections::HashMap::new(), None),
+            |c| (c.headers.clone(), c.identity.clone()),
+        );
         Ok(Self {
             name: provider.name.clone(),
             base_url: provider.base_url.trim_end_matches('/').to_string(),
             format: provider.format,
-            auth_key,
+            auth,
+            oauth_state,
+            oauth_headers,
+            identity,
             passthrough,
             headers: provider.headers.clone(),
             session_header: provider.session_header.clone(),
@@ -92,10 +122,11 @@ impl ProviderClient {
         self.format
     }
 
-    /// Whether this client has an API key available from the auth store.
+    /// Whether this client has a usable credential (API key or OAuth tokens)
+    /// available from the auth store.
     #[must_use]
     pub fn has_key(&self) -> bool {
-        self.auth_key.as_deref().is_some_and(|k| !k.is_empty())
+        self.auth.as_ref().is_some_and(AuthEntry::usable)
     }
 
     /// Default endpoint path for this provider's format.
@@ -108,8 +139,9 @@ impl ProviderClient {
     }
 
     fn configured_key(&self) -> Option<String> {
-        self.auth_key
-            .as_deref()
+        self.auth
+            .as_ref()
+            .and_then(AuthEntry::api_key)
             .filter(|k| !k.is_empty())
             .map(str::to_string)
     }
@@ -123,6 +155,63 @@ impl ProviderClient {
         self.configured_key()
     }
 
+    /// Current OAuth access token, refreshing first when it is at or inside
+    /// [`crate::oauth::REFRESH_LEEWAY_MS`] of expiry. Refreshes are serialized
+    /// per provider by the shared state mutex, so concurrent requests refresh
+    /// once. A failed refresh keeps the current token; the upstream answers
+    /// 401 if it is truly expired.
+    async fn oauth_access(&self) -> Option<String> {
+        let Some(state) = &self.oauth_state else {
+            return self
+                .auth
+                .as_ref()
+                .and_then(AuthEntry::oauth)
+                .map(|t| t.access.clone())
+                .filter(|a| !a.is_empty());
+        };
+        let mut guard = state.lock().await;
+        if guard.tokens.expires <= crate::oauth::now_ms() + crate::oauth::REFRESH_LEEWAY_MS {
+            tracing::info!(target: crate::LOG_TARGET, provider = %self.name, "refreshing oauth token");
+            match crate::oauth::refresh(&self.http, &guard.config, &guard.tokens).await {
+                Ok(fresh) => {
+                    if let Err(e) = crate::auth::set_oauth(&self.name, &fresh) {
+                        tracing::warn!(
+                            target: crate::LOG_TARGET,
+                            provider = %self.name,
+                            error = %e,
+                            "failed to persist refreshed oauth token"
+                        );
+                    }
+                    guard.tokens = fresh;
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        target: crate::LOG_TARGET,
+                        provider = %self.name,
+                        error = %e,
+                        "oauth refresh failed; using current token"
+                    );
+                }
+            }
+        }
+        let access = guard.tokens.access.clone();
+        drop(guard);
+        (!access.is_empty()).then_some(access)
+    }
+
+    /// Insert the provider's OAuth-only headers (beta flags, app identity).
+    fn insert_oauth_headers(&self, headers: &mut HeaderMap) {
+        for (name, value) in &self.oauth_headers {
+            let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) else {
+                continue;
+            };
+            headers.insert(name, value);
+        }
+    }
+
     fn header_value(raw: &str) -> Result<HeaderValue, UpstreamError> {
         HeaderValue::from_str(raw).map_err(|e| UpstreamError::InvalidHeader {
             detail: format!("{raw:?}: {e}"),
@@ -132,20 +221,30 @@ impl ProviderClient {
     /// POST `body` to `path` (defaulting to this provider's endpoint) with the
     /// correct auth headers. Returns the raw response for the caller to read.
     ///
+    /// OAuth-authenticated providers send `Authorization: Bearer`, never
+    /// `x-api-key`, apply their `oauth.headers`, and get the configured
+    /// identity block prepended to `system` (an Anthropic requirement).
+    ///
     /// # Errors
     ///
-    /// Returns [`UpstreamError::MissingApiKey`] if no API key is available,
+    /// Returns [`UpstreamError::MissingApiKey`] if no credential is available,
     /// [`UpstreamError::InvalidHeader`] if a header cannot be built, or
     /// [`UpstreamError::Request`] if the HTTP request fails.
     pub async fn chat_request(
         &self,
         path: &str,
-        body: Value,
+        mut body: Value,
         client_key: Option<&str>,
         session_id: &str,
     ) -> Result<reqwest::Response, UpstreamError> {
+        let is_oauth = matches!(self.auth, Some(AuthEntry::OAuth(_)));
+        let oauth_access = if is_oauth {
+            self.oauth_access().await
+        } else {
+            None
+        };
         let key = self.effective_key(client_key);
-        if key.is_none() {
+        if oauth_access.is_none() && key.is_none() {
             return Err(UpstreamError::MissingApiKey {
                 provider: self.name.clone(),
             });
@@ -160,13 +259,31 @@ impl ProviderClient {
             target: crate::LOG_TARGET,
             provider = %self.name,
             url = %url,
-            has_key = key.is_some(),
+            has_key = key.is_some() || oauth_access.is_some(),
+            oauth = oauth_access.is_some(),
             "sending upstream request"
         );
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(key) = key {
+        if let Some(access) = &oauth_access {
+            headers.insert(
+                AUTHORIZATION,
+                Self::header_value(&format!("Bearer {access}"))?,
+            );
+            if self.format == ProviderFormat::Anthropic {
+                headers.insert(
+                    "anthropic-version",
+                    HeaderValue::from_static(ANTHROPIC_VERSION),
+                );
+            }
+            self.insert_oauth_headers(&mut headers);
+            if self.format == ProviderFormat::Anthropic {
+                if let Some(identity) = &self.identity {
+                    inject_identity(&mut body, identity);
+                }
+            }
+        } else if let Some(key) = key {
             match self.format {
                 ProviderFormat::Anthropic => {
                     headers.insert("x-api-key", Self::header_value(&key)?);
@@ -224,14 +341,38 @@ impl ProviderClient {
     }
 }
 
-/// Whether `provider` has an API key available from the auth store.
-///
-/// Mirrors [`ProviderClient::configured_key`] without building an HTTP client,
-/// so it can be used to decide "connected" providers.
+/// Ensure `identity` is the first `system` block, preserving the caller's
+/// prompt as the next block. Anthropic rejects OAuth-authenticated requests on
+/// all models except Haiku when the request does not lead with this exact
+/// block, so it is prepended verbatim and never merged with other text.
+fn inject_identity(body: &mut Value, identity: &str) {
+    let block = json!({"type": "text", "text": identity});
+    match body.get_mut("system") {
+        None => body["system"] = Value::Array(vec![block]),
+        Some(Value::String(text)) if text == identity => {}
+        Some(Value::String(text)) => {
+            let original = json!({"type": "text", "text": text.clone()});
+            body["system"] = Value::Array(vec![block, original]);
+        }
+        Some(Value::Array(blocks)) => {
+            let first_matches = blocks
+                .first()
+                .and_then(|b| b.get("text"))
+                .and_then(Value::as_str)
+                == Some(identity);
+            if !first_matches {
+                blocks.insert(0, block);
+            }
+        }
+        Some(_) => {}
+    }
+}
+
+/// Whether `entry` can authenticate requests: a non-empty API key or OAuth
+/// tokens. Used to decide "connected" providers without building a client.
 #[must_use]
-pub fn provider_has_key(provider: &Provider, auth_key: Option<&str>) -> bool {
-    let _ = provider;
-    auth_key.is_some_and(|k| !k.is_empty())
+pub fn provider_has_key(entry: Option<&AuthEntry>) -> bool {
+    entry.is_some_and(AuthEntry::usable)
 }
 
 /// Fill `models` for connected providers that don't list them explicitly.
@@ -247,8 +388,8 @@ pub fn discover_models(config: &mut crate::config::Config) {
         .enumerate()
         .filter(|(_, p)| p.models.is_empty())
         .filter_map(|(i, p)| {
-            let key = auth.get(&p.name).map(|e| e.key.clone());
-            let client = ProviderClient::new(p, false, key).ok()?;
+            let auth_entry = auth.get(&p.name).cloned();
+            let client = ProviderClient::new(p, false, auth_entry).ok()?;
             client.has_key().then_some((i, client))
         })
         .collect();
@@ -281,19 +422,34 @@ impl ProviderClient {
     /// Model IDs from the upstream's `GET /v1/models` (both `OpenAI` and
     /// Anthropic return `{"data": [{"id": ...}]}`). Empty on any failure.
     async fn list_models(&self) -> Vec<String> {
-        let Some(key) = self.configured_key() else {
+        let is_oauth = matches!(self.auth, Some(AuthEntry::OAuth(_)));
+        let oauth_access = if is_oauth {
+            self.oauth_access().await
+        } else {
+            None
+        };
+        let api_key = self.configured_key();
+        if oauth_access.is_none() && api_key.is_none() {
             return Vec::new();
-        };
+        }
         let url = format!("{}/v1/models", self.base_url);
-        let req = match self.format {
-            ProviderFormat::Anthropic => self
-                .http
-                .get(&url)
-                .header("x-api-key", key)
+        let mut req = self.http.get(&url);
+        if let Some(access) = oauth_access {
+            req = req.header(AUTHORIZATION, format!("Bearer {access}"));
+        } else if let Some(key) = api_key {
+            req = match self.format {
+                ProviderFormat::Anthropic => req.header("x-api-key", key),
+                ProviderFormat::Openai => req.bearer_auth(key),
+            };
+        }
+        if self.format == ProviderFormat::Anthropic {
+            req = req
                 .header("anthropic-version", ANTHROPIC_VERSION)
-                .query(&[("limit", "1000")]),
-            ProviderFormat::Openai => self.http.get(&url).bearer_auth(key),
-        };
+                .query(&[("limit", "1000")]);
+        }
+        for (k, v) in &self.oauth_headers {
+            req = req.header(k.as_str(), v.as_str());
+        }
         let req = self
             .headers
             .iter()
@@ -362,6 +518,13 @@ mod tests {
             auto_model: None,
             headers: std::collections::HashMap::new(),
             session_header: None,
+            oauth: None,
+        }
+    }
+
+    fn api_key(key: &str) -> AuthEntry {
+        AuthEntry::Api {
+            key: key.to_string(),
         }
     }
 
@@ -399,14 +562,14 @@ mod tests {
     async fn effective_key_passthrough_prefers_client_key() {
         let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         let p = provider(ProviderFormat::Anthropic);
-        let client = ProviderClient::new(&p, true, Some("configured-key".to_string())).unwrap();
+        let client = ProviderClient::new(&p, true, Some(api_key("configured-key"))).unwrap();
         let key = client.effective_key(Some("client-key"));
         assert_eq!(key.as_deref(), Some("client-key"));
         // without a client key, falls back to the configured key
         let key = client.effective_key(None);
         assert_eq!(key.as_deref(), Some("configured-key"));
         // without passthrough, client key is ignored
-        let client = ProviderClient::new(&p, false, Some("configured-key".to_string())).unwrap();
+        let client = ProviderClient::new(&p, false, Some(api_key("configured-key"))).unwrap();
         let key = client.effective_key(Some("client-key"));
         assert_eq!(key.as_deref(), Some("configured-key"));
     }
@@ -418,7 +581,7 @@ mod tests {
 
         // auth key is used
         let p = provider(ProviderFormat::Anthropic);
-        let client = ProviderClient::new(&p, false, Some("auth-key".to_string())).unwrap();
+        let client = ProviderClient::new(&p, false, Some(api_key("auth-key"))).unwrap();
         assert_eq!(client.configured_key().as_deref(), Some("auth-key"));
 
         // no key at all
@@ -489,7 +652,7 @@ mod tests {
             ),
             ("X-Title".to_string(), "local-proxy".to_string()),
         ]);
-        let client = ProviderClient::new(&p, false, Some("key".to_string())).unwrap();
+        let client = ProviderClient::new(&p, false, Some(api_key("key"))).unwrap();
         client
             .chat_request("/v1/chat/completions", json!({}), None, "")
             .await
@@ -519,7 +682,7 @@ mod tests {
         let mut p = provider(ProviderFormat::Openai);
         p.base_url = base.clone();
         p.session_header = Some("x-opencode-session".to_string());
-        let client = ProviderClient::new(&p, false, Some("key".to_string())).unwrap();
+        let client = ProviderClient::new(&p, false, Some(api_key("key"))).unwrap();
         client
             .chat_request("/v1/chat/completions", json!({}), None, "sess-1")
             .await
@@ -546,7 +709,7 @@ mod tests {
             "Authorization".to_string(),
             "Bearer custom".to_string(),
         )]);
-        let client = ProviderClient::new(&p, false, Some("key".to_string())).unwrap();
+        let client = ProviderClient::new(&p, false, Some(api_key("key"))).unwrap();
         client
             .chat_request("/v1/chat/completions", json!({}), None, "")
             .await
@@ -583,7 +746,7 @@ connection: close
         });
         let mut p = provider(ProviderFormat::Openai);
         p.base_url = format!("http://{addr}");
-        let client = ProviderClient::new(&p, false, Some("key".to_string())).unwrap();
+        let client = ProviderClient::new(&p, false, Some(api_key("key"))).unwrap();
         assert_eq!(
             client.list_models().await,
             vec!["new-model-1", "new-model-2"]
@@ -634,5 +797,241 @@ connection: close
         let (status, body) = send_and_read(resp).await;
         assert_eq!(status, 400);
         assert_eq!(body, Value::String(String::new()));
+    }
+
+    fn oauth_provider(token_url: String) -> Provider {
+        let mut p = provider(ProviderFormat::Anthropic);
+        p.oauth = Some(OAuthProvider {
+            authorize_url: "https://claude.ai/oauth/authorize".to_string(),
+            token_url,
+            client_id: "client-1".to_string(),
+            scopes: vec!["user:inference".to_string()],
+            redirect_uri: "https://console.anthropic.com/oauth/code/callback".to_string(),
+            headers: std::collections::HashMap::from([(
+                "anthropic-beta".to_string(),
+                "oauth-2025-04-20".to_string(),
+            )]),
+            identity: Some("You are Claude Code, Anthropic's official CLI for Claude.".to_string()),
+            ..OAuthProvider::default()
+        });
+        p
+    }
+
+    fn oauth_entry(access: &str, refresh: &str, expires: i64) -> AuthEntry {
+        AuthEntry::OAuth(OAuthTokens {
+            access: access.to_string(),
+            refresh: refresh.to_string(),
+            expires,
+        })
+    }
+
+    #[test]
+    fn identity_injection_shapes() {
+        let id = "You are Claude Code, Anthropic's official CLI for Claude.";
+        let mut body = json!({"model": "m"});
+        inject_identity(&mut body, id);
+        assert_eq!(body["system"][0]["text"], id);
+
+        let mut body = json!({"system": "client prompt"});
+        inject_identity(&mut body, id);
+        assert_eq!(body["system"][0]["text"], id);
+        assert_eq!(body["system"][1]["text"], "client prompt");
+
+        let mut body = json!({"system": [{"type": "text", "text": "other"}]});
+        inject_identity(&mut body, id);
+        assert_eq!(body["system"][0]["text"], id);
+        assert_eq!(body["system"][1]["text"], "other");
+
+        // already first: not duplicated
+        let mut body = json!({"system": [{"type": "text", "text": id}]});
+        inject_identity(&mut body, id);
+        assert_eq!(body["system"].as_array().unwrap().len(), 1);
+    }
+
+    /// One-shot server that records the full request head and body.
+    async fn full_capture_server() -> (String, tokio::sync::oneshot::Receiver<(String, String)>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 4096];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= head_end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let head_end = buf
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(buf.len(), |p| p + 4);
+            let head = String::from_utf8_lossy(&buf[..head_end]).to_string();
+            let body = String::from_utf8_lossy(&buf[head_end..]).to_string();
+            let _ = tx.send((head, body));
+            let payload = b"{}";
+            let _ = sock
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                        payload.len()
+                    )
+                    .as_bytes(),
+                )
+                .await;
+            let _ = sock.write_all(payload).await;
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    /// One-shot token endpoint answering with `response_body`.
+    async fn token_server(
+        response_body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<String>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let mut buf = Vec::new();
+            let mut chunk = [0u8; 1024];
+            loop {
+                let n = sock.read(&mut chunk).await.unwrap_or(0);
+                if n == 0 {
+                    break;
+                }
+                buf.extend_from_slice(&chunk[..n]);
+                if let Some(head_end) = buf.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let head = String::from_utf8_lossy(&buf[..head_end]).to_lowercase();
+                    let len = head
+                        .lines()
+                        .find_map(|l| l.strip_prefix("content-length:"))
+                        .and_then(|v| v.trim().parse::<usize>().ok())
+                        .unwrap_or(0);
+                    if buf.len() >= head_end + 4 + len {
+                        break;
+                    }
+                }
+            }
+            let head_end = buf
+                .windows(4)
+                .position(|w| w == b"\r\n\r\n")
+                .map_or(buf.len(), |p| p + 4);
+            let _ = tx.send(String::from_utf8_lossy(&buf[head_end..]).to_string());
+            let head = format!(
+                "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                response_body.len()
+            );
+            let _ = sock.write_all(head.as_bytes()).await;
+            let _ = sock.write_all(response_body.as_bytes()).await;
+        });
+        (format!("http://{addr}"), rx)
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn oauth_request_uses_bearer_beta_and_identity() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+
+        let (base, rx) = full_capture_server().await;
+        let mut p = oauth_provider(String::new());
+        p.base_url = base;
+        let tokens = crate::oauth::now_ms() + 3_600_000;
+        let client = ProviderClient::new(
+            &p,
+            true,
+            Some(oauth_entry("sk-ant-oat01-live", "ref", tokens)),
+        )
+        .unwrap();
+        let body = json!({
+            "model": "m",
+            "max_tokens": 1,
+            "system": "client prompt",
+            "messages": []
+        });
+        client
+            .chat_request("/v1/messages", body, Some("client-key"), "")
+            .await
+            .unwrap();
+
+        let (head, body) = rx.await.unwrap();
+        let head = head.to_lowercase();
+        assert!(
+            head.contains("authorization: bearer sk-ant-oat01-live"),
+            "bearer auth missing: {head}"
+        );
+        assert!(head.contains("anthropic-beta: oauth-2025-04-20"));
+        assert!(head.contains("anthropic-version: 2023-06-01"));
+        assert!(!head.contains("x-api-key"));
+        assert!(!head.contains("client-key"));
+
+        let body: Value = serde_json::from_str(&body).unwrap();
+        assert_eq!(
+            body["system"][0]["text"],
+            "You are Claude Code, Anthropic's official CLI for Claude."
+        );
+        assert_eq!(body["system"][1]["text"], "client prompt");
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn expired_oauth_refreshes_and_persists() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "local-proxy-oauth-upstream-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", &dir);
+
+        let (token_base, tokens_rx) = token_server(
+            r#"{"access_token":"fresh-acc","refresh_token":"fresh-ref","expires_in":3600}"#,
+        )
+        .await;
+        let (base, rx) = header_capture_server().await;
+        let mut p = oauth_provider(token_base);
+        p.base_url = base;
+        let client =
+            ProviderClient::new(&p, false, Some(oauth_entry("stale-acc", "old-ref", 0))).unwrap();
+        client
+            .chat_request("/v1/messages", json!({}), None, "")
+            .await
+            .unwrap();
+
+        let received = rx.await.unwrap();
+        assert_eq!(
+            received.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer fresh-acc")
+        );
+        let refresh_body: Value = serde_json::from_str(&tokens_rx.await.unwrap()).unwrap();
+        assert_eq!(refresh_body["grant_type"], "refresh_token");
+        assert_eq!(refresh_body["refresh_token"], "old-ref");
+
+        let persisted = std::fs::read_to_string(dir.join("auth.json")).unwrap();
+        assert!(persisted.contains("fresh-acc"), "persisted: {persisted}");
+        assert!(persisted.contains("fresh-ref"));
+
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

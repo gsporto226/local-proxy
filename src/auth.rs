@@ -13,14 +13,59 @@ use miette::Diagnostic;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-/// A single auth entry: the API key for a provider.
+/// A single auth entry: an API key or an OAuth token bundle for a provider.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct AuthEntry {
-    /// Auth kind — always `api` for now (future: oauth).
-    #[serde(rename = "type")]
-    pub kind: String,
-    /// The provider's API key.
-    pub key: String,
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum AuthEntry {
+    /// API-key entry, as written by `connect` (`{"type":"api","key":"..."}`).
+    Api {
+        /// The provider's API key.
+        key: String,
+    },
+    /// OAuth entry, as written by `connect --oauth`
+    /// (`{"type":"oauth","access":"...","refresh":"...","expires":...}`).
+    OAuth(OAuthTokens),
+}
+
+/// OAuth tokens for one provider, persisted in `auth.json`.
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub struct OAuthTokens {
+    /// Current access token, sent as `Authorization: Bearer`.
+    pub access: String,
+    /// Refresh token used to mint new access tokens.
+    pub refresh: String,
+    /// Unix milliseconds at which `access` expires.
+    pub expires: i64,
+}
+
+impl AuthEntry {
+    /// The API key, when this entry is an API-key entry.
+    #[must_use]
+    pub fn api_key(&self) -> Option<&str> {
+        match self {
+            Self::Api { key } => Some(key),
+            Self::OAuth(_) => None,
+        }
+    }
+
+    /// The OAuth bundle, when this entry is an OAuth entry.
+    #[must_use]
+    pub const fn oauth(&self) -> Option<&OAuthTokens> {
+        match self {
+            Self::Api { .. } => None,
+            Self::OAuth(tokens) => Some(tokens),
+        }
+    }
+
+    /// Whether the entry can authenticate a request: a non-empty API key, or an
+    /// OAuth bundle with an access or refresh token.
+    #[must_use]
+    pub const fn usable(&self) -> bool {
+        match self {
+            Self::Api { key } => !key.is_empty(),
+            Self::OAuth(tokens) => !tokens.access.is_empty() || !tokens.refresh.is_empty(),
+        }
+    }
 }
 
 /// Map of provider name to its stored auth entry.
@@ -113,9 +158,11 @@ pub fn read_auth() -> Result<AuthMap, AuthError> {
 /// Return the stored API key for `provider`, if any.
 #[must_use]
 pub fn key_for(provider: &str) -> Option<String> {
-    read_auth()
-        .ok()
-        .and_then(|auth| auth.get(provider).map(|e| e.key.clone()))
+    read_auth().ok().and_then(|auth| {
+        auth.get(provider)
+            .and_then(|e| e.api_key())
+            .map(str::to_string)
+    })
 }
 
 /// Store the API key for `provider`, creating/updating `auth.json`.
@@ -124,15 +171,28 @@ pub fn key_for(provider: &str) -> Option<String> {
 ///
 /// Returns [`AuthError`] if the file cannot be written.
 pub fn set_key(provider: &str, key: &str) -> Result<(), AuthError> {
-    let path = auth_file();
-    let mut auth = load(&path)?;
-    auth.insert(
-        provider.to_string(),
-        AuthEntry {
-            kind: "api".to_string(),
+    save_entry(
+        provider,
+        AuthEntry::Api {
             key: key.to_string(),
         },
-    );
+    )
+}
+
+/// Store the OAuth token bundle for `provider`, creating/updating `auth.json`.
+///
+/// # Errors
+///
+/// Returns [`AuthError`] if the file cannot be written.
+pub fn set_oauth(provider: &str, tokens: &OAuthTokens) -> Result<(), AuthError> {
+    save_entry(provider, AuthEntry::OAuth(tokens.clone()))
+}
+
+/// Insert `entry` under `provider` and persist the store.
+fn save_entry(provider: &str, entry: AuthEntry) -> Result<(), AuthError> {
+    let path = auth_file();
+    let mut auth = load(&path)?;
+    auth.insert(provider.to_string(), entry);
     save(&path, &auth)
 }
 
@@ -182,15 +242,41 @@ mod tests {
         let mut auth = AuthMap::new();
         auth.insert(
             "opencode-go".to_string(),
-            AuthEntry {
-                kind: "api".to_string(),
+            AuthEntry::Api {
                 key: "sk-test".to_string(),
             },
         );
         save(&path, &auth).expect("save");
         let loaded = load(&path).expect("load");
-        assert_eq!(loaded["opencode-go"].key, "sk-test");
-        assert_eq!(loaded["opencode-go"].kind, "api");
+        assert_eq!(loaded["opencode-go"].api_key(), Some("sk-test"));
+        assert!(loaded["opencode-go"].oauth().is_none());
+    }
+
+    #[test]
+    fn oauth_entry_roundtrip() {
+        let path = temp_auth_file("oauth");
+        std::fs::remove_file(&path).ok();
+        let tokens = OAuthTokens {
+            access: "sk-ant-oat01-x".to_string(),
+            refresh: "sk-ant-ort01-y".to_string(),
+            expires: 1_791_225_331_499,
+        };
+        let mut auth = AuthMap::new();
+        auth.insert("claude".to_string(), AuthEntry::OAuth(tokens.clone()));
+        save(&path, &auth).expect("save");
+        let raw = std::fs::read_to_string(&path).expect("read file");
+        assert!(raw.contains("\"type\": \"oauth\""));
+        assert!(raw.contains("\"access\": \"sk-ant-oat01-x\""));
+        let loaded = load(&path).expect("load");
+        assert_eq!(loaded["claude"].oauth(), Some(&tokens));
+        assert!(loaded["claude"].usable());
+    }
+
+    #[test]
+    fn legacy_api_entry_parses() {
+        let entry: AuthEntry =
+            serde_json::from_str(r#"{"type":"api","key":"sk-legacy"}"#).expect("parses");
+        assert_eq!(entry.api_key(), Some("sk-legacy"));
     }
 
     #[test]
@@ -200,8 +286,7 @@ mod tests {
         let mut auth = AuthMap::new();
         auth.insert(
             "zen".to_string(),
-            AuthEntry {
-                kind: "api".to_string(),
+            AuthEntry::Api {
                 key: "k".to_string(),
             },
         );

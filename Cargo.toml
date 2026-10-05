@@ -24,6 +24,11 @@ directories = "5"
 miette = { version = "7", features = ["fancy"] }
 sha2 = "0.10"
 rpassword = "7"
+# OAuth 2.0 (PKCE subscription logins): base64url encoding for the PKCE
+# challenge, and URL building for the authorize endpoint. Both crates are
+# already in the dependency tree (reqwest); they are only direct deps now.
+base64 = "0.22"
+url = "2"
 notify = "7"
 notify-debouncer-full = "0.4"
 rusqlite = { version = "0.32", features = ["bundled"] }
