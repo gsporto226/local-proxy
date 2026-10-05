@@ -155,6 +155,14 @@ impl From<UpstreamError> for ApiError {
             UpstreamError::InvalidHeader { detail } => {
                 Self::internal(format!("invalid upstream header: {detail}"))
             }
+            UpstreamError::Oauth { provider, detail } => Self::new(
+                502,
+                "api_error",
+                format!(
+                    "provider {provider} failed to refresh its OAuth token: {detail}; \
+                     run `local-proxy login {provider}`"
+                ),
+            ),
             UpstreamError::Request { url, source } => Self::new(
                 502,
                 "api_error",

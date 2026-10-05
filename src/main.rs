@@ -89,6 +89,11 @@ enum Command {
         /// Provider name
         provider: String,
     },
+    /// Log in to a subscription provider (OAuth PKCE in the browser)
+    Login {
+        /// Provider name (e.g. chatgpt)
+        provider: String,
+    },
     /// List effective providers (catalog ∪ config) with key status
     Providers,
     /// Show usage statistics recorded from upstream requests
@@ -207,6 +212,7 @@ fn main() -> miette::Result<()> {
         Some(Command::Model { model }) => cli::model(config, model),
         Some(Command::Connect { provider, key }) => cli::connect(config, provider, key),
         Some(Command::Disconnect { provider }) => cli::disconnect(config, provider),
+        Some(Command::Login { provider }) => block_on(cli::login(config, provider)),
         Some(Command::Providers) => cli::providers(config),
         Some(Command::Stats { since, json }) => {
             let since = since.unwrap_or_else(|| "day".to_string());

@@ -27,6 +27,14 @@ pub enum UpstreamError {
         /// Human-readable description of the invalid header.
         detail: String,
     },
+    /// A per-request OAuth token could not be resolved or refreshed.
+    #[error("provider {provider} falhou ao renovar o token OAuth: {detail}")]
+    Oauth {
+        /// Name of the provider whose token failed.
+        provider: String,
+        /// Human-readable reason.
+        detail: String,
+    },
     /// An upstream request failed.
     #[error("upstream request to {url} failed: {source}")]
     Request {
@@ -38,13 +46,17 @@ pub enum UpstreamError {
 }
 
 /// A per-provider HTTP client that knows how to authenticate against the
-/// upstream (Anthropic or `OpenAI`) and honors the passthrough-keys policy.
+/// upstream (Anthropic, `OpenAI`, or a subscription-backed OAuth provider) and
+/// honors the passthrough-keys policy.
 #[derive(Debug, Clone)]
 pub struct ProviderClient {
     name: String,
     base_url: String,
     format: ProviderFormat,
     auth_key: Option<String>,
+    /// The OAuth flow to refresh with, when this provider authenticates via
+    /// OAuth (`None` otherwise).
+    oauth_flavor: Option<String>,
     passthrough: bool,
     headers: std::collections::HashMap<String, String>,
     http: reqwest::Client,
@@ -52,7 +64,9 @@ pub struct ProviderClient {
 
 impl ProviderClient {
     /// Build a client for `provider` honoring the given `passthrough` policy.
-    /// `auth_key` is the provider's API key resolved from the auth store.
+    /// `auth_key` is the provider's API key resolved from the auth store; when
+    /// the stored entry is an OAuth one the token is resolved at request time
+    /// instead and `auth_key` is ignored.
     ///
     /// # Errors
     ///
@@ -72,10 +86,26 @@ impl ProviderClient {
             base_url: provider.base_url.trim_end_matches('/').to_string(),
             format: provider.format,
             auth_key,
+            oauth_flavor: None,
             passthrough,
             headers: provider.headers.clone(),
             http,
         })
+    }
+
+    /// Mark this client as OAuth-backed with the given flow (`chatgpt`), so
+    /// [`Self::chat_request`] resolves a (possibly refreshed) bearer token at
+    /// request time. Pass `None` for static API-key auth.
+    #[must_use]
+    pub fn with_oauth(mut self, flavor: Option<String>) -> Self {
+        self.oauth_flavor = flavor;
+        self
+    }
+
+    /// Whether this client authenticates with OAuth tokens.
+    #[must_use]
+    pub const fn is_oauth(&self) -> bool {
+        self.oauth_flavor.is_some()
     }
 
     /// The provider's name.
@@ -90,10 +120,10 @@ impl ProviderClient {
         self.format
     }
 
-    /// Whether this client has an API key available from the auth store.
+    /// Whether this client has credentials available from the auth store.
     #[must_use]
     pub fn has_key(&self) -> bool {
-        self.auth_key.as_deref().is_some_and(|k| !k.is_empty())
+        self.is_oauth() || self.auth_key.as_deref().is_some_and(|k| !k.is_empty())
     }
 
     /// Default endpoint path for this provider's format.
@@ -102,6 +132,7 @@ impl ProviderClient {
         match self.format {
             ProviderFormat::Anthropic => "/v1/messages",
             ProviderFormat::Openai => "/v1/chat/completions",
+            ProviderFormat::OpenaiResponses => "/responses",
         }
     }
 
@@ -141,8 +172,12 @@ impl ProviderClient {
         body: Value,
         client_key: Option<&str>,
     ) -> Result<reqwest::Response, UpstreamError> {
-        let key = self.effective_key(client_key);
-        if key.is_none() {
+        let key = if self.is_oauth() {
+            None
+        } else {
+            self.effective_key(client_key)
+        };
+        if key.is_none() && !self.is_oauth() {
             return Err(UpstreamError::MissingApiKey {
                 provider: self.name.clone(),
             });
@@ -157,13 +192,27 @@ impl ProviderClient {
             target: crate::LOG_TARGET,
             provider = %self.name,
             url = %url,
-            has_key = key.is_some(),
+            has_key = key.is_some() || self.is_oauth(),
             "sending upstream request"
         );
 
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
-        if let Some(key) = key {
+        if let Some(flavor) = &self.oauth_flavor {
+            let token = crate::oauth::access_token(&self.name, flavor)
+                .await
+                .map_err(|e| UpstreamError::Oauth {
+                    provider: self.name.clone(),
+                    detail: e.to_string(),
+                })?;
+            headers.insert(
+                AUTHORIZATION,
+                Self::header_value(&format!("Bearer {token}"))?,
+            );
+            if let Some(account) = crate::auth::entry_for(&self.name).and_then(|e| e.account_id) {
+                headers.insert("chatgpt-account-id", Self::header_value(&account)?);
+            }
+        } else if let Some(key) = key {
             match self.format {
                 ProviderFormat::Anthropic => {
                     headers.insert("x-api-key", Self::header_value(&key)?);
@@ -172,7 +221,7 @@ impl ProviderClient {
                         HeaderValue::from_static(ANTHROPIC_VERSION),
                     );
                 }
-                ProviderFormat::Openai => {
+                ProviderFormat::Openai | ProviderFormat::OpenaiResponses => {
                     headers.insert(AUTHORIZATION, Self::header_value(&format!("Bearer {key}"))?);
                 }
             }
@@ -200,10 +249,11 @@ impl ProviderClient {
     }
 }
 
-/// Whether `provider` has an API key available from the auth store.
+/// Whether `provider` has credentials available from the auth store.
 ///
 /// Mirrors [`ProviderClient::configured_key`] without building an HTTP client,
-/// so it can be used to decide "connected" providers.
+/// so it can be used to decide "connected" providers. An OAuth entry (whose
+/// `key` holds the current access token) counts as connected.
 #[must_use]
 pub fn provider_has_key(provider: &Provider, auth_key: Option<&str>) -> bool {
     let _ = provider;
@@ -230,6 +280,7 @@ mod tests {
             format,
             models: Vec::new(),
             headers: std::collections::HashMap::new(),
+            oauth: None,
         }
     }
 

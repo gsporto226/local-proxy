@@ -12,6 +12,28 @@ export const BINARY = join(
   "local-proxy" + (process.platform === "win32" ? ".exe" : ""),
 );
 
+/**
+ * A throwaway config dir for a test suite, plus the `LOCAL_PROXY_CONFIG_DIR` env
+ * that points the proxy (and every CLI subcommand it spawns) at it.
+ *
+ * This is what keeps the suite off the user's real `auth.json`: the auth store
+ * lives at `<config dir>/auth.json`, so an isolated dir means the tests can seed
+ * and clear credentials freely without ever reading or writing the real store.
+ * Never write to the user's global config dir from a test.
+ */
+export function isolatedConfigDir(): { dir: string; env: Record<string, string> } {
+  // Note the prefix: `stopProxy` sweeps temp dirs named `local-proxy-e2e-*`, so
+  // this one must not collide with it or a suite's cleanup would delete another
+  // suite's auth store.
+  const dir = mkdtempSync(join(tmpdir(), "local-proxy-cfg-"));
+  return { dir, env: { LOCAL_PROXY_CONFIG_DIR: dir } };
+}
+
+/** Path of the auth store inside an isolated config `dir`. */
+export function authStorePath(dir: string): string {
+  return join(dir, "auth.json");
+}
+
 export interface ProxyHandle {
   proc: Subprocess;
   base: string;

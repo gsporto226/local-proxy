@@ -109,6 +109,32 @@ defaults:
     }
 
     #[test]
+    fn embedded_catalog_has_chatgpt_responses_provider() {
+        let config = load().expect("embedded catalog parses");
+        let chatgpt = config
+            .providers
+            .iter()
+            .find(|p| p.name == "chatgpt")
+            .expect("chatgpt provider present");
+        assert_eq!(chatgpt.format, ProviderFormat::OpenaiResponses);
+        assert_eq!(chatgpt.base_url, "https://chatgpt.com/backend-api/codex");
+        // The Codex catalog slugs, not the chat web UI's `-wm` names.
+        assert!(chatgpt.models.iter().any(|m| m == "gpt-6-sol"));
+        assert!(!chatgpt.models.iter().any(|m| m.contains("-wm")));
+        assert!(!chatgpt.headers.is_empty());
+
+        // The effort aliases resolve to a real slug plus a reasoning effort.
+        let low = config
+            .routes
+            .iter()
+            .find(|r| r.model == "chatgpt/gpt-6-sol-low")
+            .expect("effort route present");
+        assert_eq!(low.provider, "chatgpt");
+        assert_eq!(low.upstream_model.as_deref(), Some("gpt-6-sol"));
+        assert_eq!(low.reasoning_effort.as_deref(), Some("low"));
+    }
+
+    #[test]
     fn overlay_adds_new_provider() {
         let overlay = Config::from_str(
             r"providers:
@@ -196,8 +222,10 @@ defaults:
             provider: "p".to_string(),
             prefix: true,
             upstream_model: None,
+            reasoning_effort: Some("low".to_string()),
         })
         .expect("serializes");
         assert!(yaml.contains("prefix: true"));
+        assert!(yaml.contains("reasoning_effort: low"));
     }
 }

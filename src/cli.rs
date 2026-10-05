@@ -101,6 +101,14 @@ pub enum CliError {
     #[diagnostic(transparent)]
     StatuslineSetup(#[from] crate::statusline::SetupError),
 
+    /// An OAuth login or token refresh failed.
+    #[error("falha no login OAuth: {0}")]
+    #[diagnostic(
+        code(cli::oauth),
+        help("verifique a conexao e tente `local-proxy login <provider>` de novo")
+    )]
+    Oauth(#[from] crate::oauth::OAuthError),
+
     /// The local usage statistics could not be read.
     #[error("failed to read usage statistics")]
     #[diagnostic(
@@ -834,10 +842,13 @@ pub fn list_providers(config_path: &Path) -> Result<String, CliError> {
     let auth = crate::auth::read_auth().unwrap_or_default();
     let mut out = String::new();
     for p in &effective.providers {
-        let has_key = auth.contains_key(&p.name);
-        let status = if has_key { "ok" } else { "-" };
+        let status = match auth.get(&p.name) {
+            Some(entry) if entry.is_oauth() => "oauth",
+            Some(_) => "ok",
+            None => "-",
+        };
         out.push_str(&format!(
-            "{:<16} format={:<10} key={status}\n",
+            "{:<16} format={:<16} key={status}\n",
             p.name, p.format
         ));
     }
@@ -956,6 +967,49 @@ pub fn disconnect(config_path: PathBuf, provider: String) -> miette::Result<()> 
     let msg = disconnect_provider(&config_path, &provider).map_err(miette::Report::from)?;
     println!("{msg}");
     Ok(())
+}
+
+/// Run the browser OAuth (PKCE) login for `provider` and store the tokens.
+///
+/// The OAuth flow to use is the provider's configured `oauth` flavor, defaulting
+/// to the provider name itself, so `local-proxy login chatgpt` works out of the
+/// box and an aliased provider shares the same flow.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the provider is unknown, its flow does not support
+/// OAuth, the callback cannot be served, the login times out, or the token
+/// exchange fails.
+pub async fn login(config_path: PathBuf, provider: String) -> miette::Result<()> {
+    let effective = effective_config(&config_path)?;
+    let flavor = resolve_oauth_flavor(&effective, &provider);
+    if !crate::oauth::supports(&flavor) {
+        return Err(CliError::Connect {
+            message: format!(
+                "provider '{provider}' nao suporta login OAuth (flow '{flavor}'); \
+                 providers com OAuth: chatgpt"
+            ),
+        }
+        .into());
+    }
+    println!("iniciando login OAuth para '{provider}' (flow '{flavor}')...");
+    crate::oauth::login(&provider, &flavor)
+        .await
+        .map_err(CliError::from)?;
+    println!("login concluido; tokens salvos em auth.json");
+    Ok(())
+}
+
+/// The OAuth flow to use for `provider`: its configured `oauth` flavor, falling
+/// back to the provider's own name.
+#[must_use]
+fn resolve_oauth_flavor(config: &Config, provider: &str) -> String {
+    config
+        .providers
+        .iter()
+        .find(|p| p.name == provider)
+        .and_then(|p| p.oauth.clone())
+        .unwrap_or_else(|| provider.to_string())
 }
 
 /// CLI entry for `providers`: print the effective provider list.
@@ -1900,6 +1954,35 @@ mod tests {
         assert_eq!(map["ANTHROPIC_API_KEY"], "unused");
         assert_eq!(map["ANTHROPIC_AUTH_TOKEN"], "unused");
         assert!(!map.contains_key("ANTHROPIC_MODEL"));
+    }
+
+    #[test]
+    fn resolve_oauth_flavor_defaults_to_name_and_honors_config() {
+        let mut cfg = config_with(vec![]);
+        cfg.providers = vec![
+            crate::config::Provider {
+                name: "chatgpt".to_string(),
+                base_url: "http://x".to_string(),
+                format: crate::config::ProviderFormat::OpenaiResponses,
+                models: Vec::new(),
+                headers: std::collections::HashMap::new(),
+                oauth: None,
+            },
+            crate::config::Provider {
+                name: "my-gpt".to_string(),
+                base_url: "http://x".to_string(),
+                format: crate::config::ProviderFormat::OpenaiResponses,
+                models: Vec::new(),
+                headers: std::collections::HashMap::new(),
+                oauth: Some("chatgpt".to_string()),
+            },
+        ];
+        // unset flavor falls back to the provider name
+        assert_eq!(resolve_oauth_flavor(&cfg, "chatgpt"), "chatgpt");
+        // an aliased provider uses the configured flow
+        assert_eq!(resolve_oauth_flavor(&cfg, "my-gpt"), "chatgpt");
+        // unknown providers fall back to their own name too
+        assert_eq!(resolve_oauth_flavor(&cfg, "ghost"), "ghost");
     }
 
     #[test]

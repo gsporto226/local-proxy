@@ -27,7 +27,7 @@ server:
   passthrough_keys: false
 ";
 
-/// Wire format a provider's API expects (`Anthropic` vs `OpenAI`).
+/// Wire format a provider's API expects.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderFormat {
@@ -36,6 +36,9 @@ pub enum ProviderFormat {
     Anthropic,
     /// `OpenAI` Chat Completions format.
     Openai,
+    /// `OpenAI` Responses API format (used by the `ChatGPT` backend).
+    #[serde(rename = "openai-responses")]
+    OpenaiResponses,
 }
 
 /// Network and authentication settings for the proxy server.
@@ -79,6 +82,11 @@ pub struct Provider {
     /// Headers with the same name override the format/auth defaults.
     #[serde(default)]
     pub headers: HashMap<String, String>,
+    /// OAuth flow to use when this provider's auth entry is OAuth (`chatgpt`
+    /// today). Defaults to the provider's own name, so a provider called
+    /// `chatgpt` needs no explicit setting.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub oauth: Option<String>,
 }
 
 /// Maps a requested model to a provider (exact match or prefix).
@@ -93,6 +101,13 @@ pub struct Route {
     pub prefix: bool,
     /// Optional model name to send upstream instead of the requested one.
     pub upstream_model: Option<String>,
+    /// Reasoning effort to request upstream (`low`, `medium`, `high`, …).
+    ///
+    /// Only meaningful for providers whose reasoning depth is a request field
+    /// rather than part of the model name — the `ChatGPT` Codex backend, where
+    /// `gpt-6-sol` at `low` and at `medium` share one model id. The proxy adds
+    /// it to the request body; providers that ignore the field are unaffected.
+    pub reasoning_effort: Option<String>,
 }
 
 /// Configuration for the `$proxy` local-command-execution feature.
@@ -398,6 +413,7 @@ impl fmt::Display for ProviderFormat {
         match self {
             Self::Anthropic => write!(f, "anthropic"),
             Self::Openai => write!(f, "openai"),
+            Self::OpenaiResponses => write!(f, "openai-responses"),
         }
     }
 }
@@ -562,6 +578,72 @@ mod tests {
         assert!(config.providers.is_empty());
 
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn provider_format_parses_openai_responses() {
+        let config = Config::from_str(
+            "providers:\n  - name: chatgpt\n    base_url: http://x\n    format: openai-responses\n",
+            "yaml",
+        )
+        .expect("yaml parses");
+        assert_eq!(config.providers[0].format, ProviderFormat::OpenaiResponses);
+        assert_eq!(config.providers[0].format.to_string(), "openai-responses");
+
+        // round-trips through YAML with the same spelling
+        let yaml = serde_yaml::to_string(&config.providers[0]).expect("serializes");
+        assert!(yaml.contains("openai-responses"), "{yaml}");
+    }
+
+    #[test]
+    fn route_reasoning_effort_parses_and_defaults_to_none() {
+        let config = Config::from_str(
+            r"routes:
+  - model: sol-low
+    provider: chatgpt
+    upstream_model: gpt-6-sol
+    reasoning_effort: low
+  - model: plain
+    provider: chatgpt
+",
+            "yaml",
+        )
+        .expect("yaml parses");
+        assert_eq!(config.routes[0].reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            config.routes[0].upstream_model.as_deref(),
+            Some("gpt-6-sol")
+        );
+        assert_eq!(config.routes[1].reasoning_effort, None);
+
+        // A route without an effort still serializes the field (as null), which
+        // matches how `upstream_model` already behaves; the value round-trips.
+        let yaml = serde_yaml::to_string(&config.routes[1]).expect("serializes");
+        assert!(yaml.contains("reasoning_effort: null"), "{yaml}");
+        let back: crate::config::Route = serde_yaml::from_str(&yaml).expect("parses back");
+        assert_eq!(back.reasoning_effort, None);
+    }
+
+    #[test]
+    fn provider_oauth_flavor_parses_and_defaults_to_none() {
+        let config = Config::from_str(
+            r"providers:
+  - name: my-gpt
+    base_url: http://x
+    format: openai-responses
+    oauth: chatgpt
+  - name: plain
+    base_url: http://y
+    format: openai
+",
+            "yaml",
+        )
+        .expect("yaml parses");
+        assert_eq!(config.providers[0].oauth.as_deref(), Some("chatgpt"));
+        assert_eq!(config.providers[1].oauth, None);
+        // a provider without `oauth` does not serialize the field
+        let yaml = serde_yaml::to_string(&config.providers[1]).expect("serializes");
+        assert!(!yaml.contains("oauth"), "{yaml}");
     }
 
     #[test]
