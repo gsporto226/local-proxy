@@ -1351,7 +1351,6 @@ impl Machine for O2RMachine {
 ///
 /// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
 /// stream completes.
-#[must_use]
 pub fn anthropic_from_openai(
     resp: reqwest::Response,
     model: String,
@@ -1364,7 +1363,6 @@ pub fn anthropic_from_openai(
 ///
 /// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
 /// stream completes.
-#[must_use]
 pub fn openai_from_anthropic(
     resp: reqwest::Response,
     model: String,
@@ -1377,7 +1375,6 @@ pub fn openai_from_anthropic(
 ///
 /// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
 /// stream completes.
-#[must_use]
 pub fn responses_from_anthropic(
     resp: reqwest::Response,
     model: String,
@@ -1390,7 +1387,6 @@ pub fn responses_from_anthropic(
 ///
 /// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
 /// stream completes.
-#[must_use]
 pub fn responses_from_openai(
     resp: reqwest::Response,
     model: String,

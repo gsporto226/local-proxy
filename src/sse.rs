@@ -193,13 +193,13 @@ mod tests {
         assert_eq!(f1.len(), 1);
         assert_eq!(f1[0].event.as_deref(), Some("a"));
         // the partial `data: [D...` is still buffered
-        assert!(!buf.is_empty());
+        assert!(!buf.is_empty(), "partial frame should stay buffered");
 
         // second chunk completes `[DONE]`
         let f2 = feed_frames(&mut buf, b"ONE]\n\n");
         assert_eq!(f2.len(), 1);
         assert!(f2[0].is_done());
-        assert!(buf.is_empty());
+        assert!(buf.is_empty(), "buffer should be drained after [DONE]");
 
         // a dangling tail with no trailing blank line is flushed at EOF
         let mut buf2 = String::new();

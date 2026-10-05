@@ -109,7 +109,10 @@ defaults:
         assert!(config.providers.iter().any(|p| p.name == "opencode-go"));
         assert!(config.providers.iter().any(|p| p.name == "anthropic"));
         assert!(config.providers.iter().all(|p| p.models.is_empty()));
-        assert!(config.defaults.provider.is_empty());
+        assert!(
+            config.defaults.provider.is_empty(),
+            "catalog defaults.provider should be empty"
+        );
     }
 
     #[test]

@@ -603,7 +603,10 @@ mod tests {
         assert!(!config.server.passthrough_keys);
         assert!(config.providers.is_empty());
         assert!(config.routes.is_empty());
-        assert!(config.defaults.provider.is_empty());
+        assert!(
+            config.defaults.provider.is_empty(),
+            "defaults.provider should be empty"
+        );
         assert_eq!(config.defaults.active_model, None);
     }
 

@@ -1910,7 +1910,7 @@ mod tests {
         block_on(async {
             let state = app.snapshot().await;
             let out = maybe_exec(&app, &state, &body).await.expect("is $proxy");
-            assert!(!out.stdout.is_empty());
+            assert!(!out.stdout.is_empty(), "stdout should not be empty");
             assert_eq!(out.code, 0);
             assert_eq!(app.snapshot().await.config.defaults.active_model, None);
         });
