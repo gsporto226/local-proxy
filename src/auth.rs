@@ -215,7 +215,10 @@ fn open_db(path: &Path) -> Result<Connection, AuthError> {
     // Encryption is the security boundary; owner-only permissions are defense
     // in depth where the OS supports them.
     #[cfg(unix)]
-    let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let _ = std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600));
+    }
     // `key` is generated as 64 ASCII hex digits, never user-provided SQL.
     conn.execute_batch(&format!("PRAGMA key = \"x'{key}'\";"))
         .map_err(AuthError::Database)?;
