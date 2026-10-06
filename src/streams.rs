@@ -242,7 +242,10 @@ impl Machine for IrMachine {
 ///
 /// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
 /// stream completes.
-#[must_use]
+// The `Pin<Box<dyn Stream>>` return type is already `#[must_use]`. Older clippy
+// suggests adding the attribute (`must_use_candidate`, it does not recognize
+// `Pin`), newer clippy rejects it as redundant (`double_must_use`).
+#[allow(clippy::must_use_candidate)]
 pub fn translate(
     resp: reqwest::Response,
     upstream: Format,

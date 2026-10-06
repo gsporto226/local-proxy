@@ -52,6 +52,12 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: secret service build deps (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libdbus-1-dev pkg-config
+
       - name: "clippy (estrito: -D warnings + pedantic + nursery)"
         run: cargo clippy --all-targets --all-features -- -D warnings
 
@@ -78,7 +84,7 @@ jobs:
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y gnome-keyring
+          sudo apt-get install -y libdbus-1-dev pkg-config gnome-keyring
           # Create and unlock the login keyring with a throwaway password; the
           # tests only need a working, unlocked Secret Service.
           gnome-keyring-daemon --components=secrets --daemonize --unlock <<< 'foobar'

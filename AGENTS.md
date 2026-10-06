@@ -46,7 +46,8 @@ bloqueante localmente.
 - Não rode só `cargo test` — o CI reprova em `cargo fmt`/`cargo clippy` mesmo
   com os testes verdes (foi o que causou CI vermelho em `cc1b86c`).
 - O build compila SQLCipher com OpenSSL vendorizado: `perl` precisa estar no
-  PATH (Strawberry Perl no Windows). No CI o Perl já vem na imagem.
+  PATH (Strawberry Perl no Windows). No CI o Perl já vem na imagem. No Linux,
+  as bindings do Secret Service precisam de `libdbus-1-dev` e `pkg-config`.
 
 ### Testes e2e nunca tocam o store real
 

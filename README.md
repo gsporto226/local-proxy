@@ -28,7 +28,8 @@ Most AI tools hardcode their vendor's API shape. The reference design here is [o
 
 ## Requirements
 
-- Rust stable to build from source. SQLCipher builds a vendored OpenSSL, so a working `perl` is required at build time (Strawberry Perl on Windows).
+- Rust stable to build from source. SQLCipher builds a vendored OpenSSL, so a working `perl` is required at build time (Strawberry Perl on Windows). On Linux the Secret Service bindings also need `libdbus-1-dev` and `pkg-config`.
+- A running, unlocked OS credential vault at runtime: Windows Credential Manager, or the Linux Secret Service (GNOME Keyring, KWallet).
 - Bun only for the e2e suite.
 - Release binaries are published for x86_64 only (linux, darwin, windows).
 
