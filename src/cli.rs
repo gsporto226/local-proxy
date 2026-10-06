@@ -1342,6 +1342,11 @@ pub fn statusline(
     } else if let Some(m) = proxy_model {
         params.insert("model".to_string(), m);
     }
+    // Upstream-reported usage (ChatGPT/Codex); Claude's own JSON wins below.
+    if let Some((h5, week)) = crate::stats::rate_limits() {
+        params.insert("rate_5h".to_string(), format!("{}", h5.round()));
+        params.insert("rate_week".to_string(), format!("{}", week.round()));
+    }
     params.extend(claude_params);
     if let Some(e) = config
         .defaults

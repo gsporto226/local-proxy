@@ -242,6 +242,7 @@ impl Machine for IrMachine {
 ///
 /// Pass an optional [`StreamCapture`] to record cumulative usage stats when the
 /// stream completes.
+#[must_use]
 pub fn translate(
     resp: reqwest::Response,
     upstream: Format,

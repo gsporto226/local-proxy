@@ -368,6 +368,22 @@ impl ProviderClient {
             .send()
             .await
             .map_err(|source| UpstreamError::Request { url, source })?;
+        // ChatGPT (Codex) reports subscription usage on every response:
+        // primary = 5h window, secondary = weekly window.
+        let pct = |h: &str| {
+            resp.headers()
+                .get(h)
+                .and_then(|v| v.to_str().ok())
+                .and_then(|s| s.parse::<f64>().ok())
+        };
+        // Claude subscriptions (OAuth) report the same windows as 0..1 fractions.
+        let codex = pct("x-codex-primary-used-percent").zip(pct("x-codex-secondary-used-percent"));
+        let claude = pct("anthropic-ratelimit-unified-5h-utilization")
+            .zip(pct("anthropic-ratelimit-unified-7d-utilization"))
+            .map(|(h5, week)| (h5 * 100.0, week * 100.0));
+        if let Some((h5, week)) = codex.or(claude) {
+            crate::stats::record_rate_limits(h5, week);
+        }
         Ok(resp)
     }
 }

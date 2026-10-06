@@ -553,6 +553,44 @@ pub fn record_effort(session_id: &str, effort: &str) {
     }
 }
 
+/// Remember the latest subscription usage percents (5h, weekly), best-effort.
+///
+/// Account-wide, so a single row; feeds the status line's `rate_5h` and
+/// `rate_week` params. Failures are logged and ignored.
+pub fn record_rate_limits(h5: f64, week: f64) {
+    let res = open(&stats_db()).and_then(|conn| {
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS rate_limits (
+                id INTEGER PRIMARY KEY CHECK (id = 0), h5 REAL NOT NULL, week REAL NOT NULL)",
+        )
+        .and_then(|()| {
+            conn.execute(
+                "INSERT OR REPLACE INTO rate_limits VALUES (0, ?1, ?2)",
+                [h5, week],
+            )
+        })
+        .map_err(|source| StatsError::Query { source })
+    });
+    if let Err(e) = res {
+        tracing::warn!(target: "local_proxy", error = %e, "falhou ao registrar rate limits");
+    }
+}
+
+/// The latest recorded subscription usage percents `(5h, weekly)`, if any.
+#[must_use]
+pub fn rate_limits() -> Option<(f64, f64)> {
+    let path = stats_db();
+    if !path.exists() {
+        return None;
+    }
+    open(&path)
+        .ok()?
+        .query_row("SELECT h5, week FROM rate_limits WHERE id = 0", [], |r| {
+            Ok((r.get(0)?, r.get(1)?))
+        })
+        .ok()
+}
+
 /// The reasoning effort `session_id` last requested, if recorded.
 #[must_use]
 pub fn session_effort(session_id: &str) -> Option<String> {
