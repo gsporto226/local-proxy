@@ -1948,6 +1948,7 @@ mod tests {
                 output: 7,
                 reasoning: 0,
                 cost_usd: None,
+                ..TokenUsage::default()
             }
         );
         assert_eq!(m.usage().output, 7);
@@ -1972,6 +1973,7 @@ mod tests {
                 output: 4,
                 reasoning: 0,
                 cost_usd: None,
+                ..TokenUsage::default()
             }
         );
     }

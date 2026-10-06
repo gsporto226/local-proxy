@@ -18,6 +18,9 @@ pub mod auth;
 /// Embedded provider catalog and config-overlay merging.
 pub mod catalog;
 
+/// Format-neutral IR and per-format codecs.
+pub mod ir;
+
 /// Configuration types and loading.
 pub mod config;
 

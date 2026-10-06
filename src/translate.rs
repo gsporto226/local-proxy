@@ -1812,6 +1812,10 @@ pub struct TokenUsage {
     pub output: u64,
     /// Number of reasoning tokens, when reported by the upstream.
     pub reasoning: u64,
+    /// Input tokens served from the prompt cache.
+    pub cache_read: u64,
+    /// Input tokens written to the prompt cache.
+    pub cache_write: u64,
     /// The request's monetary cost in USD, when reported by the upstream.
     pub cost_usd: Option<f64>,
 }
@@ -2688,6 +2692,7 @@ mod tests {
                 output: 2,
                 reasoning: 0,
                 cost_usd: None,
+                ..TokenUsage::default()
             }
         );
 
@@ -2732,6 +2737,7 @@ mod tests {
                 output: 3,
                 reasoning: 0,
                 cost_usd: Some(0.007),
+                ..TokenUsage::default()
             },
         );
         assert_eq!(acc.cost_usd, Some(0.007));
@@ -2743,6 +2749,7 @@ mod tests {
                 output: 4,
                 reasoning: 0,
                 cost_usd: None,
+                ..TokenUsage::default()
             },
         );
         assert_eq!(acc.cost_usd, Some(0.007));
@@ -2790,6 +2797,7 @@ mod tests {
                 output: 2,
                 reasoning: 0,
                 cost_usd: None,
+                ..TokenUsage::default()
             },
         );
         // then a full picture with larger input
@@ -2800,6 +2808,7 @@ mod tests {
                 output: 3,
                 reasoning: 1,
                 cost_usd: None,
+                ..TokenUsage::default()
             },
         );
         assert_eq!(acc.input, 5);
@@ -2813,6 +2822,7 @@ mod tests {
                 output: 1,
                 reasoning: 0,
                 cost_usd: None,
+                ..TokenUsage::default()
             },
         );
         assert_eq!(acc.input, 5);
