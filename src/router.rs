@@ -363,6 +363,7 @@ mod tests {
                 provider: "anthropic".to_string(),
                 active_model: None,
                 active_effort: None,
+                active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),

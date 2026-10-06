@@ -17,7 +17,7 @@ Most AI tools hardcode their vendor's API shape. The reference design here is [o
 - Embedded provider catalog (`anthropic`, `claude`, `openai`, `chatgpt`, `opencode-go`, `zen`, `groq`, `xai`, `google`, `deepseek`, `openrouter`, `neuralwatt`). Your `config.yaml` only adds to it or overrides entries; it never replaces the whole list.
 - Hot reload. Editing the config or the credential store applies in runtime through a file watcher, no restart.
 - Encrypted credential store separate from the config (`accounts.db`, SQLCipher), modeled after opencode's `/connect`. The database key lives in the OS vault (Windows Credential Manager, Linux Secret Service), never in a file.
-- Multiple accounts per provider. An account is a provider plus an alias you choose, and each request selects one with the `X-Local-Proxy-Account: <alias>` header; a provider with a single account needs no header.
+- Multiple accounts per provider. An account is a provider plus an alias you choose. Select the active account per provider with `local-proxy account <provider>/<alias>`, and override it per request with the `X-Local-Proxy-Account: <alias>` header; a provider with a single account needs neither.
 - OAuth subscription logins (`local-proxy connect claude --account personal --oauth`, `local-proxy connect chatgpt --account work --oauth`): a provider with an `oauth:` block runs a PKCE login, stores the token bundle as that account, refreshes it automatically near expiry, and the engine stays provider-agnostic.
 - ChatGPT Plus/Pro support: requests go to the ChatGPT backend over the Responses API (`format: openai-responses`).
 - `$proxy` executor. When the last user message starts with `$proxy `, the proxy runs the rest as a `local-proxy` command and returns the output as the model's reply. Works with no provider connected.
@@ -98,6 +98,7 @@ Claude Code sends `/v1/messages`; the proxy routes to a connected provider and t
 | `model [<m>]` | Show or set the active model. `model clear` unsets it. |
 | `connect <provider> --account <alias> [key]` | Store an API key as a named account for an existing provider. Prompts hidden if the key is omitted. `--oauth` runs the provider's OAuth login instead. |
 | `disconnect <provider> --account <alias>` | Remove one stored account; other accounts of the provider are preserved. |
+| `account [<provider>/<alias>]` | List stored accounts (the active one is marked) or select the active account for a provider. `account clear [<provider>]` unsets one or all selections. |
 | `providers` | List effective providers (catalog plus config) with their account aliases and auth kind (`api`, `oauth`, or `-`). |
 | `stats [--since day\|week\|month\|all] [--json]` | Show usage statistics from recorded requests. |
 | `statusline --session <uuid>` | Render the Claude Code status line for a session from its recorded stats. |
@@ -179,13 +180,21 @@ local-proxy providers                                  # providers with their ac
 local-proxy disconnect opencode-go --account work      # remove one account
 ```
 
-With several accounts for the same provider, each request picks one with the `X-Local-Proxy-Account` header:
+With several accounts for the same provider, select the active one — persisted in the config and applied by a running proxy via hot reload:
 
 ```bash
-curl -H "X-Local-Proxy-Account: work" http://127.0.0.1:8787/v1/messages ...
+local-proxy account                        # list stored accounts, active marked
+local-proxy account opencode-go/work       # use `work` for opencode-go
+local-proxy account clear opencode-go      # back to no selection
 ```
 
-When the provider has exactly one account the header may be omitted. With two or more, a missing, invalid, or unknown alias is a clear 400 error — the proxy never silently picks another account.
+Any single request can override the selection with the `X-Local-Proxy-Account` header:
+
+```bash
+curl -H "X-Local-Proxy-Account: personal" http://127.0.0.1:8787/v1/messages ...
+```
+
+Resolution order: the header wins; then the selected account for the provider; then the only account when there is exactly one. With two or more accounts and no selection, a missing or unknown alias is a clear 400 error — the proxy never silently picks another account, and a selection whose account was disconnected is reported as stale instead of being replaced.
 
 An alias identifies one stored credential; connecting an alias that already exists is rejected, so a reconnect cannot silently replace a working credential. Disconnect it first, or use another alias.
 

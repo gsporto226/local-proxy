@@ -110,6 +110,12 @@ enum Command {
         #[arg(long, required = true, value_name = "ALIAS")]
         account: String,
     },
+    /// List stored accounts or select the active one (`provider/alias`)
+    Account {
+        /// `provider/alias` to select, or `clear [provider]` to unset
+        #[arg(value_name = "PROVIDER/ALIAS | clear [PROVIDER]")]
+        args: Vec<String>,
+    },
     /// List effective providers (catalog ∪ config) with account aliases
     Providers,
     /// Show usage statistics recorded from upstream requests
@@ -237,6 +243,7 @@ fn main() -> miette::Result<()> {
         Some(Command::Disconnect { provider, account }) => {
             cli::disconnect(config, provider, account)
         }
+        Some(Command::Account { args }) => cli::account(config, args),
         Some(Command::Providers) => cli::providers(config),
         Some(Command::Stats { since, json }) => {
             let since = since.unwrap_or_else(|| "day".to_string());

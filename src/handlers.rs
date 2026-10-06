@@ -648,10 +648,26 @@ fn client_for(
             ))
         });
     }
+    if let Some(selected) = state.config.defaults.active_accounts.get(&provider.name) {
+        // The selection must resolve to a stored credential; the unauthenticated
+        // placeholder client never satisfies it.
+        return accounts
+            .get(selected)
+            .filter(|client| client.has_key())
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "selected account '{selected}' for provider '{}' is no longer stored; \
+                     select another with `local-proxy account {}/<alias>`",
+                    provider.name, provider.name
+                ))
+            });
+    }
     if accounts.len() > 1 {
         return Err(ApiError::bad_request(format!(
-            "provider '{}' has multiple accounts; specify X-Local-Proxy-Account",
-            provider.name
+            "provider '{}' has multiple accounts; select one with \
+             `local-proxy account {}/<alias>` or specify X-Local-Proxy-Account",
+            provider.name, provider.name
         )));
     }
     accounts.values().next().cloned().ok_or_else(|| {
@@ -1622,6 +1638,7 @@ mod tests {
                 provider: "openai".to_string(),
                 active_model: Some("gpt-4o".to_string()),
                 active_effort: None,
+                active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),
@@ -1692,6 +1709,7 @@ mod tests {
                 provider: "openai".to_string(),
                 active_model: Some("gpt-4o".to_string()),
                 active_effort: None,
+                active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),
@@ -1768,6 +1786,7 @@ mod tests {
                 provider: "openai".to_string(),
                 active_model: Some("gpt-4o".to_string()),
                 active_effort: None,
+                active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),
@@ -1833,6 +1852,7 @@ mod tests {
                 provider: "openai".to_string(),
                 active_model: None,
                 active_effort: None,
+                active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),
@@ -1889,6 +1909,7 @@ mod tests {
                 provider: "openai".to_string(),
                 active_model: None,
                 active_effort: None,
+                active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),
@@ -2042,6 +2063,76 @@ mod tests {
     }
 
     #[test]
+    fn selected_account_wins_over_multiplicity_and_header_wins_over_selection() {
+        let provider = crate::config::Provider {
+            name: "openai".to_string(),
+            base_url: "http://127.0.0.1:9".to_string(),
+            format: ProviderFormat::Openai,
+            models: vec!["gpt-test".to_string()],
+            auto_model: None,
+            headers: HashMap::new(),
+            session_header: None,
+            oauth: None,
+        };
+        let account = |alias: &str| {
+            ProviderClient::new_for_alias(
+                &provider,
+                alias,
+                false,
+                Some(crate::auth::AuthEntry::Api {
+                    key: format!("key-{alias}"),
+                }),
+            )
+            .unwrap()
+        };
+        let state_with = |selected: &str| {
+            let cfg = Arc::new(Config {
+                providers: vec![provider.clone()],
+                defaults: crate::config::Defaults {
+                    active_accounts: HashMap::from([("openai".to_string(), selected.to_string())]),
+                    ..crate::config::Defaults::default()
+                },
+                ..Config::default()
+            });
+            RuntimeState {
+                config: cfg.clone(),
+                router: Arc::new(Router::new(cfg).unwrap()),
+                clients: Arc::new(HashMap::from([(
+                    "openai".to_string(),
+                    HashMap::from([
+                        ("personal".to_string(), account("personal")),
+                        ("work".to_string(), account("work")),
+                    ]),
+                )])),
+                enforce_active_model: false,
+                config_path: PathBuf::new(),
+            }
+        };
+
+        // No header: the selected account is used without error.
+        let state = state_with("work");
+        let selected = client_for(&state, &provider, None).unwrap();
+        assert_eq!(selected.effective_key(None).as_deref(), Some("key-work"));
+        // The header still overrides the selection per request.
+        let overridden = client_for(&state, &provider, Some("personal")).unwrap();
+        assert_eq!(
+            overridden.effective_key(None).as_deref(),
+            Some("key-personal")
+        );
+
+        // A selection whose account was disconnected is a clear 400, never a
+        // silent fallback to another account.
+        let disconnected = state_with("ghost");
+        let err = client_for(&disconnected, &provider, None).expect_err("stale selection");
+        assert_eq!(err.status, 400);
+        assert!(
+            err.message.contains("no longer stored"),
+            "got: {}",
+            err.message
+        );
+    }
+
+    #[test]
     fn invalid_account_header_is_rejected() {
         let mut headers = HeaderMap::new();
         assert_eq!(extract_account_alias(&headers).unwrap(), None);
@@ -2073,6 +2164,7 @@ mod tests {
                 provider: "neuralwatt".to_string(),
                 active_model: Some("glm-5.2".to_string()),
                 active_effort: None,
+                active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),

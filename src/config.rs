@@ -231,6 +231,11 @@ pub struct Defaults {
     /// (`output_config.effort`), ignoring the harness's. Set via
     /// `local-proxy effort`; persists across restarts.
     pub active_effort: Option<String>,
+    /// Active account alias per provider (`provider -> alias`), used when a
+    /// request carries no `X-Local-Proxy-Account` header. Set via
+    /// `local-proxy account <provider>/<alias>`; persists across restarts.
+    #[serde(skip_serializing_if = "HashMap::is_empty")]
+    pub active_accounts: HashMap<String, String>,
 }
 
 /// Template for the Claude Code status line, rendered by `local-proxy

@@ -82,9 +82,12 @@ export async function startProxy(
   configYaml: string,
   requestedPort?: number,
   env: Record<string, string> = {},
+  configPath?: string,
 ): Promise<ProxyHandle> {
   const port = requestedPort ?? (await findFreePort());
-  const cfg = writeConfig(configYaml);
+  // A caller can pass the same config path the CLI writes to, so `model` /
+  // `account` selections hot-reload into the running proxy.
+  const cfg = configPath ?? writeConfig(configYaml);
   const proc = spawn([BINARY, "serve", "--config", cfg, "--port", String(port)], {
     stdout: "ignore",
     stderr: "pipe",

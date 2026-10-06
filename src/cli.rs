@@ -1051,6 +1051,31 @@ pub fn list_providers(config_path: &Path) -> Result<String, CliError> {
     Ok(out.trim_end().to_string())
 }
 
+/// Create the config file (and its directory) from the embedded default when it
+/// does not exist yet.
+#[allow(clippy::result_large_err)]
+fn ensure_config(config_path: &Path) -> Result<(), CliError> {
+    if config_path.exists() {
+        return Ok(());
+    }
+    if let Some(parent) = config_path.parent() {
+        std::fs::create_dir_all(parent).map_err(CliError::from)?;
+    }
+    crate::config::create_default_config(config_path).map_err(CliError::from)
+}
+
+/// Serialize `config` and replace `config_path` atomically (temp file + rename).
+#[allow(clippy::result_large_err)]
+fn save_config(config_path: &Path, config: &Config) -> Result<(), CliError> {
+    let yaml = serde_yaml::to_string(config).map_err(|e| CliError::Connect {
+        message: format!("falha ao serializar config: {e}"),
+    })?;
+    let tmp = config_path.with_extension("yaml.tmp");
+    std::fs::write(&tmp, yaml).map_err(CliError::from)?;
+    std::fs::rename(&tmp, config_path).map_err(CliError::from)?;
+    Ok(())
+}
+
 /// Persist `defaults.active_model` in the config overlay so the model selection
 /// survives restarts. `None` clears the selection. Creates a default config
 /// file if none exists yet.
@@ -1060,21 +1085,39 @@ pub fn list_providers(config_path: &Path) -> Result<String, CliError> {
 /// Returns a [`CliError`] if the config cannot be read, serialized, or written.
 #[allow(clippy::result_large_err)]
 pub fn set_default_model(config_path: &Path, model: Option<&str>) -> Result<(), CliError> {
-    if !config_path.exists() {
-        if let Some(parent) = config_path.parent() {
-            std::fs::create_dir_all(parent).map_err(CliError::from)?;
-        }
-        crate::config::create_default_config(config_path).map_err(CliError::from)?;
-    }
+    ensure_config(config_path)?;
     let mut config = Config::load(config_path).map_err(CliError::from)?;
     config.defaults.active_model = model.map(str::to_string);
-    let yaml = serde_yaml::to_string(&config).map_err(|e| CliError::Connect {
-        message: format!("falha ao serializar config: {e}"),
-    })?;
-    let tmp = config_path.with_extension("yaml.tmp");
-    std::fs::write(&tmp, yaml).map_err(CliError::from)?;
-    std::fs::rename(&tmp, config_path).map_err(CliError::from)?;
-    Ok(())
+    save_config(config_path, &config)
+}
+
+/// Persist or clear the active account alias for `provider` in the config
+/// overlay (`defaults.active_accounts`). `None` clears that provider's
+/// selection. Creates a default config file if none exists yet.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the config cannot be read, serialized, or written.
+#[allow(clippy::result_large_err)]
+pub fn set_default_account(
+    config_path: &Path,
+    provider: &str,
+    alias: Option<&str>,
+) -> Result<(), CliError> {
+    ensure_config(config_path)?;
+    let mut config = Config::load(config_path).map_err(CliError::from)?;
+    match alias {
+        Some(alias) => {
+            config
+                .defaults
+                .active_accounts
+                .insert(provider.to_string(), alias.to_string());
+        }
+        None => {
+            config.defaults.active_accounts.remove(provider);
+        }
+    }
+    save_config(config_path, &config)
 }
 
 /// Reasoning effort levels accepted by `local-proxy effort`.
@@ -1116,20 +1159,10 @@ pub fn effort_result(config_path: &Path, level: Option<&str>) -> miette::Result<
                     EFFORT_LEVELS.join(", ")
                 ));
             };
-            if !config_path.exists() {
-                if let Some(parent) = config_path.parent() {
-                    std::fs::create_dir_all(parent).map_err(CliError::from)?;
-                }
-                crate::config::create_default_config(&config_path).map_err(CliError::from)?;
-            }
+            ensure_config(&config_path)?;
             let mut config = Config::load(&config_path).map_err(CliError::from)?;
             config.defaults.active_effort.clone_from(&value);
-            let yaml = serde_yaml::to_string(&config).map_err(|e| CliError::Connect {
-                message: format!("falha ao serializar config: {e}"),
-            })?;
-            let tmp = config_path.with_extension("yaml.tmp");
-            std::fs::write(&tmp, yaml).map_err(CliError::from)?;
-            std::fs::rename(&tmp, &config_path).map_err(CliError::from)?;
+            save_config(&config_path, &config)?;
             value.map_or_else(
                 || "effort ativo removido".to_string(),
                 |v| format!("effort ativo: {v}"),
@@ -1243,6 +1276,115 @@ pub fn disconnect(config_path: PathBuf, provider: String, account: String) -> mi
 #[allow(clippy::needless_pass_by_value)]
 pub fn providers(config_path: PathBuf) -> miette::Result<()> {
     let out = list_providers(&config_path).map_err(miette::Report::from)?;
+    println!("{out}");
+    Ok(())
+}
+
+/// Render the stored accounts, one per line, marking the active alias of each
+/// provider.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the catalog, config, or auth store cannot be loaded.
+#[allow(clippy::result_large_err, clippy::format_push_string)]
+pub fn list_accounts(config_path: &Path) -> Result<String, CliError> {
+    let config = effective_config(config_path)?;
+    let auth = crate::auth::read_auth().map_err(CliError::from)?;
+    let mut out = String::new();
+    for provider in &config.providers {
+        let Some(accounts) = auth.get(&provider.name) else {
+            continue;
+        };
+        let mut aliases: Vec<_> = accounts.iter().collect();
+        aliases.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        for (alias, entry) in aliases {
+            let kind = match entry {
+                crate::auth::AuthEntry::OAuth(_) => "oauth",
+                crate::auth::AuthEntry::Api { .. } => "api",
+            };
+            let active = config
+                .defaults
+                .active_accounts
+                .get(&provider.name)
+                .is_some_and(|selected| selected == alias);
+            let marker = if active { " [ativa]" } else { "" };
+            out.push_str(&format!("{}/{alias} ({kind}){marker}\n", provider.name));
+        }
+    }
+    if out.is_empty() {
+        return Ok(
+            "nenhuma conta salva; use `local-proxy connect <provider> --account <alias>`"
+                .to_string(),
+        );
+    }
+    Ok(out.trim_end().to_string())
+}
+
+/// Compute the message for `local-proxy account`: list accounts, select one
+/// (`provider/alias`), or clear the selection (`clear [provider]`).
+///
+/// Running proxies pick the change up via hot-reload.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the target is malformed, the account does not
+/// exist, or the config cannot be written.
+#[allow(clippy::result_large_err)]
+pub fn account_result(config_path: &Path, args: &[String]) -> Result<String, CliError> {
+    match args {
+        [] => list_accounts(config_path),
+        [command, provider] if command == "clear" => {
+            set_default_account(config_path, provider, None)?;
+            Ok(format!("conta ativa do provider '{provider}' limpa"))
+        }
+        [command] if command == "clear" => {
+            let config = effective_config(config_path)?;
+            if config.defaults.active_accounts.is_empty() {
+                return Ok("nenhuma conta ativa para limpar".to_string());
+            }
+            ensure_config(config_path)?;
+            let mut config = Config::load(config_path).map_err(CliError::from)?;
+            config.defaults.active_accounts.clear();
+            save_config(config_path, &config)?;
+            Ok("contas ativas limpas".to_string())
+        }
+        [target] => {
+            let Some((provider, alias)) = target.split_once('/') else {
+                return Err(CliError::Connect {
+                    message: format!(
+                        "alvo '{target}' invalido; use provider/alias (ex.: chatgpt/work)"
+                    ),
+                });
+            };
+            let auth = crate::auth::read_auth().map_err(CliError::from)?;
+            if !auth
+                .get(provider)
+                .is_some_and(|accounts| accounts.contains_key(alias))
+            {
+                return Err(CliError::Connect {
+                    message: format!(
+                        "conta '{alias}' nao encontrada para o provider '{provider}'; \
+                         veja `local-proxy account`"
+                    ),
+                });
+            }
+            set_default_account(config_path, provider, Some(alias))?;
+            Ok(format!("conta ativa do provider '{provider}': {alias}"))
+        }
+        _ => Err(CliError::Connect {
+            message: "uso: `local-proxy account [provider/alias | clear [provider]]`".to_string(),
+        }),
+    }
+}
+
+/// CLI entry for `account`: list, select, or clear the active account.
+///
+/// # Errors
+///
+/// Returns an error if the target is malformed or the config cannot be written.
+#[allow(clippy::needless_pass_by_value)]
+pub fn account(config_path: PathBuf, args: Vec<String>) -> miette::Result<()> {
+    let out = account_result(&config_path, &args).map_err(miette::Report::from)?;
     println!("{out}");
     Ok(())
 }
@@ -2314,6 +2456,33 @@ mod tests {
         set_default_model(&path, None).expect("clear model");
         let config = Config::load(&path).expect("reload");
         assert_eq!(config.defaults.active_model, None);
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn set_default_account_persists_and_clears() {
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("clock is set")
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "local-proxy-account-select-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).expect("create test dir");
+        let path = dir.join("config.yaml");
+
+        set_default_account(&path, "chatgpt", Some("work")).expect("persist account");
+        set_default_account(&path, "opencode-go", Some("personal")).expect("persist second");
+        let config = Config::load(&path).expect("reload");
+        assert_eq!(config.defaults.active_accounts["chatgpt"], "work");
+        assert_eq!(config.defaults.active_accounts["opencode-go"], "personal");
+
+        set_default_account(&path, "chatgpt", None).expect("clear one");
+        let config = Config::load(&path).expect("reload");
+        assert!(!config.defaults.active_accounts.contains_key("chatgpt"));
+        assert_eq!(config.defaults.active_accounts["opencode-go"], "personal");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

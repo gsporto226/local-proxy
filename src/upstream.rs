@@ -171,7 +171,7 @@ impl ProviderClient {
             .map(str::to_string)
     }
 
-    fn effective_key(&self, client_key: Option<&str>) -> Option<String> {
+    pub(crate) fn effective_key(&self, client_key: Option<&str>) -> Option<String> {
         if self.passthrough {
             if let Some(key) = client_key.filter(|k| !k.is_empty()) {
                 return Some(key.to_string());

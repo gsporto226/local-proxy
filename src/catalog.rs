@@ -50,6 +50,8 @@ pub fn effective_config(base: Config, overlay: Config) -> Config {
         }
     }
 
+    let mut active_accounts = base.defaults.active_accounts;
+    active_accounts.extend(overlay.defaults.active_accounts);
     let defaults = crate::config::Defaults {
         provider: if overlay.defaults.provider.is_empty() {
             base.defaults.provider.clone()
@@ -61,6 +63,7 @@ pub fn effective_config(base: Config, overlay: Config) -> Config {
             .defaults
             .active_effort
             .or(base.defaults.active_effort),
+        active_accounts,
     };
 
     Config {
