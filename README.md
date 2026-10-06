@@ -484,9 +484,10 @@ src/
 ├── cli.rs         serve, launch, status, stop, models, model, connect, disconnect, providers, stats, statusline, update
 ├── router.rs      resolve_model to (provider, upstream_model, reasoning_effort)
 ├── upstream.rs    HTTP calls, key resolution, per-provider headers
-├── translate.rs   request and response translation across the three formats
+├── ir/           format-neutral IR: one decoder + encoder per format (anthropic, openai, responses)
+├── translate.rs   token usage, cost, and Anthropic passthrough hygiene
 ├── sse.rs         SSE frame parser
-├── streams.rs     streaming state machines, all three directions
+├── streams.rs     SSE driver: upstream decoder -> IR events -> client encoder
 ├── exec.rs        $proxy executor, token detection, arg parsing, timeout
 ├── error.rs       ApiError and per-format error shape
 ├── stats.rs       local statistics (SQLite stats.db) and stats command

@@ -386,12 +386,19 @@ describe("e2e: proxy against a mock upstream (responses upstream)", () => {
       model: "claude-via-responses",
       max_tokens: 10,
       thinking: { type: "enabled", effort: "high" },
+      // Claude Code sends these on every request; the Codex backend 400s on
+      // both ("Unsupported parameter: metadata", "Invalid type for
+      // context_management"). The IR must not forward them.
+      metadata: { user_id: "u" },
+      context_management: { edits: [] },
       messages: [{ role: "user", content: "hi" }],
     });
     expect(r.status).toBe(200);
     const sent = mock.lastResponsesBody();
     expect(sent.reasoning?.effort).toBe("high");
     expect(sent.reasoning_effort).toBeUndefined();
+    expect(sent.metadata).toBeUndefined();
+    expect(sent.context_management).toBeUndefined();
     // the proxy still forces streaming for this backend
     expect(sent.stream).toBe(true);
   });

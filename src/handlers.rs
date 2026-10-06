@@ -21,6 +21,7 @@ use tokio::sync::RwLock;
 
 use crate::config::{Config, ConfigError, ProviderFormat};
 use crate::error::ApiError;
+use crate::ir::{self, Format};
 use crate::router::{Router, RouterError};
 use crate::stats::{self, StatLine};
 use crate::streams::{self, parse_energy_comment, StreamCapture, UpstreamStream};
@@ -375,6 +376,7 @@ fn enable_usage(body: &mut Value) {
 ///   a request field, so `gpt-6-sol` at `low` and at `medium` are the same model
 ///   id — the route pin is a default, not an override, mirroring how a
 ///   client-sent model wins over `active_model`);
+/// - a `prompt_cache_key` from the client session id, when the client sent none;
 /// - forced streaming: that backend rejects non-streaming requests
 ///   (`"Stream must be set to true"`). A client that asked for a single
 ///   response still gets one — the caller reassembles the stream.
@@ -384,19 +386,20 @@ fn prepare_responses_request(
     provider: &crate::config::Provider,
     body: &mut Value,
     effort: Option<&str>,
+    session_id: &str,
 ) {
     if provider.format != ProviderFormat::OpenaiResponses {
         return;
+    }
+    // Route the prompt cache by conversation (what Codex itself sends), so
+    // turns of one session hit the same cache.
+    if body.get("prompt_cache_key").is_none() && !session_id.is_empty() {
+        body["prompt_cache_key"] = json!(session_id);
     }
     if let Some(effort) = effort.filter(|e| !e.is_empty()) {
         if body.get("reasoning").is_none() {
             body["reasoning"] = json!({ "effort": effort });
         }
-    }
-    // The Codex backend rejects `metadata` ("Unsupported parameter"), which
-    // Claude Code sends on every request (`{user_id}`).
-    if let Some(obj) = body.as_object_mut() {
-        obj.remove("metadata");
     }
     body["stream"] = json!(true);
 }
@@ -406,20 +409,17 @@ fn prepare_responses_request(
 ///
 /// Used for a non-streaming client of a stream-only upstream. A transport error
 /// ends the read; whatever was reassembled so far is returned.
-async fn aggregate_responses_stream(resp: reqwest::Response) -> Value {
+async fn aggregate_responses_stream(resp: reqwest::Response) -> ir::Response {
     use futures_util::StreamExt as _;
     let mut frames = Box::pin(crate::sse::sse_frames(resp));
-    let mut events: Vec<Value> = Vec::new();
-    while let Some(frame) = frames.next().await {
-        let Ok(frame) = frame else { break };
+    let mut events = Vec::new();
+    while let Some(Ok(frame)) = frames.next().await {
         if frame.is_done() {
             break;
         }
-        if let Some(value) = frame.json() {
-            events.push(value);
-        }
+        events.extend(frame.json());
     }
-    translate::responses_events_to_response(&events)
+    ir::responses::aggregate(&events)
 }
 
 fn sse_response(stream: UpstreamStream) -> Response {
@@ -901,7 +901,17 @@ async fn messages_handler(
             stats::record_effort(&session_id, &effort);
         }
     }
-    match handle_messages(&app, &state, &body, client_key.as_deref(), &session_id).await {
+    match handle_chat(
+        Format::Anthropic,
+        "/v1/messages",
+        &app,
+        &state,
+        &body,
+        client_key.as_deref(),
+        &session_id,
+    )
+    .await
+    {
         Ok(r) => {
             tracing::info!(
                 target: crate::LOG_TARGET,
@@ -925,8 +935,31 @@ async fn messages_handler(
     }
 }
 
+/// Body for an upstream of the client's own format: no translation, only the
+/// per-format hygiene the passthrough has always applied.
+fn same_format_request(format: Format, body: Value) -> Value {
+    match format {
+        Format::Anthropic => translate::normalize_anthropic_request(&body),
+        Format::Openai => body,
+        // The ChatGPT backend rejects stored responses; make `store` explicit
+        // when the client omitted it.
+        Format::Responses => {
+            let mut body = body;
+            if body.get("store").is_none() {
+                body["store"] = json!(false);
+            }
+            body
+        }
+    }
+}
+
+/// Serve one chat request from a `client`-format endpoint: resolve the route,
+/// translate through the IR when the upstream speaks another format, and
+/// translate the response (or stream) back.
 #[allow(clippy::too_many_lines)]
-async fn handle_messages(
+async fn handle_chat(
+    client_format: Format,
+    endpoint: &'static str,
     app: &AppState,
     state: &RuntimeState,
     body: &Bytes,
@@ -939,12 +972,12 @@ async fn handle_messages(
     if let Some(out) = maybe_exec(app, state, &body).await {
         let text = crate::exec::format_output(&out);
         let model = active_model_or_default(state);
-        tracing::info!(
-            target: crate::LOG_TARGET,
-            endpoint = "/v1/messages",
-            "handled $proxy command"
-        );
-        return Ok(exec_messages_response(&text, &model));
+        tracing::info!(target: crate::LOG_TARGET, endpoint, "handled $proxy command");
+        return Ok(match client_format {
+            Format::Anthropic => exec_messages_response(&text, &model),
+            Format::Openai => exec_chat_response(&text, &model),
+            Format::Responses => exec_responses_response(&text, &model),
+        });
     }
 
     let streaming = wants_stream(&body);
@@ -952,27 +985,36 @@ async fn handle_messages(
     let (provider, upstream_model, reasoning_effort) = resolve_model(state, client_model)?;
     tracing::info!(
         target: crate::LOG_TARGET,
-        endpoint = "/v1/messages",
+        endpoint,
         provider = %provider.name,
         upstream_model,
         streaming,
         "resolved route"
     );
     body["model"] = json!(upstream_model);
-    if let Some(effort) = &state.config.defaults.active_effort {
-        body["output_config"]["effort"] = json!(effort);
+    if client_format == Format::Anthropic {
+        if let Some(effort) = &state.config.defaults.active_effort {
+            body["output_config"]["effort"] = json!(effort);
+        }
     }
     let client = client_for(state, &provider)?;
+    let upstream_format = Format::from(provider.format);
+    let same = upstream_format == client_format;
 
-    let mut upstream_body = match provider.format {
-        ProviderFormat::Anthropic => translate::normalize_anthropic_request(&body),
-        ProviderFormat::Openai => translate::anthropic_to_openai_request(body)?,
-        ProviderFormat::OpenaiResponses => translate::anthropic_to_responses_request(body)?,
+    let mut upstream_body = if same {
+        same_format_request(client_format, body)
+    } else {
+        ir::translate_request(client_format, upstream_format, body)?
     };
-    if streaming && provider.format == ProviderFormat::Openai {
+    if streaming && upstream_format == Format::Openai {
         enable_usage(&mut upstream_body);
     }
-    prepare_responses_request(&provider, &mut upstream_body, reasoning_effort.as_deref());
+    prepare_responses_request(
+        &provider,
+        &mut upstream_body,
+        reasoning_effort.as_deref(),
+        session_id,
+    );
 
     let resp = client
         .chat_request(client.default_path(), upstream_body, client_key, session_id)
@@ -982,7 +1024,7 @@ async fn handle_messages(
     if status >= 400 {
         let (status, rbody) = send_and_read(resp).await;
         capture(
-            "/v1/messages",
+            endpoint,
             &provider.name,
             &upstream_model,
             streaming,
@@ -993,7 +1035,7 @@ async fn handle_messages(
         );
         tracing::warn!(
             target: crate::LOG_TARGET,
-            endpoint = "/v1/messages",
+            endpoint,
             provider = %provider.name,
             status,
             body = %rbody,
@@ -1003,78 +1045,66 @@ async fn handle_messages(
     }
     if streaming {
         let cap = StreamCapture::new(
-            "/v1/messages",
+            endpoint,
             &provider.name,
             &upstream_model,
             status,
             started,
             session_id,
         );
-        return match provider.format {
-            ProviderFormat::Anthropic => Ok(passthrough_stream(resp, Some(cap))),
-            ProviderFormat::Openai => Ok(sse_response(streams::anthropic_from_openai(
+        return Ok(if same {
+            passthrough_stream(resp, Some(cap))
+        } else {
+            sse_response(streams::translate(
                 resp,
-                upstream_model,
+                upstream_format,
+                client_format,
+                &upstream_model,
                 Some(cap),
-            ))),
-            ProviderFormat::OpenaiResponses => Ok(sse_response(streams::anthropic_from_responses(
-                resp,
-                upstream_model,
-                Some(cap),
-            ))),
-        };
+            ))
+        });
     }
 
-    let rbody = if provider.format == ProviderFormat::OpenaiResponses {
-        aggregate_responses_stream(resp).await
-    } else {
-        resp.json::<Value>().await.unwrap_or(Value::Null)
-    };
-    match provider.format {
-        ProviderFormat::Anthropic => {
-            capture(
-                "/v1/messages",
-                &provider.name,
-                &upstream_model,
-                false,
-                status,
-                Some(&rbody),
-                &started,
-                session_id,
-            );
-            Ok(json_response(StatusCode::OK, rbody))
-        }
-        ProviderFormat::Openai => {
-            capture(
-                "/v1/messages",
-                &provider.name,
-                &upstream_model,
-                false,
-                status,
-                Some(&rbody),
-                &started,
-                session_id,
-            );
-            let translated = translate::openai_to_anthropic_response(rbody, &upstream_model)
-                .map_err(ApiError::from)?;
-            Ok(json_response(StatusCode::OK, translated))
-        }
-        ProviderFormat::OpenaiResponses => {
-            capture(
-                "/v1/messages",
-                &provider.name,
-                &upstream_model,
-                false,
-                status,
-                Some(&rbody),
-                &started,
-                session_id,
-            );
-            let translated = translate::responses_to_anthropic_response(rbody, &upstream_model)
-                .map_err(ApiError::from)?;
-            Ok(json_response(StatusCode::OK, translated))
-        }
+    // A Responses upstream only streams; fold its events into one response.
+    if upstream_format == Format::Responses {
+        let mut folded = aggregate_responses_stream(resp).await;
+        let usage = json!({"usage": translate::responses_usage(&folded.usage)});
+        capture(
+            endpoint,
+            &provider.name,
+            &upstream_model,
+            false,
+            status,
+            Some(&usage),
+            &started,
+            session_id,
+        );
+        folded.model.clone_from(&upstream_model);
+        return Ok(json_response(
+            StatusCode::OK,
+            ir::encode_response(client_format, &folded),
+        ));
     }
+    let rbody = resp.json::<Value>().await.unwrap_or(Value::Null);
+    capture(
+        endpoint,
+        &provider.name,
+        &upstream_model,
+        false,
+        status,
+        Some(&rbody),
+        &started,
+        session_id,
+    );
+    if same {
+        return Ok(json_response(StatusCode::OK, rbody));
+    }
+    let mut decoded = ir::decode_response(upstream_format, &rbody);
+    decoded.model = upstream_model;
+    Ok(json_response(
+        StatusCode::OK,
+        ir::encode_response(client_format, &decoded),
+    ))
 }
 
 // ---------------------------------------------------------------------------
@@ -1092,7 +1122,17 @@ async fn chat_completions_handler(
         Err(e) => return error_response(&e, false),
     };
     let session_id = extract_session_id(&headers);
-    match handle_chat_completions(&app, &state, &body, client_key.as_deref(), &session_id).await {
+    match handle_chat(
+        Format::Openai,
+        "/v1/chat/completions",
+        &app,
+        &state,
+        &body,
+        client_key.as_deref(),
+        &session_id,
+    )
+    .await
+    {
         Ok(r) => {
             tracing::info!(
                 target: crate::LOG_TARGET,
@@ -1112,155 +1152,6 @@ async fn chat_completions_handler(
                 "request failed"
             );
             error_response(&e, false)
-        }
-    }
-}
-
-#[allow(clippy::too_many_lines)]
-async fn handle_chat_completions(
-    app: &AppState,
-    state: &RuntimeState,
-    body: &Bytes,
-    client_key: Option<&str>,
-    session_id: &str,
-) -> Result<Response, ApiError> {
-    let started = Instant::now();
-    let mut body = parse_body(body)?;
-
-    if let Some(out) = maybe_exec(app, state, &body).await {
-        let text = crate::exec::format_output(&out);
-        let model = active_model_or_default(state);
-        tracing::info!(
-            target: crate::LOG_TARGET,
-            endpoint = "/v1/chat/completions",
-            "handled $proxy command"
-        );
-        return Ok(exec_chat_response(&text, &model));
-    }
-
-    let streaming = wants_stream(&body);
-    let client_model = body.get("model").and_then(Value::as_str);
-    let (provider, upstream_model, reasoning_effort) = resolve_model(state, client_model)?;
-    tracing::info!(
-        target: crate::LOG_TARGET,
-        endpoint = "/v1/chat/completions",
-        provider = %provider.name,
-        upstream_model,
-        streaming,
-        "resolved route"
-    );
-    body["model"] = json!(upstream_model);
-    let client = client_for(state, &provider)?;
-
-    let mut upstream_body = match provider.format {
-        ProviderFormat::Openai => body,
-        ProviderFormat::Anthropic => translate::openai_to_anthropic_request(body)?,
-        ProviderFormat::OpenaiResponses => translate::openai_to_responses_request(body)?,
-    };
-    if streaming && provider.format == ProviderFormat::Openai {
-        enable_usage(&mut upstream_body);
-    }
-    prepare_responses_request(&provider, &mut upstream_body, reasoning_effort.as_deref());
-
-    let resp = client
-        .chat_request(client.default_path(), upstream_body, client_key, session_id)
-        .await
-        .map_err(ApiError::from)?;
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        let (status, rbody) = send_and_read(resp).await;
-        capture(
-            "/v1/chat/completions",
-            &provider.name,
-            &upstream_model,
-            streaming,
-            status,
-            Some(&rbody),
-            &started,
-            session_id,
-        );
-        tracing::warn!(
-            target: crate::LOG_TARGET,
-            endpoint = "/v1/chat/completions",
-            provider = %provider.name,
-            status,
-            body = %rbody,
-            "upstream returned error"
-        );
-        return Err(ApiError::from_upstream(status, rbody));
-    }
-    if streaming {
-        let cap = StreamCapture::new(
-            "/v1/chat/completions",
-            &provider.name,
-            &upstream_model,
-            status,
-            started,
-            session_id,
-        );
-        return match provider.format {
-            ProviderFormat::Openai => Ok(passthrough_stream(resp, Some(cap))),
-            ProviderFormat::Anthropic => Ok(sse_response(streams::openai_from_anthropic(
-                resp,
-                upstream_model,
-                Some(cap),
-            ))),
-            ProviderFormat::OpenaiResponses => Ok(sse_response(streams::openai_from_responses(
-                resp,
-                upstream_model,
-                Some(cap),
-            ))),
-        };
-    }
-
-    let rbody = if provider.format == ProviderFormat::OpenaiResponses {
-        aggregate_responses_stream(resp).await
-    } else {
-        resp.json::<Value>().await.unwrap_or(Value::Null)
-    };
-    match provider.format {
-        ProviderFormat::Openai => {
-            capture(
-                "/v1/chat/completions",
-                &provider.name,
-                &upstream_model,
-                false,
-                status,
-                Some(&rbody),
-                &started,
-                session_id,
-            );
-            Ok(json_response(StatusCode::OK, rbody))
-        }
-        ProviderFormat::Anthropic => {
-            capture(
-                "/v1/chat/completions",
-                &provider.name,
-                &upstream_model,
-                false,
-                status,
-                Some(&rbody),
-                &started,
-                session_id,
-            );
-            let translated = translate::anthropic_to_openai_response(rbody, &upstream_model)
-                .map_err(ApiError::from)?;
-            Ok(json_response(StatusCode::OK, translated))
-        }
-        ProviderFormat::OpenaiResponses => {
-            capture(
-                "/v1/chat/completions",
-                &provider.name,
-                &upstream_model,
-                false,
-                status,
-                Some(&rbody),
-                &started,
-                session_id,
-            );
-            let translated = translate::responses_to_openai_response(rbody, &upstream_model)
-                .map_err(ApiError::from)?;
-            Ok(json_response(StatusCode::OK, translated))
         }
     }
 }
@@ -1280,7 +1171,17 @@ async fn responses_handler(
         Err(e) => return error_response(&e, false),
     };
     let session_id = extract_session_id(&headers);
-    match handle_responses(&app, &state, &body, client_key.as_deref(), &session_id).await {
+    match handle_chat(
+        Format::Responses,
+        "/v1/responses",
+        &app,
+        &state,
+        &body,
+        client_key.as_deref(),
+        &session_id,
+    )
+    .await
+    {
         Ok(r) => {
             tracing::info!(
                 target: crate::LOG_TARGET,
@@ -1302,138 +1203,6 @@ async fn responses_handler(
             error_response(&e, false)
         }
     }
-}
-
-#[allow(clippy::too_many_lines)]
-async fn handle_responses(
-    app: &AppState,
-    state: &RuntimeState,
-    body: &Bytes,
-    client_key: Option<&str>,
-    session_id: &str,
-) -> Result<Response, ApiError> {
-    let started = Instant::now();
-    let mut body = parse_body(body)?;
-
-    if let Some(out) = maybe_exec(app, state, &body).await {
-        let text = crate::exec::format_output(&out);
-        let model = active_model_or_default(state);
-        tracing::info!(
-            target: crate::LOG_TARGET,
-            endpoint = "/v1/responses",
-            "handled $proxy command"
-        );
-        return Ok(exec_responses_response(&text, &model));
-    }
-
-    let streaming = wants_stream(&body);
-    let client_model = body.get("model").and_then(Value::as_str);
-    let (provider, upstream_model, reasoning_effort) = resolve_model(state, client_model)?;
-    tracing::info!(
-        target: crate::LOG_TARGET,
-        endpoint = "/v1/responses",
-        provider = %provider.name,
-        upstream_model,
-        streaming,
-        "resolved route"
-    );
-    body["model"] = json!(upstream_model);
-    let client = client_for(state, &provider)?;
-
-    let mut upstream_body = match provider.format {
-        ProviderFormat::Openai => translate::responses_to_openai_request(body)?,
-        ProviderFormat::Anthropic => translate::responses_to_anthropic_request(body)?,
-        // The ChatGPT backend rejects stored responses; make `store` explicit
-        // when the client omitted it.
-        ProviderFormat::OpenaiResponses => {
-            let mut body = body;
-            if body.get("store").is_none() {
-                body["store"] = json!(false);
-            }
-            body
-        }
-    };
-    if streaming && provider.format == ProviderFormat::Openai {
-        enable_usage(&mut upstream_body);
-    }
-    prepare_responses_request(&provider, &mut upstream_body, reasoning_effort.as_deref());
-
-    let resp = client
-        .chat_request(client.default_path(), upstream_body, client_key, session_id)
-        .await
-        .map_err(ApiError::from)?;
-    let status = resp.status().as_u16();
-    if status >= 400 {
-        let (status, rbody) = send_and_read(resp).await;
-        capture(
-            "/v1/responses",
-            &provider.name,
-            &upstream_model,
-            streaming,
-            status,
-            Some(&rbody),
-            &started,
-            session_id,
-        );
-        tracing::warn!(
-            target: crate::LOG_TARGET,
-            endpoint = "/v1/responses",
-            provider = %provider.name,
-            status,
-            body = %rbody,
-            "upstream returned error"
-        );
-        return Err(ApiError::from_upstream(status, rbody));
-    }
-    if streaming {
-        let cap = StreamCapture::new(
-            "/v1/responses",
-            &provider.name,
-            &upstream_model,
-            status,
-            started,
-            session_id,
-        );
-        return match provider.format {
-            ProviderFormat::Openai => Ok(sse_response(streams::responses_from_openai(
-                resp,
-                upstream_model,
-                Some(cap),
-            ))),
-            ProviderFormat::Anthropic => Ok(sse_response(streams::responses_from_anthropic(
-                resp,
-                upstream_model,
-                Some(cap),
-            ))),
-            ProviderFormat::OpenaiResponses => Ok(passthrough_stream(resp, Some(cap))),
-        };
-    }
-
-    let rbody = if provider.format == ProviderFormat::OpenaiResponses {
-        aggregate_responses_stream(resp).await
-    } else {
-        resp.json::<Value>().await.unwrap_or(Value::Null)
-    };
-    capture(
-        "/v1/responses",
-        &provider.name,
-        &upstream_model,
-        false,
-        status,
-        Some(&rbody),
-        &started,
-        session_id,
-    );
-    let translated = match provider.format {
-        ProviderFormat::Openai => translate::openai_to_responses_response(rbody, &upstream_model)
-            .map_err(ApiError::from)?,
-        ProviderFormat::Anthropic => {
-            translate::anthropic_to_responses_response(rbody, &upstream_model)
-                .map_err(ApiError::from)?
-        }
-        ProviderFormat::OpenaiResponses => rbody,
-    };
-    Ok(json_response(StatusCode::OK, translated))
 }
 
 // ---------------------------------------------------------------------------
@@ -1649,28 +1418,29 @@ mod tests {
             session_header: None,
             oauth: None,
         };
-        let mut body = json!({"model": "gpt-6-sol", "stream": false, "metadata": {"user_id": "u"}});
-        prepare_responses_request(&responses, &mut body, Some("medium"));
+        let mut body = json!({"model": "gpt-6-sol", "stream": false});
+        prepare_responses_request(&responses, &mut body, Some("medium"), "sess-1");
+        // the session routes the prompt cache
+        assert_eq!(body["prompt_cache_key"], "sess-1");
         // the Codex backend rejects non-streaming, so upstream always streams
         assert_eq!(body["stream"], true);
         assert_eq!(body["reasoning"]["effort"], "medium");
-        assert!(body.get("metadata").is_none());
 
         // without a configured effort the field is not injected
         let mut plain = json!({"model": "gpt-6-sol"});
-        prepare_responses_request(&responses, &mut plain, None);
+        prepare_responses_request(&responses, &mut plain, None, "");
         assert_eq!(plain["stream"], true);
         assert!(plain.get("reasoning").is_none());
 
         // an empty effort string is treated as unset
         let mut empty = json!({});
-        prepare_responses_request(&responses, &mut empty, Some(""));
+        prepare_responses_request(&responses, &mut empty, Some(""), "");
         assert!(empty.get("reasoning").is_none());
 
         // the route pin is a default, not an override: a client that asked for
         // its own effort keeps it
         let mut client = json!({"reasoning": {"effort": "xhigh"}});
-        prepare_responses_request(&responses, &mut client, Some("low"));
+        prepare_responses_request(&responses, &mut client, Some("low"), "");
         assert_eq!(client["reasoning"]["effort"], "xhigh");
     }
 
@@ -1688,7 +1458,7 @@ mod tests {
                 oauth: None,
             };
             let mut body = json!({"stream": false});
-            prepare_responses_request(&provider, &mut body, Some("medium"));
+            prepare_responses_request(&provider, &mut body, Some("medium"), "");
             // untouched: no forced streaming, no reasoning field
             assert_eq!(body["stream"], false);
             assert!(body.get("reasoning").is_none());
