@@ -50,6 +50,11 @@ pub struct RuntimeState {
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<RwLock<RuntimeState>>,
+    /// Per-session account pins (`session id -> provider -> alias`), set by
+    /// `$proxy account` inside a session. In-memory only: a restart drops the
+    /// pins and every session falls back to the persisted last-selected
+    /// default.
+    sessions: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
 }
 
 impl AppState {
@@ -58,6 +63,52 @@ impl AppState {
     pub fn new(state: RuntimeState) -> Self {
         Self {
             inner: Arc::new(RwLock::new(state)),
+            sessions: Arc::new(RwLock::new(HashMap::new())),
+        }
+    }
+
+    /// The account pinned to `session_id` for `provider`, if any.
+    pub async fn session_account(&self, session_id: &str, provider: &str) -> Option<String> {
+        if session_id.is_empty() {
+            return None;
+        }
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .and_then(|accounts| accounts.get(provider))
+            .cloned()
+    }
+
+    /// Pin `alias` as the account of `session_id` for `provider`. A request
+    /// without a session id cannot pin anything (there is no session).
+    pub async fn set_session_account(&self, session_id: &str, provider: &str, alias: &str) {
+        if session_id.is_empty() {
+            return;
+        }
+        self.sessions
+            .write()
+            .await
+            .entry(session_id.to_string())
+            .or_default()
+            .insert(provider.to_string(), alias.to_string());
+    }
+
+    /// Drop the session's account pins: one provider, or all of them.
+    pub async fn clear_session_accounts(&self, session_id: &str, provider: Option<&str>) {
+        if session_id.is_empty() {
+            return;
+        }
+        let mut sessions = self.sessions.write().await;
+        match provider {
+            Some(provider) => {
+                if let Some(accounts) = sessions.get_mut(session_id) {
+                    accounts.remove(provider);
+                }
+            }
+            None => {
+                sessions.remove(session_id);
+            }
         }
     }
 
@@ -635,11 +686,26 @@ fn resolve_model(
 fn client_for(
     state: &RuntimeState,
     provider: &crate::config::Provider,
+    session_alias: Option<&str>,
     alias: Option<&str>,
 ) -> Result<ProviderClient, ApiError> {
     let accounts = state.clients.get(&provider.name).ok_or_else(|| {
         ApiError::internal(format!("client not built for provider {}", provider.name))
     })?;
+    // A `$proxy account` pin outranks everything for this session.
+    if let Some(alias) = session_alias {
+        return accounts
+            .get(alias)
+            .filter(|client| client.has_key())
+            .cloned()
+            .ok_or_else(|| {
+                ApiError::bad_request(format!(
+                    "session account '{alias}' for provider '{}' is no longer stored; \
+                     select another with `$proxy account {}/<alias>`",
+                    provider.name, provider.name
+                ))
+            });
+    }
     if let Some(alias) = alias {
         return accounts.get(alias).cloned().ok_or_else(|| {
             ApiError::bad_request(format!(
@@ -753,6 +819,7 @@ async fn maybe_exec(
     app: &AppState,
     state: &RuntimeState,
     body: &Value,
+    session_id: &str,
 ) -> Option<crate::exec::ExecOutput> {
     let exec = &state.config.exec;
     if !exec.enabled {
@@ -765,6 +832,8 @@ async fn maybe_exec(
         Some(handle_model_exec(app, state, &args).await)
     } else if args.first().map(String::as_str) == Some("effort") {
         Some(handle_effort_exec(app, state, &args).await)
+    } else if args.first().map(String::as_str) == Some("account") {
+        Some(handle_account_exec(app, state, session_id, &args).await)
     } else if args.first().map(String::as_str) == Some("logs") {
         Some(handle_logs_exec(&args))
     } else {
@@ -882,6 +951,52 @@ async fn handle_model_exec(
         stderr: String::new(),
         code: 0,
         timed_out: false,
+    }
+}
+
+/// Handle `$proxy account ...` in-process: list accounts, switch this session
+/// to `provider/alias`, or clear the selection.
+///
+/// Selecting pins the account to the session id that made the request and
+/// persists it as the last-selected default (via the CLI logic); clearing drops
+/// the session pin too. Without a session id the command only changes the
+/// persisted default.
+async fn handle_account_exec(
+    app: &AppState,
+    state: &RuntimeState,
+    session_id: &str,
+    args: &[String],
+) -> crate::exec::ExecOutput {
+    let rest = args.get(1..).unwrap_or_default();
+    match crate::cli::account_result(&state.config_path, rest) {
+        Ok(msg) => {
+            match rest {
+                [command] if command == "clear" => {
+                    app.clear_session_accounts(session_id, None).await;
+                }
+                [command, provider] if command == "clear" => {
+                    app.clear_session_accounts(session_id, Some(provider)).await;
+                }
+                [target] => {
+                    if let Some((provider, alias)) = target.split_once('/') {
+                        app.set_session_account(session_id, provider, alias).await;
+                    }
+                }
+                _ => {}
+            }
+            crate::exec::ExecOutput {
+                stdout: msg,
+                stderr: String::new(),
+                code: 0,
+                timed_out: false,
+            }
+        }
+        Err(e) => crate::exec::ExecOutput {
+            stdout: String::new(),
+            stderr: e.to_string(),
+            code: 1,
+            timed_out: false,
+        },
     }
 }
 
@@ -1056,7 +1171,7 @@ async fn handle_chat(
     let started = Instant::now();
     let mut body = parse_body(body)?;
 
-    if let Some(out) = maybe_exec(app, state, &body).await {
+    if let Some(out) = maybe_exec(app, state, &body, session_id).await {
         let text = crate::exec::format_output(&out);
         let model = active_model_or_default(state);
         tracing::info!(target: crate::LOG_TARGET, endpoint, "handled $proxy command");
@@ -1084,7 +1199,8 @@ async fn handle_chat(
             body["output_config"]["effort"] = json!(effort);
         }
     }
-    let client = client_for(state, &provider, account_alias)?;
+    let session_alias = app.session_account(session_id, &provider.name).await;
+    let client = client_for(state, &provider, session_alias.as_deref(), account_alias)?;
     let upstream_format = Format::from(provider.format);
     let same = upstream_format == client_format;
 
@@ -1965,7 +2081,7 @@ mod tests {
         let body = json!({"messages": [{"role": "user", "content": "$proxy status"}]});
         block_on(async {
             let state = app.snapshot().await;
-            assert!(maybe_exec(&app, &state, &body).await.is_none());
+            assert!(maybe_exec(&app, &state, &body, "").await.is_none());
         });
     }
 
@@ -1985,11 +2101,69 @@ mod tests {
         let body = json!({"messages": [{"role": "user", "content": "$proxy model"}]});
         block_on(async {
             let state = app.snapshot().await;
-            let out = maybe_exec(&app, &state, &body).await.expect("is $proxy");
+            let out = maybe_exec(&app, &state, &body, "")
+                .await
+                .expect("is $proxy");
             assert!(!out.stdout.is_empty(), "stdout should not be empty");
             assert_eq!(out.code, 0);
             assert_eq!(app.snapshot().await.config.defaults.active_model, None);
         });
+    }
+
+    #[test]
+    fn maybe_exec_account_pins_the_session_and_persists_the_default() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let stamp = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
+        let dir = std::env::temp_dir().join(format!(
+            "local-proxy-account-exec-{}-{stamp}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", &dir);
+        crate::auth::set_key_for("mock", "work", "key-work").unwrap();
+        let config_path = dir.join("config.yaml");
+
+        let app = AppState::new(RuntimeState {
+            config: Arc::new(Config::default()),
+            router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
+            clients: Arc::new(HashMap::new()),
+            enforce_active_model: false,
+            config_path: config_path.clone(),
+        });
+        block_on(async {
+            let state = app.snapshot().await;
+
+            let body =
+                json!({"messages": [{"role": "user", "content": "$proxy account mock/work"}]});
+            let out = maybe_exec(&app, &state, &body, "sess-1")
+                .await
+                .expect("is $proxy");
+            assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+            assert_eq!(
+                app.session_account("sess-1", "mock").await.as_deref(),
+                Some("work")
+            );
+            // The selection is also the persisted last-selected default.
+            let saved = Config::load(&config_path).unwrap();
+            assert_eq!(saved.defaults.active_accounts["mock"], "work");
+
+            // `clear` drops the session pin and the persisted default.
+            let body =
+                json!({"messages": [{"role": "user", "content": "$proxy account clear mock"}]});
+            let out = maybe_exec(&app, &state, &body, "sess-1")
+                .await
+                .expect("is $proxy");
+            assert_eq!(out.code, 0, "stderr: {}", out.stderr);
+            assert_eq!(app.session_account("sess-1", "mock").await, None);
+            let saved = Config::load(&config_path).unwrap();
+            assert!(!saved.defaults.active_accounts.contains_key("mock"));
+        });
+
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2048,22 +2222,27 @@ mod tests {
             enforce_active_model: false,
             config_path: PathBuf::new(),
         };
-        assert!(client_for(&make_state(accounts.clone()), &provider, None).is_ok());
-        assert!(client_for(&make_state(accounts.clone()), &provider, Some("one")).is_ok());
-        let err = client_for(&make_state(accounts.clone()), &provider, Some("missing"))
-            .expect_err("unknown alias must fail even with one account");
+        assert!(client_for(&make_state(accounts.clone()), &provider, None, None).is_ok());
+        assert!(client_for(&make_state(accounts.clone()), &provider, None, Some("one")).is_ok());
+        let err = client_for(
+            &make_state(accounts.clone()),
+            &provider,
+            None,
+            Some("missing"),
+        )
+        .expect_err("unknown alias must fail even with one account");
         assert_eq!(err.status, 400);
         assert!(err.message.contains("unknown account 'missing'"));
         accounts.insert("two".to_string(), account("two"));
         let state = make_state(accounts);
-        let err = client_for(&state, &provider, None).expect_err("ambiguous account");
+        let err = client_for(&state, &provider, None, None).expect_err("ambiguous account");
         assert_eq!(err.status, 400);
         assert!(err.message.contains("X-Local-Proxy-Account"));
-        assert!(client_for(&state, &provider, Some("two")).is_ok());
+        assert!(client_for(&state, &provider, None, Some("two")).is_ok());
     }
 
     #[test]
-    fn selected_account_wins_over_multiplicity_and_header_wins_over_selection() {
+    fn account_resolution_is_session_then_header_then_selection() {
         let provider = crate::config::Provider {
             name: "openai".to_string(),
             base_url: "http://127.0.0.1:9".to_string(),
@@ -2111,22 +2290,41 @@ mod tests {
 
         // No header: the selected account is used without error.
         let state = state_with("work");
-        let selected = client_for(&state, &provider, None).unwrap();
+        let selected = client_for(&state, &provider, None, None).unwrap();
         assert_eq!(selected.effective_key(None).as_deref(), Some("key-work"));
-        // The header still overrides the selection per request.
-        let overridden = client_for(&state, &provider, Some("personal")).unwrap();
+        // The header overrides the persisted selection per request.
+        let overridden = client_for(&state, &provider, None, Some("personal")).unwrap();
         assert_eq!(
             overridden.effective_key(None).as_deref(),
+            Some("key-personal")
+        );
+
+        // A session pin (from `$proxy account`) outranks both the persisted
+        // selection and the per-request header.
+        let pinned = client_for(&state, &provider, Some("personal"), None).unwrap();
+        assert_eq!(pinned.effective_key(None).as_deref(), Some("key-personal"));
+        let pinned_over_header =
+            client_for(&state, &provider, Some("personal"), Some("work")).unwrap();
+        assert_eq!(
+            pinned_over_header.effective_key(None).as_deref(),
             Some("key-personal")
         );
 
         // A selection whose account was disconnected is a clear 400, never a
         // silent fallback to another account.
         let disconnected = state_with("ghost");
-        let err = client_for(&disconnected, &provider, None).expect_err("stale selection");
+        let err = client_for(&disconnected, &provider, None, None).expect_err("stale selection");
         assert_eq!(err.status, 400);
         assert!(
             err.message.contains("no longer stored"),
+            "got: {}",
+            err.message
+        );
+        // Same for a stale session pin.
+        let err = client_for(&state, &provider, Some("ghost"), None).expect_err("stale pin");
+        assert_eq!(err.status, 400);
+        assert!(
+            err.message.contains("session account"),
             "got: {}",
             err.message
         );

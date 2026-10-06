@@ -841,6 +841,58 @@ describe("e2e: multiple accounts per provider", () => {
     }
     expect(status).toBe(400);
   });
+
+  test("$proxy account pins the account for the session and updates the default", async () => {
+    const sessionA = { "x-claude-code-session-id": "sess-A" };
+    const sessionB = { "x-claude-code-session-id": "sess-B" };
+    const chat = { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
+
+    // Session A switches through the proxy itself.
+    const cmd = await postJson(
+      proxy.base,
+      "/v1/messages",
+      { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "$proxy account mock_responses/work" }] },
+      sessionA,
+    );
+    expect(cmd.status).toBe(200);
+    expect(await readBody(cmd)).toContain("work");
+
+    // Header-less requests from session A use the pinned account.
+    const pinned = await postJson(proxy.base, "/v1/messages", chat, sessionA);
+    expect(pinned.status).toBe(200);
+    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
+
+    // Move the persisted default from the CLI; session B (no pin) follows it.
+    const cli = await runCli(["--config", cfgPath, "account", "mock_responses/personal"], env);
+    expect(cli.exit).toBe(0);
+    let authB = "";
+    for (let i = 0; i < 30; i++) {
+      const r = await postJson(proxy.base, "/v1/messages", chat, sessionB);
+      if (r.status === 200) {
+        authB = mock.lastResponsesHeaders().authorization ?? "";
+        if (authB === "Bearer key-personal") break;
+      }
+      await Bun.sleep(100);
+    }
+    expect(authB).toBe("Bearer key-personal");
+
+    // Session A still uses its own pin, not the new default.
+    const stillA = await postJson(proxy.base, "/v1/messages", chat, sessionA);
+    expect(stillA.status).toBe(200);
+    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
+
+    // Clearing drops the pin: session A falls back to the persisted default.
+    const clear = await postJson(
+      proxy.base,
+      "/v1/messages",
+      { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "$proxy account clear mock_responses" }] },
+      sessionA,
+    );
+    expect(clear.status).toBe(200);
+    const fallback = await postJson(proxy.base, "/v1/messages", chat, sessionA);
+    expect(fallback.status).toBe(200);
+    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-personal");
+  });
 });
 
 describe("e2e: legacy auth.json migration", () => {

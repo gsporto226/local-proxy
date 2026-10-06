@@ -17,7 +17,7 @@ Most AI tools hardcode their vendor's API shape. The reference design here is [o
 - Embedded provider catalog (`anthropic`, `claude`, `openai`, `chatgpt`, `opencode-go`, `zen`, `groq`, `xai`, `google`, `deepseek`, `openrouter`, `neuralwatt`). Your `config.yaml` only adds to it or overrides entries; it never replaces the whole list.
 - Hot reload. Editing the config or the credential store applies in runtime through a file watcher, no restart.
 - Encrypted credential store separate from the config (`accounts.db`, SQLCipher), modeled after opencode's `/connect`. The database key lives in the OS vault (Windows Credential Manager, Linux Secret Service), never in a file.
-- Multiple accounts per provider. An account is a provider plus an alias you choose. Select the active account per provider with `local-proxy account <provider>/<alias>`, and override it per request with the `X-Local-Proxy-Account: <alias>` header; a provider with a single account needs neither.
+- Multiple accounts per provider. An account is a provider plus an alias you choose. Select the active account per provider with `local-proxy account <provider>/<alias>`, switch a live session with `$proxy account <provider>/<alias>`, and override per request with the `X-Local-Proxy-Account: <alias>` header; a provider with a single account needs none of these.
 - OAuth subscription logins (`local-proxy connect claude --account personal --oauth`, `local-proxy connect chatgpt --account work --oauth`): a provider with an `oauth:` block runs a PKCE login, stores the token bundle as that account, refreshes it automatically near expiry, and the engine stays provider-agnostic.
 - ChatGPT Plus/Pro support: requests go to the ChatGPT backend over the Responses API (`format: openai-responses`).
 - `$proxy` executor. When the last user message starts with `$proxy `, the proxy runs the rest as a `local-proxy` command and returns the output as the model's reply. Works with no provider connected.
@@ -194,7 +194,14 @@ Any single request can override the selection with the `X-Local-Proxy-Account` h
 curl -H "X-Local-Proxy-Account: personal" http://127.0.0.1:8787/v1/messages ...
 ```
 
-Resolution order: the header wins; then the selected account for the provider; then the only account when there is exactly one. With two or more accounts and no selection, a missing or unknown alias is a clear 400 error — the proxy never silently picks another account, and a selection whose account was disconnected is reported as stale instead of being replaced.
+Inside a session (any client that sends a session id, like Claude Code), `$proxy account <provider>/<alias>` switches that session immediately — the pin is remembered for the session's lifetime and also becomes the persisted last-selected default, so new sessions start there. `$proxy account` lists, and `$proxy account clear [provider]` drops the session pin:
+
+```
+$proxy account chatgpt/work
+$proxy account clear chatgpt
+```
+
+Resolution order: a session pin wins; then the `X-Local-Proxy-Account` header; then the selected account for the provider; then the only account when there is exactly one. With two or more accounts and none of those, a missing or unknown alias is a clear 400 error — the proxy never silently picks another account, and a selection whose account was disconnected is reported as stale instead of being replaced.
 
 An alias identifies one stored credential; connecting an alias that already exists is rejected, so a reconnect cannot silently replace a working credential. Disconnect it first, or use another alias.
 
@@ -382,6 +389,7 @@ $proxy status                        # proxy status
 $proxy models                        # models from connected providers
 $proxy stats --since week            # usage statistics
 $proxy model deepseek-v4-flash       # select this instance's active model, persisted
+$proxy account chatgpt/work          # switch this session's account (persisted as the default)
 $proxy connect opencode-go --account default <key>  # store the key, no interactive prompt
 ```
 
