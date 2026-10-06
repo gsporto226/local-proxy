@@ -393,6 +393,11 @@ fn prepare_responses_request(
             body["reasoning"] = json!({ "effort": effort });
         }
     }
+    // The Codex backend rejects `metadata` ("Unsupported parameter"), which
+    // Claude Code sends on every request (`{user_id}`).
+    if let Some(obj) = body.as_object_mut() {
+        obj.remove("metadata");
+    }
     body["stream"] = json!(true);
 }
 
@@ -1644,11 +1649,12 @@ mod tests {
             session_header: None,
             oauth: None,
         };
-        let mut body = json!({"model": "gpt-6-sol", "stream": false});
+        let mut body = json!({"model": "gpt-6-sol", "stream": false, "metadata": {"user_id": "u"}});
         prepare_responses_request(&responses, &mut body, Some("medium"));
         // the Codex backend rejects non-streaming, so upstream always streams
         assert_eq!(body["stream"], true);
         assert_eq!(body["reasoning"]["effort"], "medium");
+        assert!(body.get("metadata").is_none());
 
         // without a configured effort the field is not injected
         let mut plain = json!({"model": "gpt-6-sol"});
