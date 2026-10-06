@@ -45,14 +45,16 @@ bloqueante localmente.
 - O projeto usa `missing_docs = "deny"`: todo item público precisa de `///`.
 - Não rode só `cargo test` — o CI reprova em `cargo fmt`/`cargo clippy` mesmo
   com os testes verdes (foi o que causou CI vermelho em `cc1b86c`).
+- O build compila SQLCipher com OpenSSL vendorizado: `perl` precisa estar no
+  PATH (Strawberry Perl no Windows). No CI o Perl já vem na imagem.
 
-### Testes e2e nunca tocam o `auth.json` real
+### Testes e2e nunca tocam o store real
 
-O store de credenciais vive em `<config dir>/auth.json`
-(`%APPDATA%\local-proxy\config\auth.json` no Windows). Um teste que escreva
-ali apaga ou sobrescreve as chaves do usuário — e se o teste falhar, der
-timeout ou for interrompido antes do `afterAll`, a restauração não acontece e
-as chaves se perdem de vez.
+O store de credenciais vive em `<config dir>/accounts.db` com a chave no cofre
+do SO (`%APPDATA%\local-proxy\config\accounts.db` no Windows). Um `auth.json`
+legado ainda pode existir e é migrado (renomeado para `auth.json.migrated`) na
+primeira leitura — um teste que rode contra o diretório real mexe nas
+credenciais do usuário.
 
 Todo suite que precise semear credenciais usa `isolatedConfigDir()` de
 `e2e/helpers.ts`, que cria um diretório temporário e devolve o env
@@ -70,3 +72,24 @@ Nunca faça backup/restore do arquivo real: uma restauração que não roda é u
 perda silenciosa de credenciais. O prefixo do diretório temporário não pode
 começar com `local-proxy-e2e-` (o `stopProxy` varre temporários com esse
 prefixo e apagaria o store de outro suite).
+
+### Testes unitários (Rust) nunca tocam o store real
+
+O mesmo vale para `cargo test`. Todo teste que leia ou escreva credenciais pega
+o `TEST_STATE_LOCK` e aponta `LOCAL_PROXY_CONFIG_DIR` para um diretório
+temporário enquanto roda:
+
+```rust
+let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+std::env::set_var("LOCAL_PROXY_CONFIG_DIR", &dir);
+// ... auth::read_auth / set_key_for / build_runtime_state / etc ...
+std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
+```
+
+O lock serializa todos os testes que mexem no env (config.rs, upstream.rs,
+handlers.rs, cli.rs, statusline.rs). Como defesa extra, `auth::with_db` falha
+em `cfg(test)` sem `LOCAL_PROXY_CONFIG_DIR`: um teste esquecido falha alto em
+vez de migrar o store real — foi assim que o `auth.json` do usuário foi
+migrado por engano em 06/10/2026 (teste
+`rebuild_merges_catalog_with_overlay_and_reapplies`, que chamava
+`build_runtime_state` sem isolar o diretório).

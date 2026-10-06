@@ -1,5 +1,6 @@
 import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 
 import {
   authStorePath,
@@ -10,15 +11,20 @@ import {
   parseSse,
   postJson,
   readBody,
+  runCli,
   startProxy,
   stopProxy,
+  writeConfig,
   type ProxyHandle,
 } from "./helpers";
 import { mockConfig, startMockUpstream, type MockUpstream } from "./mock-upstream";
 
-// Providers get their API keys only from `auth.json`, so seed the mock providers
-// there. This suite runs against a throwaway config dir (`LOCAL_PROXY_CONFIG_DIR`)
-// so the user's real auth store is never read, written, or restored.
+// Providers get their API keys only from the credential store. These tests seed
+// the legacy `auth.json` on purpose: the proxy migrates it to the encrypted
+// store (`accounts.db`) on first read, so every scenario also exercises the
+// migration path. This suite runs against a throwaway config dir
+// (`LOCAL_PROXY_CONFIG_DIR`) so the user's real auth store is never read,
+// written, or restored.
 const { dir: configDir, env: isolatedEnv } = isolatedConfigDir();
 const authPath = authStorePath(configDir);
 
@@ -448,11 +454,10 @@ describe("e2e: oauth-backed responses provider", () => {
     expect(headers["chatgpt-account-id"]).toBe("acct-e2e");
   });
 
-  test("persists the refreshed token in auth.json", () => {
-    const auth = JSON.parse(readFileSync(authPath, "utf8"));
-    expect(auth.mock_oauth.access).toBe("refreshed-token");
-    expect(auth.mock_oauth.refresh).toBe("refresh-2");
-    expect(auth.mock_oauth.type).toBe("oauth");
+  test("migrates the legacy store and keeps a backup", () => {
+    expect(existsSync(authPath)).toBe(false);
+    expect(existsSync(join(configDir, "auth.json.migrated"))).toBe(true);
+    expect(existsSync(join(configDir, "accounts.db"))).toBe(true);
   });
 
   test("a fresh token is reused without another refresh", async () => {
@@ -464,6 +469,25 @@ describe("e2e: oauth-backed responses provider", () => {
     });
     expect(r.status).toBe(200);
     expect(mock.tokenHits()).toBe(before);
+  });
+
+  test("the refreshed token survives a proxy restart", async () => {
+    stopProxy(proxy);
+    proxy = await startProxy(
+      mockConfig(`http://127.0.0.1:${mock.port}`, { activeModel: "oauth-via-responses" }),
+      undefined,
+      isolatedEnv,
+    );
+    const before = mock.tokenHits();
+    const r = await postJson(proxy.base, "/v1/messages", {
+      model: "oauth-via-responses",
+      max_tokens: 10,
+      messages: [{ role: "user", content: "restart" }],
+    });
+    expect(r.status).toBe(200);
+    // No refresh on the new process: the fresh token came from the store.
+    expect(mock.tokenHits()).toBe(before);
+    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer refreshed-token");
   });
 });
 
@@ -664,5 +688,103 @@ describe("e2e: per-provider auto model", () => {
     } finally {
       stopScenario(s);
     }
+  });
+});
+
+describe("e2e: multiple accounts per provider", () => {
+  let mock: MockUpstream;
+  let proxy: ProxyHandle;
+  const { env } = isolatedConfigDir();
+  let cfgPath: string;
+
+  beforeAll(async () => {
+    mock = await startMockUpstream();
+    const cfg = mockConfig(`http://127.0.0.1:${mock.port}`, {
+      activeModel: "claude-via-responses",
+    });
+    cfgPath = writeConfig(cfg);
+    // Two named accounts on the same provider, written through the real CLI.
+    for (const [alias, key] of [
+      ["work", "key-work"],
+      ["personal", "key-personal"],
+    ]) {
+      const res = await runCli(
+        ["--config", cfgPath, "connect", "mock_responses", "--account", alias, key],
+        env,
+      );
+      expect(res.exit).toBe(0);
+    }
+    proxy = await startProxy(cfg, undefined, env);
+  });
+
+  afterAll(() => stopScenario({ mock, proxy }));
+
+  test("a request without an account header fails when the provider has several accounts", async () => {
+    const r = await postJson(proxy.base, "/v1/messages", {
+      model: "claude-via-responses",
+      max_tokens: 10,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(r.status).toBe(400);
+    expect(await readBody(r)).toContain("X-Local-Proxy-Account");
+  });
+
+  test("an unknown alias is rejected", async () => {
+    const r = await postJson(
+      proxy.base,
+      "/v1/messages",
+      { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "hi" }] },
+      { "x-local-proxy-account": "nope" },
+    );
+    expect(r.status).toBe(400);
+    expect(await readBody(r)).toContain("unknown account 'nope'");
+  });
+
+  test("each alias sends its own credential upstream", async () => {
+    const work = await postJson(
+      proxy.base,
+      "/v1/messages",
+      { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "hi" }] },
+      { "x-local-proxy-account": "work" },
+    );
+    expect(work.status).toBe(200);
+    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
+
+    const personal = await postJson(
+      proxy.base,
+      "/v1/messages",
+      { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "hi" }] },
+      { "x-local-proxy-account": "personal" },
+    );
+    expect(personal.status).toBe(200);
+    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-personal");
+  });
+
+  test("providers lists every alias with its kind", async () => {
+    const res = await runCli(["--config", cfgPath, "providers"], env);
+    expect(res.exit).toBe(0);
+    expect(res.output).toContain("mock_responses");
+    expect(res.output).toContain("personal (api)");
+    expect(res.output).toContain("work (api)");
+  });
+});
+
+describe("e2e: legacy auth.json migration", () => {
+  const { dir, env } = isolatedConfigDir();
+
+  test("migrates legacy entries to default accounts and keeps a backup", async () => {
+    const cfgPath = writeConfig(mockConfig("http://127.0.0.1:9", {}));
+    writeFileSync(
+      join(dir, "auth.json"),
+      JSON.stringify({ mock_openai: { type: "api", key: "k" } }),
+    );
+
+    const res = await runCli(["--config", cfgPath, "providers"], env);
+    expect(res.exit).toBe(0);
+    expect(res.output).toContain("mock_openai");
+    expect(res.output).toContain("default (api)");
+    expect(existsSync(join(dir, "auth.json"))).toBe(false);
+    expect(existsSync(join(dir, "auth.json.migrated"))).toBe(true);
+    expect(existsSync(join(dir, "accounts.db"))).toBe(true);
   });
 });

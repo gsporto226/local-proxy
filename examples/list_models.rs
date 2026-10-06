@@ -30,11 +30,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let provider = "chatgpt";
     // Uses the stored access token as is; run any proxied request first if it
     // has expired (the proxy refreshes and persists it).
+    let account_alias = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "default".to_string());
     let tokens = auth::read_auth()?
         .get(provider)
+        .and_then(|accounts| accounts.get(&account_alias))
         .and_then(auth::AuthEntry::oauth)
         .cloned()
-        .ok_or("no chatgpt oauth entry; run `local-proxy connect chatgpt --oauth`")?;
+        .ok_or("no chatgpt oauth account; connect with --account <alias> or pass an alias")?;
     let (token, account) = (tokens.access, tokens.account_id);
 
     let client = reqwest::Client::builder()

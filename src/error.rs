@@ -168,11 +168,12 @@ impl From<TranslateError> for ApiError {
 impl From<UpstreamError> for ApiError {
     fn from(e: UpstreamError) -> Self {
         match e {
+            UpstreamError::Auth(source) => Self::internal(format!("account store: {source}")),
             UpstreamError::MissingApiKey { provider } => Self::new(
                 502,
                 "api_error",
                 format!(
-                    "provider {provider} has no API key; store one via `local-proxy connect {provider}`"
+                    "provider {provider} has no account; connect via `local-proxy connect {provider} --account <alias>`"
                 ),
             ),
             UpstreamError::ClientBuild { source } => {

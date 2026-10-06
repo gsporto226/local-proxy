@@ -16,10 +16,11 @@ export const BINARY = join(
  * A throwaway config dir for a test suite, plus the `LOCAL_PROXY_CONFIG_DIR` env
  * that points the proxy (and every CLI subcommand it spawns) at it.
  *
- * This is what keeps the suite off the user's real `auth.json`: the auth store
- * lives at `<config dir>/auth.json`, so an isolated dir means the tests can seed
- * and clear credentials freely without ever reading or writing the real store.
- * Never write to the user's global config dir from a test.
+ * This is what keeps the suite off the user's real credential store: the store
+ * lives at `<config dir>/accounts.db` (a legacy `auth.json` is migrated into it),
+ * so an isolated dir means the tests can seed and clear credentials freely
+ * without ever reading or writing the real store. Never write to the user's
+ * global config dir from a test.
  */
 export function isolatedConfigDir(): { dir: string; env: Record<string, string> } {
   // Note the prefix: `stopProxy` sweeps temp dirs named `local-proxy-e2e-*`, so

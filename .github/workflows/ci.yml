@@ -74,6 +74,15 @@ jobs:
         with:
           cache-on-failure: true
 
+      - name: secret service for tests (Linux vault)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gnome-keyring
+          # Create and unlock the login keyring with a throwaway password; the
+          # tests only need a working, unlocked Secret Service.
+          gnome-keyring-daemon --components=secrets --daemonize --unlock <<< 'foobar'
+
       - name: unit tests
         run: cargo test --all-features
 

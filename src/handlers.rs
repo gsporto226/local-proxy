@@ -35,8 +35,8 @@ pub struct RuntimeState {
     pub config: Arc<Config>,
     /// The model/router resolution logic.
     pub router: Arc<Router>,
-    /// The built upstream clients, keyed by provider name.
-    pub clients: Arc<HashMap<String, ProviderClient>>,
+    /// The built upstream clients, keyed by provider name and account alias.
+    pub clients: Arc<HashMap<String, HashMap<String, ProviderClient>>>,
     /// When true, requests that carry a client-sent model are forced to use the
     /// proxy's `active_model` instead. Used by `local-proxy launch claude` so the
     /// launched tool's own model selection never overrides the user's choice.
@@ -93,6 +93,9 @@ pub enum RuntimeError {
     #[error("failed to build router: {0}")]
     #[diagnostic(code(runtime::router))]
     Router(#[source] RouterError),
+    /// The account database or vault could not be read.
+    #[error("failed to load accounts: {0}")]
+    Auth(#[source] crate::auth::AuthError),
     /// The upstream clients could not be built.
     #[error("failed to build upstream clients: {0}")]
     #[diagnostic(code(runtime::clients))]
@@ -127,10 +130,13 @@ pub fn build_runtime_state(config_path: &Path) -> Result<RuntimeState, RuntimeEr
         source,
     })?;
     let mut config = crate::catalog::effective_config(base, overlay);
-    crate::upstream::discover_models(&mut config);
+    crate::upstream::discover_models(&mut config).map_err(RuntimeError::Clients)?;
     let config = Arc::new(config);
     let router = Arc::new(Router::new(config.clone()).map_err(RuntimeError::Router)?);
-    let clients = Arc::new(build_clients(&config).map_err(RuntimeError::Clients)?);
+    let clients = Arc::new(build_clients(&config).map_err(|error| match error {
+        ClientBuildError::Auth(source) => RuntimeError::Auth(source),
+        ClientBuildError::Upstream(source) => RuntimeError::Clients(source),
+    })?);
     Ok(RuntimeState {
         config,
         router,
@@ -156,7 +162,7 @@ fn carry_instance_state(old: &RuntimeState, new: &mut RuntimeState) {
 /// the active config file or the auth store.
 fn is_reload_path(path: &Path, config_file: &std::ffi::OsStr) -> bool {
     path.file_name()
-        .is_some_and(|name| name == config_file || name == "auth.json")
+        .is_some_and(|name| name == config_file || name == "auth.json" || name == "accounts.db")
 }
 
 /// Spawn a file-watcher task that rebuilds `state` when the config or auth file
@@ -236,23 +242,53 @@ pub fn spawn_watcher(config_path: PathBuf, app_state: &AppState) -> Result<(), R
     Ok(())
 }
 
+/// Errors while loading credentials or building upstream clients.
+#[derive(Debug, thiserror::Error)]
+pub enum ClientBuildError {
+    /// The encrypted account database or OS vault could not be accessed.
+    #[error("account store: {0}")]
+    Auth(#[from] crate::auth::AuthError),
+    /// An upstream client could not be built.
+    #[error("upstream: {0}")]
+    Upstream(#[from] UpstreamError),
+}
+
 /// Build an upstream [`ProviderClient`] for every configured provider.
 ///
 /// # Errors
 ///
 /// Returns an error if any provider client fails to build.
-pub fn build_clients(config: &Config) -> Result<HashMap<String, ProviderClient>, UpstreamError> {
+pub fn build_clients(
+    config: &Config,
+) -> Result<HashMap<String, HashMap<String, ProviderClient>>, ClientBuildError> {
     let passthrough = config.server.passthrough_keys;
-    let auth = crate::auth::read_auth().unwrap_or_default();
+    let auth = crate::auth::read_auth()?;
     let mut map = HashMap::new();
     let mut connected = Vec::new();
     for provider in &config.providers {
-        let auth_entry = auth.get(&provider.name).cloned();
-        let client = ProviderClient::new(provider, passthrough, auth_entry)?;
-        if client.has_key() {
-            connected.push(provider.name.clone());
+        let mut accounts = HashMap::new();
+        if let Some(entries) = auth.get(&provider.name) {
+            for (alias, entry) in entries {
+                let client = ProviderClient::new_for_alias(
+                    provider,
+                    alias,
+                    passthrough,
+                    Some(entry.clone()),
+                )?;
+                if client.has_key() {
+                    connected.push(format!("{}:{alias}", provider.name));
+                }
+                accounts.insert(alias.clone(), client);
+            }
         }
-        map.insert(provider.name.clone(), client);
+        // Preserve passthrough-key support when no credentials are stored.
+        if accounts.is_empty() {
+            accounts.insert(
+                "default".to_string(),
+                ProviderClient::new(provider, passthrough, None)?,
+            );
+        }
+        map.insert(provider.name.clone(), accounts);
     }
     tracing::info!(
         target: crate::LOG_TARGET,
@@ -332,6 +368,17 @@ fn extract_session_id(headers: &HeaderMap) -> String {
         .and_then(|v| v.to_str().ok())
         .unwrap_or_default()
         .to_string()
+}
+
+fn extract_account_alias(headers: &HeaderMap) -> Result<Option<&str>, ApiError> {
+    headers
+        .get("x-local-proxy-account")
+        .map(|value| {
+            value
+                .to_str()
+                .map_err(|_| ApiError::bad_request("invalid X-Local-Proxy-Account header"))
+        })
+        .transpose()
 }
 
 // ---------------------------------------------------------------------------
@@ -520,7 +567,7 @@ fn is_connected(state: &RuntimeState, provider: &str) -> bool {
     state
         .clients
         .get(provider)
-        .is_some_and(crate::upstream::ProviderClient::has_key)
+        .is_some_and(|accounts| accounts.values().any(ProviderClient::has_key))
 }
 
 fn resolve_model(
@@ -573,8 +620,8 @@ fn resolve_model(
     };
     if !is_connected(&resolved.provider.name) {
         return Err(ApiError::bad_request(format!(
-            "model '{requested}' resolves to provider '{}' which has no API key; \
-             connect it via `local-proxy connect {}` or select a connected model",
+            "model '{requested}' resolves to provider '{}' which has no account; \
+             connect it via `local-proxy connect {} --account <alias>` or select a connected model",
             resolved.provider.name, resolved.provider.name
         )));
     }
@@ -588,8 +635,26 @@ fn resolve_model(
 fn client_for(
     state: &RuntimeState,
     provider: &crate::config::Provider,
+    alias: Option<&str>,
 ) -> Result<ProviderClient, ApiError> {
-    state.clients.get(&provider.name).cloned().ok_or_else(|| {
+    let accounts = state.clients.get(&provider.name).ok_or_else(|| {
+        ApiError::internal(format!("client not built for provider {}", provider.name))
+    })?;
+    if let Some(alias) = alias {
+        return accounts.get(alias).cloned().ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "unknown account '{alias}' for provider '{}'",
+                provider.name
+            ))
+        });
+    }
+    if accounts.len() > 1 {
+        return Err(ApiError::bad_request(format!(
+            "provider '{}' has multiple accounts; specify X-Local-Proxy-Account",
+            provider.name
+        )));
+    }
+    accounts.values().next().cloned().ok_or_else(|| {
         ApiError::internal(format!("client not built for provider {}", provider.name))
     })
 }
@@ -895,6 +960,10 @@ async fn messages_handler(
         Ok(k) => k,
         Err(e) => return error_response(&e, true),
     };
+    let account_alias = match extract_account_alias(&headers) {
+        Ok(alias) => alias,
+        Err(e) => return error_response(&e, true),
+    };
     let session_id = extract_session_id(&headers);
     if !session_id.is_empty() {
         if let Some(effort) = request_effort(&body) {
@@ -908,6 +977,7 @@ async fn messages_handler(
         &state,
         &body,
         client_key.as_deref(),
+        account_alias,
         &session_id,
     )
     .await
@@ -956,7 +1026,7 @@ fn same_format_request(format: Format, body: Value) -> Value {
 /// Serve one chat request from a `client`-format endpoint: resolve the route,
 /// translate through the IR when the upstream speaks another format, and
 /// translate the response (or stream) back.
-#[allow(clippy::too_many_lines)]
+#[allow(clippy::too_many_lines, clippy::too_many_arguments)]
 async fn handle_chat(
     client_format: Format,
     endpoint: &'static str,
@@ -964,6 +1034,7 @@ async fn handle_chat(
     state: &RuntimeState,
     body: &Bytes,
     client_key: Option<&str>,
+    account_alias: Option<&str>,
     session_id: &str,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
@@ -997,7 +1068,7 @@ async fn handle_chat(
             body["output_config"]["effort"] = json!(effort);
         }
     }
-    let client = client_for(state, &provider)?;
+    let client = client_for(state, &provider, account_alias)?;
     let upstream_format = Format::from(provider.format);
     let same = upstream_format == client_format;
 
@@ -1121,6 +1192,10 @@ async fn chat_completions_handler(
         Ok(k) => k,
         Err(e) => return error_response(&e, false),
     };
+    let account_alias = match extract_account_alias(&headers) {
+        Ok(alias) => alias,
+        Err(e) => return error_response(&e, false),
+    };
     let session_id = extract_session_id(&headers);
     match handle_chat(
         Format::Openai,
@@ -1129,6 +1204,7 @@ async fn chat_completions_handler(
         &state,
         &body,
         client_key.as_deref(),
+        account_alias,
         &session_id,
     )
     .await
@@ -1170,6 +1246,10 @@ async fn responses_handler(
         Ok(k) => k,
         Err(e) => return error_response(&e, false),
     };
+    let account_alias = match extract_account_alias(&headers) {
+        Ok(alias) => alias,
+        Err(e) => return error_response(&e, false),
+    };
     let session_id = extract_session_id(&headers);
     match handle_chat(
         Format::Responses,
@@ -1178,6 +1258,7 @@ async fn responses_handler(
         &state,
         &body,
         client_key.as_deref(),
+        account_alias,
         &session_id,
     )
     .await
@@ -1467,6 +1548,9 @@ mod tests {
 
     #[test]
     fn rebuild_merges_catalog_with_overlay_and_reapplies() {
+        // `build_runtime_state` reads the credential store: keep this test off
+        // the real config dir and out of the way of other env-mutating tests.
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .expect("clock is set")
@@ -1476,6 +1560,7 @@ mod tests {
             std::process::id()
         ));
         std::fs::create_dir_all(&dir).expect("create test dir");
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", &dir);
         let path = dir.join("config.yaml");
         std::fs::write(
             &path,
@@ -1496,6 +1581,7 @@ mod tests {
         let second = build_runtime_state(&path).expect("rebuild");
         assert!(second.config.providers.iter().any(|p| p.name == "second"));
 
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1549,14 +1635,17 @@ mod tests {
             .clone();
         clients.insert(
             "openai".to_string(),
-            crate::upstream::ProviderClient::new(
-                &openai,
-                false,
-                Some(crate::auth::AuthEntry::Api {
-                    key: "sk".to_string(),
-                }),
-            )
-            .expect("client"),
+            HashMap::from([(
+                "default".to_string(),
+                crate::upstream::ProviderClient::new(
+                    &openai,
+                    false,
+                    Some(crate::auth::AuthEntry::Api {
+                        key: "sk".to_string(),
+                    }),
+                )
+                .expect("client"),
+            )]),
         );
         let state = RuntimeState {
             config: cfg.clone(),
@@ -1616,14 +1705,17 @@ mod tests {
             .clone();
         clients.insert(
             "openai".to_string(),
-            crate::upstream::ProviderClient::new(
-                &openai,
-                false,
-                Some(crate::auth::AuthEntry::Api {
-                    key: "sk".to_string(),
-                }),
-            )
-            .expect("client"),
+            HashMap::from([(
+                "default".to_string(),
+                crate::upstream::ProviderClient::new(
+                    &openai,
+                    false,
+                    Some(crate::auth::AuthEntry::Api {
+                        key: "sk".to_string(),
+                    }),
+                )
+                .expect("client"),
+            )]),
         );
         let state = RuntimeState {
             config: cfg.clone(),
@@ -1689,14 +1781,17 @@ mod tests {
             .clone();
         clients.insert(
             "openai".to_string(),
-            crate::upstream::ProviderClient::new(
-                &openai,
-                false,
-                Some(crate::auth::AuthEntry::Api {
-                    key: "sk".to_string(),
-                }),
-            )
-            .expect("client"),
+            HashMap::from([(
+                "default".to_string(),
+                crate::upstream::ProviderClient::new(
+                    &openai,
+                    false,
+                    Some(crate::auth::AuthEntry::Api {
+                        key: "sk".to_string(),
+                    }),
+                )
+                .expect("client"),
+            )]),
         );
         let state = RuntimeState {
             config: cfg.clone(),
@@ -1751,14 +1846,17 @@ mod tests {
             .clone();
         clients.insert(
             "openai".to_string(),
-            crate::upstream::ProviderClient::new(
-                &openai,
-                false,
-                Some(crate::auth::AuthEntry::Api {
-                    key: "sk".to_string(),
-                }),
-            )
-            .expect("client"),
+            HashMap::from([(
+                "default".to_string(),
+                crate::upstream::ProviderClient::new(
+                    &openai,
+                    false,
+                    Some(crate::auth::AuthEntry::Api {
+                        key: "sk".to_string(),
+                    }),
+                )
+                .expect("client"),
+            )]),
         );
         let state = RuntimeState {
             config: cfg.clone(),
@@ -1895,6 +1993,68 @@ mod tests {
     }
 
     #[test]
+    fn account_selection_requires_alias_only_for_multiple_accounts() {
+        let provider = crate::config::Provider {
+            name: "openai".to_string(),
+            base_url: "http://127.0.0.1:9".to_string(),
+            format: ProviderFormat::Openai,
+            models: vec!["gpt-test".to_string()],
+            auto_model: None,
+            headers: HashMap::new(),
+            session_header: None,
+            oauth: None,
+        };
+        let account = |alias: &str| {
+            ProviderClient::new_for_alias(
+                &provider,
+                alias,
+                false,
+                Some(crate::auth::AuthEntry::Api {
+                    key: format!("key-{alias}"),
+                }),
+            )
+            .unwrap()
+        };
+        let cfg = Arc::new(Config {
+            providers: vec![provider.clone()],
+            ..Config::default()
+        });
+        let mut accounts = HashMap::from([("one".to_string(), account("one"))]);
+        let make_state = |accounts: HashMap<String, ProviderClient>| RuntimeState {
+            config: cfg.clone(),
+            router: Arc::new(Router::new(cfg.clone()).unwrap()),
+            clients: Arc::new(HashMap::from([("openai".to_string(), accounts)])),
+            enforce_active_model: false,
+            config_path: PathBuf::new(),
+        };
+        assert!(client_for(&make_state(accounts.clone()), &provider, None).is_ok());
+        assert!(client_for(&make_state(accounts.clone()), &provider, Some("one")).is_ok());
+        let err = client_for(&make_state(accounts.clone()), &provider, Some("missing"))
+            .expect_err("unknown alias must fail even with one account");
+        assert_eq!(err.status, 400);
+        assert!(err.message.contains("unknown account 'missing'"));
+        accounts.insert("two".to_string(), account("two"));
+        let state = make_state(accounts);
+        let err = client_for(&state, &provider, None).expect_err("ambiguous account");
+        assert_eq!(err.status, 400);
+        assert!(err.message.contains("X-Local-Proxy-Account"));
+        assert!(client_for(&state, &provider, Some("two")).is_ok());
+    }
+
+    #[test]
+    fn invalid_account_header_is_rejected() {
+        let mut headers = HeaderMap::new();
+        assert_eq!(extract_account_alias(&headers).unwrap(), None);
+        headers.insert("x-local-proxy-account", "work".parse().unwrap());
+        assert_eq!(extract_account_alias(&headers).unwrap(), Some("work"));
+        headers.insert(
+            "x-local-proxy-account",
+            axum::http::HeaderValue::from_bytes(b"\xff").unwrap(),
+        );
+        assert_eq!(extract_account_alias(&headers).unwrap_err().status, 400);
+    }
+
+    #[test]
     fn active_model_to_unconnected_provider_errors_clearly() {
         let cfg = Arc::new(Config {
             server: crate::config::Server::default(),
@@ -1925,6 +2085,6 @@ mod tests {
             config_path: PathBuf::new(),
         };
         let err = resolve_model(&state, None).expect_err("unconnected provider is an error");
-        assert!(err.message.contains("no API key"), "got: {}", err.message);
+        assert!(err.message.contains("no account"), "got: {}", err.message);
     }
 }

@@ -512,6 +512,38 @@ mod tests {
         assert_eq!(q["code"], "true");
     }
 
+    #[test]
+    fn account_id_reads_the_namespaced_claim() {
+        let b64 = |v: &Value| URL_SAFE_NO_PAD.encode(serde_json::to_vec(v).unwrap());
+        let namespaced = format!(
+            "{}.{}.sig",
+            b64(&json!({"alg": "none"})),
+            b64(&json!({
+                "https://api.openai.com/auth": { "chatgpt_account_id": "acct-777" },
+            }))
+        );
+        assert_eq!(
+            account_id_from_jwt(&namespaced, "https://api.openai.com/auth").as_deref(),
+            Some("acct-777")
+        );
+
+        // A flat claim works too; a missing claim or a malformed token yields None.
+        let flat = format!(
+            "{}.{}.sig",
+            b64(&json!({})),
+            b64(&json!({"chatgpt_account_id": "flat-1"}))
+        );
+        assert_eq!(
+            account_id_from_jwt(&flat, "whatever").as_deref(),
+            Some("flat-1")
+        );
+        assert_eq!(account_id_from_jwt("not-a-jwt", "x"), None);
+        assert_eq!(
+            account_id_from_jwt(&format!("{}.{}.sig", b64(&json!({})), b64(&json!({}))), "x"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn exchange_sends_pkce_fields_and_parses_tokens() {
         let (base, rx) =

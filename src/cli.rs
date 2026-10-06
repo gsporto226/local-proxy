@@ -763,11 +763,14 @@ pub fn logs(config_path: PathBuf, lines: usize) -> miette::Result<()> {
 #[allow(clippy::result_large_err)]
 pub fn connected_models(config_path: &Path) -> Result<Vec<String>, CliError> {
     let mut config = effective_config(config_path)?;
-    crate::upstream::discover_models(&mut config);
-    let auth = crate::auth::read_auth().unwrap_or_default();
+    crate::upstream::discover_models(&mut config).map_err(CliError::from)?;
+    let auth = crate::auth::read_auth().map_err(CliError::from)?;
     let mut models = Vec::new();
     for provider in &config.providers {
-        if !crate::upstream::provider_has_key(auth.get(&provider.name)) {
+        if !auth
+            .get(&provider.name)
+            .is_some_and(|accounts| accounts.values().any(crate::auth::AuthEntry::usable))
+        {
             continue;
         }
         for model in &provider.models {
@@ -863,9 +866,15 @@ fn effective_config(config_path: &Path) -> Result<Config, CliError> {
 pub fn connect_provider(
     config_path: &Path,
     provider: &str,
+    account: &str,
     key: Option<String>,
     oauth: bool,
 ) -> Result<String, CliError> {
+    if account.trim().is_empty() {
+        return Err(CliError::Connect {
+            message: "account alias must not be empty".to_string(),
+        });
+    }
     let effective = effective_config(config_path)?;
     let Some(found) = effective.providers.iter().find(|p| p.name == provider) else {
         return Err(CliError::Connect {
@@ -886,9 +895,9 @@ pub fn connect_provider(
             crate::config::OAuthFlow::Paste => oauth_paste_login(provider, &config)?,
             crate::config::OAuthFlow::Callback => oauth_callback_login(provider, &config)?,
         };
-        crate::auth::set_oauth(provider, &tokens).map_err(CliError::from)?;
+        crate::auth::set_oauth_for(provider, account, &tokens).map_err(CliError::from)?;
         return Ok(format!(
-            "oauth do provider '{provider}' conectado em auth.json (access token expira {})",
+            "oauth da conta '{account}' do provider '{provider}' conectado no banco criptografado (access token expira {})",
             remaining_lifetime(tokens.expires)
         ));
     }
@@ -901,8 +910,10 @@ pub fn connect_provider(
                 },
             )?,
         };
-    crate::auth::set_key(provider, key.trim()).map_err(CliError::from)?;
-    Ok(format!("chave do provider '{provider}' salva em auth.json"))
+    crate::auth::set_key_for(provider, account, key.trim()).map_err(CliError::from)?;
+    Ok(format!(
+        "chave da conta '{account}' do provider '{provider}' salva no banco criptografado"
+    ))
 }
 
 /// Run the `callback` OAuth flow for `provider`: browser login with the
@@ -979,42 +990,61 @@ fn remaining_lifetime(expires_ms: i64) -> String {
     }
 }
 
-/// Remove the stored API key for `provider` from `auth.json`. Returns the
-/// result message.
+/// Remove the stored credential for one account of `provider` from the
+/// encrypted store. Returns the result message.
 ///
 /// # Errors
 ///
 /// Returns [`CliError::Auth`] if the auth store cannot be written.
 #[allow(clippy::result_large_err)]
-pub fn disconnect_provider(config_path: &Path, provider: &str) -> Result<String, CliError> {
+pub fn disconnect_provider(
+    config_path: &Path,
+    provider: &str,
+    account: &str,
+) -> Result<String, CliError> {
     let _ = config_path;
-    let removed = crate::auth::remove_key(provider).map_err(CliError::from)?;
+    let removed = crate::auth::remove_account(provider, account).map_err(CliError::from)?;
     Ok(if removed {
-        format!("chave do provider '{provider}' removida")
+        format!("conta '{account}' do provider '{provider}' removida")
     } else {
-        format!("nenhuma chave salva para o provider '{provider}'")
+        format!("nenhuma conta '{account}' salva para o provider '{provider}'")
     })
 }
 
-/// Render the effective provider list (catalog ∪ config) with key status.
+/// Render the effective provider list (catalog ∪ config) with account aliases.
 ///
 /// # Errors
 ///
-/// Returns a [`CliError`] if the catalog or config cannot be loaded.
-#[allow(clippy::result_large_err)]
-#[allow(clippy::format_push_string)]
+/// Returns a [`CliError`] if the catalog, config, or auth store cannot be loaded.
+#[allow(clippy::result_large_err, clippy::format_push_string)]
 pub fn list_providers(config_path: &Path) -> Result<String, CliError> {
     let effective = effective_config(config_path)?;
-    let auth = crate::auth::read_auth().unwrap_or_default();
+    let auth = crate::auth::read_auth().map_err(CliError::from)?;
     let mut out = String::new();
     for p in &effective.providers {
-        let status = match auth.get(&p.name) {
-            Some(crate::auth::AuthEntry::OAuth(_)) => "oauth",
-            Some(_) => "ok",
-            None => "-",
+        let accounts = auth.get(&p.name);
+        let mut aliases: Vec<_> = accounts
+            .into_iter()
+            .flat_map(|entries| entries.iter())
+            .collect();
+        aliases.sort_unstable_by(|a, b| a.0.cmp(b.0));
+        let status = if aliases.is_empty() {
+            "-".to_string()
+        } else {
+            aliases
+                .iter()
+                .map(|(alias, entry)| {
+                    let kind = match entry {
+                        crate::auth::AuthEntry::OAuth(_) => "oauth",
+                        crate::auth::AuthEntry::Api { .. } => "api",
+                    };
+                    format!("{alias} ({kind})")
+                })
+                .collect::<Vec<_>>()
+                .join(", ")
         };
         out.push_str(&format!(
-            "{:<16} format={:<16} key={status}\n",
+            "{:<16} format={:<16} accounts={status}\n",
             p.name, p.format
         ));
     }
@@ -1182,23 +1212,25 @@ pub fn model(config_path: PathBuf, model: Option<String>) -> miette::Result<()> 
 pub fn connect(
     config_path: PathBuf,
     provider: String,
+    account: String,
     key: Option<String>,
     oauth: bool,
 ) -> miette::Result<()> {
-    let msg =
-        connect_provider(&config_path, &provider, key, oauth).map_err(miette::Report::from)?;
+    let msg = connect_provider(&config_path, &provider, &account, key, oauth)
+        .map_err(miette::Report::from)?;
     println!("{msg}");
     Ok(())
 }
 
-/// CLI entry for `disconnect`: remove the stored API key for a provider.
+/// CLI entry for `disconnect`: remove one stored provider account.
 ///
 /// # Errors
 ///
 /// Returns a [`CliError`] if the auth store cannot be written.
 #[allow(clippy::needless_pass_by_value)]
-pub fn disconnect(config_path: PathBuf, provider: String) -> miette::Result<()> {
-    let msg = disconnect_provider(&config_path, &provider).map_err(miette::Report::from)?;
+pub fn disconnect(config_path: PathBuf, provider: String, account: String) -> miette::Result<()> {
+    let msg =
+        disconnect_provider(&config_path, &provider, &account).map_err(miette::Report::from)?;
     println!("{msg}");
     Ok(())
 }
@@ -2238,6 +2270,9 @@ mod tests {
 
     #[test]
     fn config_dir_is_global() {
+        // `config_dir` reads `LOCAL_PROXY_CONFIG_DIR`; the lock keeps the two
+        // reads in the assertion consistent with tests that override it.
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         assert_eq!(config_dir(), crate::config::global_config_dir());
     }
 

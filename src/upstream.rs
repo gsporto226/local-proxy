@@ -11,8 +11,11 @@ const ANTHROPIC_VERSION: &str = "2023-06-01";
 /// Errors that can occur while building clients or talking to upstreams.
 #[derive(Debug, thiserror::Error)]
 pub enum UpstreamError {
+    /// The account store could not be read.
+    #[error("account store: {0}")]
+    Auth(#[from] crate::auth::AuthError),
     /// The provider has no API key in the auth store.
-    #[error("provider {provider} has no credentials; store a key with `local-proxy connect {provider}` or run `local-proxy connect {provider} --oauth` for a subscription")]
+    #[error("provider {provider} has no credentials; connect with `local-proxy connect {provider} --account <alias>`")]
     MissingApiKey {
         /// Name of the provider missing a key.
         provider: String,
@@ -52,6 +55,7 @@ struct OAuthState {
 #[derive(Debug, Clone)]
 pub struct ProviderClient {
     name: String,
+    alias: String,
     base_url: String,
     format: ProviderFormat,
     auth: Option<AuthEntry>,
@@ -79,6 +83,20 @@ impl ProviderClient {
         passthrough: bool,
         auth: Option<AuthEntry>,
     ) -> Result<Self, UpstreamError> {
+        Self::new_for_alias(provider, "default", passthrough, auth)
+    }
+
+    /// Build a client for a named account of `provider`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpstreamError::ClientBuild`] if the HTTP client cannot be created.
+    pub fn new_for_alias(
+        provider: &Provider,
+        alias: &str,
+        passthrough: bool,
+        auth: Option<AuthEntry>,
+    ) -> Result<Self, UpstreamError> {
         let http = reqwest::Client::builder()
             .timeout(Duration::from_mins(10))
             .build()
@@ -98,6 +116,7 @@ impl ProviderClient {
         );
         Ok(Self {
             name: provider.name.clone(),
+            alias: alias.to_string(),
             base_url: provider.base_url.trim_end_matches('/').to_string(),
             format: provider.format,
             auth,
@@ -180,7 +199,7 @@ impl ProviderClient {
             tracing::info!(target: crate::LOG_TARGET, provider = %self.name, "refreshing oauth token");
             match crate::oauth::refresh(&self.http, &guard.config, &guard.tokens).await {
                 Ok(fresh) => {
-                    if let Err(e) = crate::auth::set_oauth(&self.name, &fresh) {
+                    if let Err(e) = crate::auth::update_oauth_for(&self.name, &self.alias, &fresh) {
                         tracing::warn!(
                             target: crate::LOG_TARGET,
                             provider = %self.name,
@@ -415,33 +434,35 @@ fn inject_identity(body: &mut Value, identity: &str) {
     }
 }
 
-/// Whether `entry` can authenticate requests: a non-empty API key or OAuth
-/// tokens. Used to decide "connected" providers without building a client.
-#[must_use]
-pub fn provider_has_key(entry: Option<&AuthEntry>) -> bool {
-    entry.is_some_and(AuthEntry::usable)
-}
-
 /// Fill `models` for connected providers that don't list them explicitly.
 ///
 /// Asks each upstream's `GET /v1/models`. Providers that fail
 /// or time out are left empty. Blocks the caller (runs on its own thread and
 /// runtime, so it is safe to call from inside an async context).
-pub fn discover_models(config: &mut crate::config::Config) {
-    let auth = crate::auth::read_auth().unwrap_or_default();
+///
+/// # Errors
+/// Returns an error if the encrypted account store is inaccessible.
+pub fn discover_models(config: &mut crate::config::Config) -> Result<(), UpstreamError> {
+    let auth = crate::auth::read_auth()?;
     let targets: Vec<(usize, ProviderClient)> = config
         .providers
         .iter()
         .enumerate()
         .filter(|(_, p)| p.models.is_empty())
         .filter_map(|(i, p)| {
-            let auth_entry = auth.get(&p.name).cloned();
-            let client = ProviderClient::new(p, false, auth_entry).ok()?;
-            client.has_key().then_some((i, client))
+            // Any usable account can answer the models query; sort for a
+            // deterministic pick across runs.
+            let accounts = auth.get(&p.name)?;
+            let mut aliases: Vec<_> = accounts.iter().collect();
+            aliases.sort_unstable_by(|a, b| a.0.cmp(b.0));
+            let (alias, entry) = aliases.into_iter().find(|(_, entry)| entry.usable())?;
+            let client =
+                ProviderClient::new_for_alias(p, alias, false, Some(entry.clone())).ok()?;
+            Some((i, client))
         })
         .collect();
     if targets.is_empty() {
-        return;
+        return Ok(());
     }
     let found = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -463,6 +484,7 @@ pub fn discover_models(config: &mut crate::config::Config) {
     for (i, models) in found {
         config.providers[i].models = models;
     }
+    Ok(())
 }
 
 impl ProviderClient {
@@ -1059,6 +1081,17 @@ connection: close
         let (base, rx) = header_capture_server().await;
         let mut p = oauth_provider(token_base);
         p.base_url = base;
+        crate::auth::set_oauth_for(
+            &p.name,
+            "default",
+            &OAuthTokens {
+                access: "stale-acc".to_string(),
+                refresh: "old-ref".to_string(),
+                expires: 0,
+                account_id: None,
+            },
+        )
+        .unwrap();
         let client =
             ProviderClient::new(&p, false, Some(oauth_entry("stale-acc", "old-ref", 0))).unwrap();
         client
@@ -1075,9 +1108,12 @@ connection: close
         assert_eq!(refresh_body["grant_type"], "refresh_token");
         assert_eq!(refresh_body["refresh_token"], "old-ref");
 
-        let persisted = std::fs::read_to_string(dir.join("auth.json")).unwrap();
-        assert!(persisted.contains("fresh-acc"), "persisted: {persisted}");
-        assert!(persisted.contains("fresh-ref"));
+        let persisted = crate::auth::account_for(&p.name, "default")
+            .unwrap()
+            .unwrap();
+        let refreshed = persisted.oauth().unwrap();
+        assert_eq!(refreshed.access, "fresh-acc");
+        assert_eq!(refreshed.refresh, "fresh-ref");
 
         std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

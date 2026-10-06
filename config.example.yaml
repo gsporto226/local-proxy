@@ -6,12 +6,13 @@
 # opencode-go, zen, groq, xai, google, deepseek, openrouter, neuralwatt) and
 # their models, edit the catalog or run `local-proxy providers`.
 #
-# Provider API keys live exclusively in the global auth store (`auth.json`),
-# never in the config. Store a key with:
-#   local-proxy connect <provider> [key]
+# Provider credentials live exclusively in the global encrypted account store
+# (`accounts.db`, key in the OS credential vault), never in the config. Store
+# a key with:
+#   local-proxy connect <provider> --account <alias> [key]
 #
 # Subscription providers (ChatGPT Plus/Pro) log in with OAuth instead:
-#   local-proxy connect chatgpt --oauth
+#   local-proxy connect chatgpt --account <alias> --oauth
 
 server:
   host: 127.0.0.1

@@ -9,7 +9,7 @@ providers:
     format: anthropic
   # Claude Pro/Max (or Team/Enterprise) subscription over OAuth, separate from
   # the API-key `anthropic` provider so both can be connected at once.
-  # `local-proxy connect claude --oauth` runs the login.
+  # `local-proxy connect claude --account <alias> --oauth` runs the login.
   - name: claude
     base_url: https://api.anthropic.com
     format: anthropic
@@ -34,8 +34,8 @@ providers:
     base_url: https://api.openai.com/v1
     format: openai
   # ChatGPT Plus/Pro subscription backend (Codex). Authenticate with
-  # `local-proxy connect chatgpt --oauth` (browser PKCE with a localhost
-  # callback); it speaks the Responses API.
+  # `local-proxy connect chatgpt --account <alias> --oauth` (browser PKCE with
+  # a localhost callback); it speaks the Responses API.
   #
   # These are the Codex-catalog slugs, pinned here because the backend has no
   # `/v1/models`. They are NOT the same as the ones the chat web UI uses

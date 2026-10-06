@@ -1,6 +1,7 @@
 // End-to-end check of the `callback` OAuth login flow: a mock authorization
-// server, plus the real `local-proxy connect chatgpt --oauth` driving it,
-// verifying the code exchange and the auth.json entry it writes.
+// server, plus the real `local-proxy connect chatgpt --account default --oauth`
+// driving it, verifying the code exchange and the account it stores in the
+// encrypted credential store.
 //
 // Everything runs against a throwaway config dir (LOCAL_PROXY_CONFIG_DIR), so
 // the user's real auth store is never read or written. A config overlay points
@@ -8,12 +9,12 @@
 // test reads the authorization URL the CLI prints and fetches it, which is what
 // a browser would do.
 import { expect, test } from "bun:test";
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { spawn } from "node:child_process";
 
-import { BINARY, authStorePath, findFreePort } from "./helpers";
+import { BINARY, findFreePort, runCli } from "./helpers";
 
 // The JWT the token endpoint returns; the proxy reads the account id from this
 // claim namespace.
@@ -45,15 +46,19 @@ async function spawnLogin(configDir: string, serverPort: number) {
       account_id_claim: https://api.openai.com/auth
 `,
   );
-  const child = spawn(BINARY, ["--config", configPath, "connect", "chatgpt", "--oauth"], {
-    env: {
-      ...process.env,
-      LOCAL_PROXY_CONFIG_DIR: configDir,
-      // Do not launch a real browser; the test plays the browser's part.
-      LOCAL_PROXY_OAUTH_NO_BROWSER: "1",
+  const child = spawn(
+    BINARY,
+    ["--config", configPath, "connect", "chatgpt", "--account", "default", "--oauth"],
+    {
+      env: {
+        ...process.env,
+        LOCAL_PROXY_CONFIG_DIR: configDir,
+        // Do not launch a real browser; the test plays the browser's part.
+        LOCAL_PROXY_OAUTH_NO_BROWSER: "1",
+      },
+      stdio: ["ignore", "pipe", "pipe"],
     },
-    stdio: ["ignore", "pipe", "pipe"],
-  });
+  );
 
   // The CLI prints the authorization URL; the caller fetches it.
   let buffered = "";
@@ -124,12 +129,12 @@ test("connect --oauth stores an oauth entry with the account id from the id_toke
     expect(await exit).toBe(0);
     expect(authorizeCalls).toBe(1);
 
-    const auth = JSON.parse(readFileSync(authStorePath(configDir), "utf8"));
-    expect(auth.chatgpt.type).toBe("oauth");
-    expect(auth.chatgpt.access).toBe("access-abc");
-    expect(auth.chatgpt.refresh).toBe("refresh-xyz");
-    expect(auth.chatgpt.account_id).toBe("acct-777");
-    expect(auth.chatgpt.expires).toBeGreaterThan(Date.now());
+    const providers = await runCli(["--config", configPath, "providers"], {
+      LOCAL_PROXY_CONFIG_DIR: configDir,
+    });
+    expect(providers.exit).toBe(0);
+    expect(providers.output).toContain("chatgpt");
+    expect(providers.output).toContain("default (oauth)");
   } finally {
     server.stop(true);
     rmSync(configDir, { recursive: true, force: true });
@@ -163,8 +168,12 @@ test("connect --oauth rejects a state that does not match", async () => {
     await fetch(authorizeUrl);
 
     expect(await exit).not.toBe(0);
-    // No auth.json written on a rejected login.
-    expect(() => readFileSync(authStorePath(configDir), "utf8")).toThrow();
+    // No account stored on a rejected login.
+    const providers = await runCli(["--config", configPath, "providers"], {
+      LOCAL_PROXY_CONFIG_DIR: configDir,
+    });
+    expect(providers.output).toContain("chatgpt");
+    expect(providers.output).not.toContain("default (oauth)");
   } finally {
     server.stop(true);
     rmSync(configDir, { recursive: true, force: true });

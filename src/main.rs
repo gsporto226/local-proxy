@@ -92,6 +92,9 @@ enum Command {
     Connect {
         /// Provider name (must exist in the catalog or config)
         provider: String,
+        /// Account alias under this provider (required; e.g. personal or work)
+        #[arg(long, required = true, value_name = "ALIAS")]
+        account: String,
         /// API key; prompted hidden if omitted
         key: Option<String>,
         /// Run the provider's OAuth login flow instead of storing an API key
@@ -99,12 +102,15 @@ enum Command {
         #[arg(long)]
         oauth: bool,
     },
-    /// Remove the stored API key for a provider
+    /// Remove one stored account for a provider
     Disconnect {
         /// Provider name
         provider: String,
+        /// Account alias to remove (other accounts are preserved)
+        #[arg(long, required = true, value_name = "ALIAS")]
+        account: String,
     },
-    /// List effective providers (catalog ∪ config) with key status
+    /// List effective providers (catalog ∪ config) with account aliases
     Providers,
     /// Show usage statistics recorded from upstream requests
     Stats {
@@ -224,10 +230,13 @@ fn main() -> miette::Result<()> {
         Some(Command::Effort { level }) => cli::effort(config, level),
         Some(Command::Connect {
             provider,
+            account,
             key,
             oauth,
-        }) => cli::connect(config, provider, key, oauth),
-        Some(Command::Disconnect { provider }) => cli::disconnect(config, provider),
+        }) => cli::connect(config, provider, account, key, oauth),
+        Some(Command::Disconnect { provider, account }) => {
+            cli::disconnect(config, provider, account)
+        }
         Some(Command::Providers) => cli::providers(config),
         Some(Command::Stats { since, json }) => {
             let since = since.unwrap_or_else(|| "day".to_string());

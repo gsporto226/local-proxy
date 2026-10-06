@@ -5,6 +5,7 @@ import {
   eventNames,
   frameData,
   get,
+  isolatedConfigDir,
   parseSse,
   postJsonRetry,
   readBody,
@@ -116,7 +117,7 @@ describe.skipIf(skip)("e2e: live opencode-zen", () => {
         "OPENCODE_ZEN_KEY not set; run with the env var to exercise live tests",
       );
     }
-    proxy = await startProxy(zenConfig());
+    proxy = await startProxy(zenConfig(), undefined, isolatedConfigDir().env);
   });
 
   afterAll(() => {

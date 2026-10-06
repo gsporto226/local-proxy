@@ -15,9 +15,10 @@ Most AI tools hardcode their vendor's API shape. The reference design here is [o
 - Endpoints: `/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/health`.
 - Request and response translation plus streaming SSE, event by event, in all three directions (Anthropic to OpenAI, OpenAI to Anthropic, Responses to Anthropic and OpenAI).
 - Embedded provider catalog (`anthropic`, `claude`, `openai`, `chatgpt`, `opencode-go`, `zen`, `groq`, `xai`, `google`, `deepseek`, `openrouter`, `neuralwatt`). Your `config.yaml` only adds to it or overrides entries; it never replaces the whole list.
-- Hot reload. Editing the config or `auth.json` applies in runtime through a file watcher, no restart.
-- Auth store separate from the config (`auth.json`), modeled after opencode's `/connect`. Keys never live in the config.
-- OAuth subscription logins (`local-proxy connect claude --oauth`, `local-proxy connect chatgpt --oauth`): a provider with an `oauth:` block runs a PKCE login, stores the token bundle in `auth.json`, refreshes it automatically near expiry, and the engine stays provider-agnostic.
+- Hot reload. Editing the config or the credential store applies in runtime through a file watcher, no restart.
+- Encrypted credential store separate from the config (`accounts.db`, SQLCipher), modeled after opencode's `/connect`. The database key lives in the OS vault (Windows Credential Manager, Linux Secret Service), never in a file.
+- Multiple accounts per provider. An account is a provider plus an alias you choose, and each request selects one with the `X-Local-Proxy-Account: <alias>` header; a provider with a single account needs no header.
+- OAuth subscription logins (`local-proxy connect claude --account personal --oauth`, `local-proxy connect chatgpt --account work --oauth`): a provider with an `oauth:` block runs a PKCE login, stores the token bundle as that account, refreshes it automatically near expiry, and the engine stays provider-agnostic.
 - ChatGPT Plus/Pro support: requests go to the ChatGPT backend over the Responses API (`format: openai-responses`).
 - `$proxy` executor. When the last user message starts with `$proxy `, the proxy runs the rest as a `local-proxy` command and returns the output as the model's reply. Works with no provider connected.
 - Model routing with a clear precedence (exact route, `provider/model`, prefix, native list, default).
@@ -27,7 +28,7 @@ Most AI tools hardcode their vendor's API shape. The reference design here is [o
 
 ## Requirements
 
-- Rust stable to build from source.
+- Rust stable to build from source. SQLCipher builds a vendored OpenSSL, so a working `perl` is required at build time (Strawberry Perl on Windows).
 - Bun only for the e2e suite.
 - Release binaries are published for x86_64 only (linux, darwin, windows).
 
@@ -70,8 +71,8 @@ The binary lands in `target/release/local-proxy` (`local-proxy.exe` on Windows).
 ## Quick start
 
 ```bash
-local-proxy connect opencode-go          # prompts for the API key
-local-proxy serve                        # proxy on 127.0.0.1:8787
+local-proxy connect opencode-go --account default   # prompts for the API key
+local-proxy serve                                   # proxy on 127.0.0.1:8787
 ```
 
 Point Claude Code at it:
@@ -94,18 +95,18 @@ Claude Code sends `/v1/messages`; the proxy routes to a connected provider and t
 | `stop` | Stop the background proxy. |
 | `models` | List models from connected providers, as `provider/model`. |
 | `model [<m>]` | Show or set the active model. `model clear` unsets it. |
-| `connect <provider> [key]` | Store an API key for an existing provider. Prompts hidden if the key is omitted. `--oauth` runs the provider's OAuth login instead. |
-| `disconnect <provider>` | Remove the stored API key. |
-| `providers` | List effective providers (catalog plus config) with key status (`ok`, `oauth`, or `-`). |
+| `connect <provider> --account <alias> [key]` | Store an API key as a named account for an existing provider. Prompts hidden if the key is omitted. `--oauth` runs the provider's OAuth login instead. |
+| `disconnect <provider> --account <alias>` | Remove one stored account; other accounts of the provider are preserved. |
+| `providers` | List effective providers (catalog plus config) with their account aliases and auth kind (`api`, `oauth`, or `-`). |
 | `stats [--since day\|week\|month\|all] [--json]` | Show usage statistics from recorded requests. |
 | `statusline --session <uuid>` | Render the Claude Code status line for a session from its recorded stats. |
 | `update` | Check for and apply a newer release. |
 
 ## Configuration
 
-The provider catalog is compiled into the binary from `src/catalog.yaml`. Your config is an overlay. A provider with the same name replaces the catalog entry. A new name adds a provider. Routes and defaults defined in your config win over the catalog's. Keys come from the auth store or inline `api_key`; there is no environment variable fallback.
+The provider catalog is compiled into the binary from `src/catalog.yaml`. Your config is an overlay. A provider with the same name replaces the catalog entry. A new name adds a provider. Routes and defaults defined in your config win over the catalog's. Keys come from the account store or inline `api_key`; there is no environment variable fallback.
 
-The main config lives in the user config directory: `%APPDATA%\local-proxy\config.yaml` on Windows, `~/.config/local-proxy/config.yaml` on Unix. The runtime files (pid, log, `auth.json`, `stats.db`) live in the same directory. If the global file does not exist, the CLI creates it from a minimal embedded default and prints where it was created.
+The main config lives in the user config directory: `%APPDATA%\local-proxy\config.yaml` on Windows, `~/.config/local-proxy/config.yaml` on Unix. The runtime files (pid, log, `accounts.db`, `stats.db`) live in the same directory. If the global file does not exist, the CLI creates it from a minimal embedded default and prints where it was created.
 
 Config resolution, in order:
 
@@ -166,28 +167,38 @@ providers:
 - A provider without `auto_model` rejects `<provider>/auto` with `proxy: provider '<name>' has no auto_model configured`. Bare `auto` with no provider configured fails the same way. An exact route named `auto` always wins.
 - `local-proxy models` lists `provider/auto` for connected providers that define it, and `local-proxy model provider/auto` (or `$proxy model provider/auto`) selects and persists it.
 
-### Keys: connect and disconnect
+### Accounts: connect and disconnect
 
-Keys live in `auth.json`, never in the config. `connect` only accepts providers that already exist, in the catalog or added by your config.
+Credentials live in the encrypted account store (`accounts.db`), never in the config. An account is a provider plus an alias you choose; `connect` only accepts providers that already exist, in the catalog or added by your config.
 
 ```bash
-local-proxy connect opencode-go          # prompts hidden
-local-proxy connect opencode-go sk-xxx   # or pass it directly
-local-proxy providers                    # effective providers plus key status
-local-proxy disconnect opencode-go       # remove the key
+local-proxy connect opencode-go --account personal     # prompts hidden
+local-proxy connect opencode-go --account work sk-xxx  # or pass it directly
+local-proxy providers                                  # providers with their account aliases
+local-proxy disconnect opencode-go --account work      # remove one account
 ```
 
-Per request, the key resolution reads `auth.json[provider]`. That is the only source.
+With several accounts for the same provider, each request picks one with the `X-Local-Proxy-Account` header:
+
+```bash
+curl -H "X-Local-Proxy-Account: work" http://127.0.0.1:8787/v1/messages ...
+```
+
+When the provider has exactly one account the header may be omitted. With two or more, a missing, invalid, or unknown alias is a clear 400 error — the proxy never silently picks another account.
+
+An alias identifies one stored credential; connecting an alias that already exists is rejected, so a reconnect cannot silently replace a working credential. Disconnect it first, or use another alias.
+
+The store is a fully encrypted SQLite database (SQLCipher). The database key is random per config directory and lives in the OS vault: Windows Credential Manager, or the Linux Secret Service (GNOME Keyring, KWallet). Headless Linux needs a running, unlocked Secret Service — there is no plaintext fallback. On first use, a legacy `auth.json` is migrated as the `default` account of each provider, and the file is kept next to the database as `auth.json.migrated`.
 
 ### OAuth subscription logins
 
 A provider with an `oauth:` block accepts `connect --oauth`. The catalog ships one for Claude subscriptions (Pro, Max, Team, Enterprise), separate from the API-key `anthropic` provider so both can be connected at once:
 
 ```bash
-local-proxy connect claude --oauth
+local-proxy connect claude --account personal --oauth
 ```
 
-The command prints the authorize URL (it does not open a browser), you approve access on claude.ai, and paste the `code#state` shown on the callback page — the same flow Claude Code's own `/login` uses. The tokens land in `auth.json` as `{"type":"oauth","access":...,"refresh":...,"expires":...}`, the proxy sends `Authorization: Bearer` (never `x-api-key`) with the provider's `oauth.headers` (Anthropic beta flags), and refreshes the access token automatically one minute before expiry, persisting the new bundle. The Claude entry also injects the required `You are Claude Code, Anthropic's official CLI for Claude.` block as the first `system` entry on every request; Anthropic rejects OAuth-authenticated non-Haiku requests without it.
+The command prints the authorize URL (it does not open a browser), you approve access on claude.ai, and paste the `code#state` shown on the callback page — the same flow Claude Code's own `/login` uses. The tokens land in the account store as `{"type":"oauth","access":...,"refresh":...,"expires":...}`, the proxy sends `Authorization: Bearer` (never `x-api-key`) with the provider's `oauth.headers` (Anthropic beta flags), and refreshes the access token automatically one minute before expiry, persisting the new bundle for that account. The Claude entry also injects the required `You are Claude Code, Anthropic's official CLI for Claude.` block as the first `system` entry on every request; Anthropic rejects OAuth-authenticated non-Haiku requests without it.
 
 Nothing about Anthropic lives in the Rust code: a future OAuth provider with the same `paste` interaction is a config block alone. The login engine only needs the descriptor:
 
@@ -217,20 +228,20 @@ To run a second subscription account, define another provider with the same `oau
 
 The `chatgpt` provider uses a ChatGPT Plus/Pro subscription instead of an API key. It speaks the Responses API against the Codex backend, so any of the three client formats reach it: Claude Code (`/v1/messages`), Codex (`/v1/responses`), and opencode (`/v1/chat/completions`) are all translated.
 
-Log in once. `connect --oauth` opens the browser, runs an OAuth PKCE flow with a callback on `localhost:1455`, and writes the tokens to `auth.json`:
+Log in once. `connect --oauth` opens the browser, runs an OAuth PKCE flow with a callback on `localhost:1455`, and stores the tokens:
 
 ```bash
-local-proxy connect chatgpt --oauth
+local-proxy connect chatgpt --account default --oauth
 local-proxy model chatgpt/gpt-6-sol-medium   # select it as the active model
-local-proxy providers                        # chatgpt shows key=oauth
+local-proxy providers                        # chatgpt shows default (oauth)
 ```
 
-The access token is short-lived. It is refreshed automatically when a request finds it expired (or within 60 seconds of expiry), and the refreshed tokens are written back to `auth.json`. The `chatgpt-account-id` header the backend requires is read from the login's `id_token` and stored with the tokens.
+The access token is short-lived. It is refreshed automatically when a request finds it expired (or within 60 seconds of expiry), and the refreshed tokens are written back to the account store. The `chatgpt-account-id` header the backend requires is read from the login's `id_token` and stored with the tokens.
 
-To log out, remove the stored entry:
+To log out, remove the stored account:
 
 ```bash
-local-proxy disconnect chatgpt
+local-proxy disconnect chatgpt --account default
 ```
 
 ### Models and reasoning effort
@@ -293,7 +304,7 @@ routes:
 
 **The model the client sends in the request wins.** Each request resolves the client's model through the router — exact route, `provider/model` syntax, longest prefix, then the provider's native model list. A client model that matches none of these is rejected with `proxy: unknown model <model>`; the proxy does not silently route it elsewhere.
 
-When the client sends **no model** (or an empty one), the proxy falls back to its own override: the explicitly selected active model, else the first model from a connected provider, else an error. This override can be pinned for a specific instance with `serve --model <model>` (or `launch ... --model <model>`), which sets it in memory without persisting it. A provider counts as connected when it has a key in `auth.json`.
+When the client sends **no model** (or an empty one), the proxy falls back to its own override: the explicitly selected active model, else the first model from a connected provider, else an error. This override can be pinned for a specific instance with `serve --model <model>` (or `launch ... --model <model>`), which sets it in memory without persisting it. A provider counts as connected when it has at least one usable account in the credential store.
 
 Selection and query happen through the CLI or through `$proxy`, with the same validation logic:
 
@@ -310,7 +321,7 @@ The selection is stored in `defaults.active_model` in the config. Last write win
 
 ### Hot reload
 
-Any edit to `config.yaml` or `auth.json`, by CLI or by hand, applies in runtime through a file watcher with a 300ms debounce. No restart. One exception: `defaults.active_model` is not reread from the file. Each instance keeps the active model it set in memory.
+Any edit to `config.yaml` or the account store (`accounts.db`), by CLI or by hand, applies in runtime through a file watcher with a 300ms debounce. No restart. One exception: `defaults.active_model` is not reread from the file. Each instance keeps the active model it set in memory.
 
 ## HTTP endpoints
 
@@ -361,7 +372,7 @@ $proxy status                        # proxy status
 $proxy models                        # models from connected providers
 $proxy stats --since week            # usage statistics
 $proxy model deepseek-v4-flash       # select this instance's active model, persisted
-$proxy connect opencode-go <key>     # store the key, no interactive prompt
+$proxy connect opencode-go --account default <key>  # store the key, no interactive prompt
 ```
 
 The token, the binary, and the timeout are configurable in the `exec` block:
@@ -479,7 +490,7 @@ src/
 ├── main.rs        CLI and boot (errors with miette)
 ├── config.rs      Config, Provider, Route (headers, oauth, reasoning_effort), Defaults, overlay
 ├── catalog.rs     embedded catalog and catalog to config merge
-├── auth.rs        auth.json keys, OAuth tokens, and atomic writes
+├── auth.rs        encrypted account store (SQLCipher), OS vault key, legacy migration
 ├── oauth.rs       generic OAuth 2.0 + PKCE engine (login flows, exchange, refresh)
 ├── cli.rs         serve, launch, status, stop, models, model, connect, disconnect, providers, stats, statusline, update
 ├── router.rs      resolve_model to (provider, upstream_model, reasoning_effort)
@@ -500,7 +511,8 @@ scripts/           status line scripts (bash and PowerShell)
 ## Troubleshooting
 
 - `FreeUsageLimitError` from live tests. The free opencode-zen model is rate-limited. The tests report an environmental skip; the proxy is not at fault.
-- `Invalid API key` or 401s. The key lives in `auth.json`, not in the config. Run `local-proxy providers` to see which providers have a resolvable key, then `local-proxy connect <provider>`.
+- `Invalid API key` or 401s. The credential lives in the encrypted account store, not in the config. Run `local-proxy providers` to see the stored accounts, then `local-proxy connect <provider> --account <alias>`.
+- `OS credential vault unavailable` on Linux. The Secret Service is not running or is locked. Start and unlock GNOME Keyring (`gnome-keyring-daemon --unlock`) or KWallet; there is no plaintext fallback.
 - Port already in use. The default port is 8787. Pass `--port` to `serve`, or use `launch`, which picks a free random port.
 - Where is the config? `%APPDATA%\local-proxy\config.yaml` on Windows, `~/.config/local-proxy/config.yaml` on Unix. Override with `--config`, `LOCAL_PROXY_CONFIG`, or `LOCAL_PROXY_CONFIG_DIR`.
 - `status` says "not reachable" right after `--background`. The background process may still be starting. Check again in a second.
@@ -511,7 +523,7 @@ scripts/           status line scripts (bash and PowerShell)
 The known gaps, tracked in `docs/PENDING.md`, are not in scope for the current version:
 
 - `model` rewrites the config through serde, so manual comments and formatting in `config.yaml` are lost on that write.
-- Concurrent `connect`, `disconnect` and `login` calls can race on `auth.json`. Atomic writes prevent corruption, but there is no lock.
+- Concurrent OAuth refreshes for the same account from several proxy instances can race; the store serializes writes, but the last refresh wins.
 - The launcher keeps a single pid file, so multiple background proxies overwrite each other.
 - No retry or round-robin across keys, no rate limiting, no embeddings, no cache, no container image.
 
