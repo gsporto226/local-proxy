@@ -16,12 +16,13 @@ import {
 /**
  * Live e2e against the user's *actual* global config: the model routed by the
  * proxy is the one configured for the current user (`defaults.active_model`),
- * and the upstream key comes from the user's real `auth.json` (`opencode-go`).
- * The real `claude` CLI is pointed at the proxy via `ANTHROPIC_BASE_URL`,
- * mirroring the env `local-proxy launch` sets.
+ * and the upstream key comes from the user's real credential store
+ * (`accounts.db`, with a legacy `auth.json` migrated on first read). The real
+ * `claude` CLI is pointed at the proxy via `ANTHROPIC_BASE_URL`, mirroring the
+ * env `local-proxy launch` sets.
  *
  * Skips (environmental) when the user has not configured `opencode-go`, has no
- * stored key, or `claude` is not on PATH.
+ * stored account, or `claude` is not on PATH.
  */
 
 const T = 180000;
@@ -36,7 +37,6 @@ function globalConfigDir(): string {
 
 const userDir = globalConfigDir();
 const userConfigPath = join(userDir, "config.yaml");
-const userAuthPath = join(userDir, "auth.json");
 
 function firstApiKey(configText: string): string | undefined {
   const inline = configText.match(/api_keys\s*:\s*\[\s*["']?([^"'\]]+?)["']?\s*\]/);
@@ -69,12 +69,18 @@ if (!existsSync(userConfigPath)) {
   skipReason = `active_model not opencode-go (got ${ACTIVE_MODEL ?? "(unset)"})`;
 } else {
   try {
-    const auth = JSON.parse(readFileSync(userAuthPath, "utf8"));
-    if (!auth["opencode-go"]?.key) {
-      skipReason = "no opencode-go key in auth.json";
+    // Ask the CLI: it reads the encrypted store (and migrates a legacy
+    // `auth.json` if one is still around) without exposing the credential.
+    const check = Bun.spawnSync([BINARY, "providers"]);
+    const line = check.stdout
+      .toString()
+      .split(/\r?\n/)
+      .find((l) => l.startsWith("opencode-go"));
+    if (!line || line.includes("accounts=-")) {
+      skipReason = "no opencode-go account in the credential store";
     }
   } catch {
-    skipReason = "no/invalid auth.json";
+    skipReason = "could not read the credential store";
   }
   proxyKey = firstApiKey(userConfigText) ?? "unused";
 }
