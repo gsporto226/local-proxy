@@ -535,22 +535,62 @@ pub fn session_on(
 ///
 /// Feeds the status line's `effort` param; failures are logged and ignored.
 pub fn record_effort(session_id: &str, effort: &str) {
+    record_session_value("session_effort", "effort", session_id, effort);
+}
+
+/// Remember the model (`provider/model`) the proxy last routed `session_id`
+/// to, best-effort.
+///
+/// Feeds the status line's `model` param, so each session shows its own
+/// instance's model instead of the global `active_model`.
+pub fn record_model(session_id: &str, model: &str) {
+    record_session_value("session_model", "model", session_id, model);
+}
+
+/// The model the proxy last routed `session_id` to, if recorded.
+#[must_use]
+pub fn session_model(session_id: &str) -> Option<String> {
+    session_value("session_model", "model", session_id)
+}
+
+/// Upsert `value` for `session_id` in the one-row-per-session `table`.
+/// `table`/`column` are compile-time names, never user input.
+fn record_session_value(table: &str, column: &str, session_id: &str, value: &str) {
+    if session_id.is_empty() {
+        return;
+    }
     let res = open(&stats_db()).and_then(|conn| {
-        conn.execute_batch(
-            "CREATE TABLE IF NOT EXISTS session_effort (
-                session_id TEXT PRIMARY KEY, effort TEXT NOT NULL)",
-        )
+        conn.execute_batch(&format!(
+            "CREATE TABLE IF NOT EXISTS {table} (
+                session_id TEXT PRIMARY KEY, {column} TEXT NOT NULL)"
+        ))
         .and_then(|()| {
             conn.execute(
-                "INSERT OR REPLACE INTO session_effort VALUES (?1, ?2)",
-                [session_id, effort],
+                &format!("INSERT OR REPLACE INTO {table} VALUES (?1, ?2)"),
+                [session_id, value],
             )
         })
         .map_err(|source| StatsError::Query { source })
     });
     if let Err(e) = res {
-        tracing::warn!(target: "local_proxy", error = %e, "falhou ao registrar effort");
+        tracing::warn!(target: "local_proxy", error = %e, table, "falhou ao registrar valor da sessao");
     }
+}
+
+/// The value stored for `session_id` in `table`, if any.
+fn session_value(table: &str, column: &str, session_id: &str) -> Option<String> {
+    let path = stats_db();
+    if session_id.is_empty() || !path.exists() {
+        return None;
+    }
+    open(&path)
+        .ok()?
+        .query_row(
+            &format!("SELECT {column} FROM {table} WHERE session_id = ?1"),
+            [session_id],
+            |r| r.get(0),
+        )
+        .ok()
 }
 
 /// Remember the latest subscription usage percents (5h, weekly), best-effort.
@@ -594,18 +634,7 @@ pub fn rate_limits() -> Option<(f64, f64)> {
 /// The reasoning effort `session_id` last requested, if recorded.
 #[must_use]
 pub fn session_effort(session_id: &str) -> Option<String> {
-    let path = stats_db();
-    if session_id.is_empty() || !path.exists() {
-        return None;
-    }
-    open(&path)
-        .ok()?
-        .query_row(
-            "SELECT effort FROM session_effort WHERE session_id = ?1",
-            [session_id],
-            |r| r.get(0),
-        )
-        .ok()
+    session_value("session_effort", "effort", session_id)
 }
 
 /// Sum of reported cost (USD) over a time window, or `None` when the database
