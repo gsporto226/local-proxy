@@ -421,6 +421,16 @@ fn extract_session_id(headers: &HeaderMap) -> String {
         .to_string()
 }
 
+/// Extract the inbound `User-Agent`, forwarded upstream so Anthropic sees the
+/// real Claude Code version instead of the catalog's fallback.
+#[must_use]
+fn extract_user_agent(headers: &HeaderMap) -> Option<String> {
+    headers
+        .get(header::USER_AGENT)
+        .and_then(|v| v.to_str().ok())
+        .map(str::to_string)
+}
+
 fn extract_account_alias(headers: &HeaderMap) -> Result<Option<&str>, ApiError> {
     headers
         .get("x-local-proxy-account")
@@ -1101,6 +1111,7 @@ async fn messages_handler(
             stats::record_effort(&session_id, &effort);
         }
     }
+    let user_agent = extract_user_agent(&headers);
     match handle_chat(
         Format::Anthropic,
         "/v1/messages",
@@ -1110,6 +1121,7 @@ async fn messages_handler(
         client_key.as_deref(),
         account_alias,
         &session_id,
+        user_agent.as_deref(),
     )
     .await
     {
@@ -1167,6 +1179,7 @@ async fn handle_chat(
     client_key: Option<&str>,
     account_alias: Option<&str>,
     session_id: &str,
+    user_agent: Option<&str>,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
     let mut body = parse_body(body)?;
@@ -1220,7 +1233,13 @@ async fn handle_chat(
     );
 
     let resp = client
-        .chat_request(client.default_path(), upstream_body, client_key, session_id)
+        .chat_request(
+            client.default_path(),
+            upstream_body,
+            client_key,
+            session_id,
+            user_agent,
+        )
         .await
         .map_err(ApiError::from)?;
     let status = resp.status().as_u16();
@@ -1329,6 +1348,7 @@ async fn chat_completions_handler(
         Err(e) => return error_response(&e, false),
     };
     let session_id = extract_session_id(&headers);
+    let user_agent = extract_user_agent(&headers);
     match handle_chat(
         Format::Openai,
         "/v1/chat/completions",
@@ -1338,6 +1358,7 @@ async fn chat_completions_handler(
         client_key.as_deref(),
         account_alias,
         &session_id,
+        user_agent.as_deref(),
     )
     .await
     {
@@ -1383,6 +1404,7 @@ async fn responses_handler(
         Err(e) => return error_response(&e, false),
     };
     let session_id = extract_session_id(&headers);
+    let user_agent = extract_user_agent(&headers);
     match handle_chat(
         Format::Responses,
         "/v1/responses",
@@ -1392,6 +1414,7 @@ async fn responses_handler(
         client_key.as_deref(),
         account_alias,
         &session_id,
+        user_agent.as_deref(),
     )
     .await
     {

@@ -28,7 +28,9 @@ providers:
       headers:
         anthropic-beta: oauth-2025-04-20,claude-code-20250219
         x-app: cli
-        user-agent: claude-cli/2.1.0 (external, cli)
+        # Fallback only: requests from Claude Code forward their own
+        # `claude-cli/<version>` User-Agent, which Anthropic gates new models on.
+        user-agent: claude-cli/2.1.292 (external, cli)
       identity: "You are Claude Code, Anthropic's official CLI for Claude."
   - name: openai
     base_url: https://api.openai.com/v1

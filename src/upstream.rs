@@ -1,7 +1,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE};
+use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
 use serde_json::{json, Value};
 
 use crate::auth::{AuthEntry, OAuthTokens};
@@ -263,6 +263,10 @@ impl ProviderClient {
     /// `x-api-key`, apply their `oauth.headers`, and get the configured
     /// identity block prepended to `system` (an Anthropic requirement).
     ///
+    /// `client_user_agent` is the inbound request's `User-Agent`. When it
+    /// identifies Claude Code it replaces the provider's configured one, so
+    /// the version Anthropic sees always tracks the real client.
+    ///
     /// # Errors
     ///
     /// Returns [`UpstreamError::MissingApiKey`] if no credential is available,
@@ -275,6 +279,7 @@ impl ProviderClient {
         mut body: Value,
         client_key: Option<&str>,
         session_id: &str,
+        client_user_agent: Option<&str>,
     ) -> Result<reqwest::Response, UpstreamError> {
         let is_oauth = matches!(self.auth, Some(AuthEntry::OAuth(_)));
         let oauth_access = if is_oauth {
@@ -370,6 +375,13 @@ impl ProviderClient {
                 continue;
             };
             headers.insert(name, value);
+        }
+        // Anthropic gates models on the Claude Code client version it reads from
+        // `User-Agent`; forward the real client's instead of a stale catalog one.
+        if let Some(ua) = client_user_agent.filter(|u| u.starts_with("claude-cli/")) {
+            if let Ok(value) = HeaderValue::from_str(ua) {
+                headers.insert(USER_AGENT, value);
+            }
         }
 
         tracing::debug!(
@@ -620,7 +632,7 @@ mod tests {
         let client =
             ProviderClient::new(&provider(ProviderFormat::Anthropic), false, None).unwrap();
         let err = client
-            .chat_request("/v1/messages", json!({}), None, "")
+            .chat_request("/v1/messages", json!({}), None, "", None)
             .await
             .unwrap_err();
         assert!(matches!(err, UpstreamError::MissingApiKey { .. }));
@@ -723,7 +735,7 @@ mod tests {
         ]);
         let client = ProviderClient::new(&p, false, Some(api_key("key"))).unwrap();
         client
-            .chat_request("/v1/chat/completions", json!({}), None, "")
+            .chat_request("/v1/chat/completions", json!({}), None, "", None)
             .await
             .unwrap();
 
@@ -753,7 +765,7 @@ mod tests {
         p.session_header = Some("x-opencode-session".to_string());
         let client = ProviderClient::new(&p, false, Some(api_key("key"))).unwrap();
         client
-            .chat_request("/v1/chat/completions", json!({}), None, "sess-1")
+            .chat_request("/v1/chat/completions", json!({}), None, "sess-1", None)
             .await
             .unwrap();
 
@@ -780,7 +792,7 @@ mod tests {
         )]);
         let client = ProviderClient::new(&p, false, Some(api_key("key"))).unwrap();
         client
-            .chat_request("/v1/chat/completions", json!({}), None, "")
+            .chat_request("/v1/chat/completions", json!({}), None, "", None)
             .await
             .unwrap();
 
@@ -788,6 +800,50 @@ mod tests {
         assert_eq!(
             received.get("authorization").and_then(|v| v.to_str().ok()),
             Some("Bearer custom")
+        );
+    }
+
+    #[tokio::test]
+    #[allow(clippy::await_holding_lock)]
+    async fn claude_client_user_agent_replaces_catalog_fallback() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+
+        let (base, rx) = header_capture_server().await;
+        let mut p = provider(ProviderFormat::Anthropic);
+        p.base_url = base;
+        p.headers = std::collections::HashMap::from([(
+            "user-agent".to_string(),
+            "claude-cli/2.1.0 (external, cli)".to_string(),
+        )]);
+        let client = ProviderClient::new(&p, false, Some(api_key("key"))).unwrap();
+        client
+            .chat_request(
+                "/v1/messages",
+                json!({}),
+                None,
+                "",
+                Some("claude-cli/9.9.9 (external, cli)"),
+            )
+            .await
+            .unwrap();
+        let received = rx.await.unwrap();
+        assert_eq!(
+            received.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("claude-cli/9.9.9 (external, cli)")
+        );
+
+        // Anything that is not Claude Code keeps the catalog's value.
+        let (base2, rx2) = header_capture_server().await;
+        p.base_url = base2;
+        let client = ProviderClient::new(&p, false, Some(api_key("key"))).unwrap();
+        client
+            .chat_request("/v1/messages", json!({}), None, "", Some("curl/8.5.0"))
+            .await
+            .unwrap();
+        let received = rx2.await.unwrap();
+        assert_eq!(
+            received.get("user-agent").and_then(|v| v.to_str().ok()),
+            Some("claude-cli/2.1.0 (external, cli)")
         );
     }
 
@@ -1035,7 +1091,7 @@ connection: close
             "messages": []
         });
         client
-            .chat_request("/v1/messages", body, Some("client-key"), "")
+            .chat_request("/v1/messages", body, Some("client-key"), "", None)
             .await
             .unwrap();
 
@@ -1095,7 +1151,7 @@ connection: close
         let client =
             ProviderClient::new(&p, false, Some(oauth_entry("stale-acc", "old-ref", 0))).unwrap();
         client
-            .chat_request("/v1/messages", json!({}), None, "")
+            .chat_request("/v1/messages", json!({}), None, "", None)
             .await
             .unwrap();
 
