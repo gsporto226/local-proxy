@@ -12,6 +12,9 @@ pub const LOG_TARGET: &str = "local_proxy";
 /// Command-line interface implementation.
 pub mod cli;
 
+/// Loopback-only admin API (`/admin/*`) and its event stream.
+pub mod admin;
+
 /// Global API-key store.
 pub mod auth;
 

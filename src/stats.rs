@@ -161,12 +161,26 @@ pub fn record(started: Instant, stat: StatLine) {
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
     let path = stats_db();
-    if let Err(e) = write_line(&path, &stat, ts, latency_ms) {
-        tracing::warn!(
+    match write_line(&path, &stat, ts, latency_ms) {
+        Ok(()) => crate::admin::emit(
+            "request",
+            serde_json::json!({
+                "ts": ts,
+                "provider": stat.provider,
+                "model": stat.model,
+                "input_tokens": stat.input_tokens,
+                "output_tokens": stat.output_tokens,
+                "status": stat.status,
+                "latency_ms": latency_ms,
+                "cost_usd": stat.cost.and_then(|c| c.request_cost_usd),
+                "session_id": stat.session_id,
+            }),
+        ),
+        Err(e) => tracing::warn!(
             target: "local_proxy",
             error = %e,
             "falhou ao registrar stats (dados não persistidos)"
-        );
+        ),
     }
 }
 
@@ -453,7 +467,7 @@ fn where_clause(window: TimeWindow) -> (String, Vec<rusqlite::types::Value>) {
 }
 
 /// Aggregated figures for a single client session (drives the status line).
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SessionStats {
     /// Number of recorded requests in the session.
     pub requests: u64,
@@ -574,6 +588,7 @@ pub fn record_rate_limits(h5: f64, week: f64) {
     if let Err(e) = res {
         tracing::warn!(target: "local_proxy", error = %e, "falhou ao registrar rate limits");
     }
+    crate::admin::emit("rate_limits", serde_json::json!({ "h5": h5, "week": week }));
 }
 
 /// The latest recorded subscription usage percents `(5h, weekly)`, if any.

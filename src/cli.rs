@@ -373,7 +373,10 @@ pub async fn serve(
     }
 
     let host = host_flag.unwrap_or_else(|| runtime.config.server.host.clone());
-    let port = port_flag.unwrap_or(runtime.config.server.port);
+    let port = port_flag
+        .or_else(|| std::env::var("LOCAL_PROXY_PORT").ok()?.parse().ok())
+        .unwrap_or(runtime.config.server.port);
+    crate::admin::set_port(port);
     let addr = format!("{host}:{port}");
 
     let state = AppState::new(runtime);
@@ -387,7 +390,11 @@ pub async fn serve(
         write_pid(std::process::id()).map_err(CliError::from)?;
     }
     tracing::info!(target: crate::LOG_TARGET, %addr, "listening");
-    let result = axum::serve(listener, app).await;
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await;
     if !ephemeral {
         remove_pid();
     }
@@ -396,6 +403,7 @@ pub async fn serve(
 }
 
 fn init_tracing() {
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| format!("{}={},tower_http=debug", crate::LOG_TARGET, "debug").into());
 
@@ -410,14 +418,11 @@ fn init_tracing() {
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true);
-    match file_writer {
-        Ok(file) => {
-            use tracing_subscriber::fmt::writer::MakeWriterExt;
-            let _ = builder.with_writer(std::io::stdout.and(file)).try_init();
-        }
-        Err(_) => {
-            let _ = builder.try_init();
-        }
+    let console = std::io::stdout.and(crate::admin::LogTap::default);
+    if let Ok(file) = file_writer {
+        let _ = builder.with_writer(console.and(file)).try_init();
+    } else {
+        let _ = builder.with_writer(console).try_init();
     }
 }
 
@@ -440,6 +445,7 @@ pub fn launch_environment(
         .cloned()
         .unwrap_or_else(|| "unused".to_string());
     let mut env = vec![
+        ("LOCAL_PROXY_PORT".to_string(), port.to_string()),
         ("ANTHROPIC_BASE_URL".to_string(), base),
         ("ANTHROPIC_API_KEY".to_string(), auth.clone()),
         ("ANTHROPIC_AUTH_TOKEN".to_string(), auth),
@@ -1011,35 +1017,84 @@ pub fn disconnect_provider(
     })
 }
 
-/// Render the effective provider list (catalog ∪ config) with account aliases.
+/// One stored account of a provider, as listed by `providers`/`account` and
+/// `GET /admin/accounts`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountInfo {
+    /// Provider name.
+    pub provider: String,
+    /// Account alias.
+    pub alias: String,
+    /// Credential kind: `api` or `oauth`.
+    pub kind: &'static str,
+    /// Whether this alias is the persisted default (`defaults.active_accounts`).
+    pub is_default: bool,
+}
+
+/// One effective provider (catalog and config) with its stored accounts.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderInfo {
+    /// Provider name.
+    pub name: String,
+    /// Wire format of the provider.
+    pub format: String,
+    /// Stored accounts, sorted by alias.
+    pub accounts: Vec<AccountInfo>,
+}
+
+/// The effective providers with their stored accounts, shared by the
+/// `providers`/`account` CLI output and the admin API.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the catalog, config, or auth store cannot be loaded.
+#[allow(clippy::result_large_err)]
+pub fn provider_accounts(config_path: &Path) -> Result<Vec<ProviderInfo>, CliError> {
+    let config = effective_config(config_path)?;
+    let auth = crate::auth::read_auth().map_err(CliError::from)?;
+    Ok(config
+        .providers
+        .iter()
+        .map(|p| {
+            let mut accounts: Vec<AccountInfo> = auth
+                .get(&p.name)
+                .into_iter()
+                .flat_map(|entries| entries.iter())
+                .map(|(alias, entry)| AccountInfo {
+                    provider: p.name.clone(),
+                    alias: alias.clone(),
+                    kind: match entry {
+                        crate::auth::AuthEntry::OAuth(_) => "oauth",
+                        crate::auth::AuthEntry::Api { .. } => "api",
+                    },
+                    is_default: config.defaults.active_accounts.get(&p.name) == Some(alias),
+                })
+                .collect();
+            accounts.sort_unstable_by(|a, b| a.alias.cmp(&b.alias));
+            ProviderInfo {
+                name: p.name.clone(),
+                format: p.format.to_string(),
+                accounts,
+            }
+        })
+        .collect())
+}
+
+/// Render the effective provider list (catalog and config) with account aliases.
 ///
 /// # Errors
 ///
 /// Returns a [`CliError`] if the catalog, config, or auth store cannot be loaded.
 #[allow(clippy::result_large_err, clippy::format_push_string)]
 pub fn list_providers(config_path: &Path) -> Result<String, CliError> {
-    let effective = effective_config(config_path)?;
-    let auth = crate::auth::read_auth().map_err(CliError::from)?;
     let mut out = String::new();
-    for p in &effective.providers {
-        let accounts = auth.get(&p.name);
-        let mut aliases: Vec<_> = accounts
-            .into_iter()
-            .flat_map(|entries| entries.iter())
-            .collect();
-        aliases.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        let status = if aliases.is_empty() {
+    for p in provider_accounts(config_path)? {
+        let status = if p.accounts.is_empty() {
             "-".to_string()
         } else {
-            aliases
+            p.accounts
                 .iter()
-                .map(|(alias, entry)| {
-                    let kind = match entry {
-                        crate::auth::AuthEntry::OAuth(_) => "oauth",
-                        crate::auth::AuthEntry::Api { .. } => "api",
-                    };
-                    format!("{alias} ({kind})")
-                })
+                .map(|a| format!("{} ({})", a.alias, a.kind))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -1288,28 +1343,16 @@ pub fn providers(config_path: PathBuf) -> miette::Result<()> {
 /// Returns a [`CliError`] if the catalog, config, or auth store cannot be loaded.
 #[allow(clippy::result_large_err, clippy::format_push_string)]
 pub fn list_accounts(config_path: &Path) -> Result<String, CliError> {
-    let config = effective_config(config_path)?;
-    let auth = crate::auth::read_auth().map_err(CliError::from)?;
     let mut out = String::new();
-    for provider in &config.providers {
-        let Some(accounts) = auth.get(&provider.name) else {
-            continue;
-        };
-        let mut aliases: Vec<_> = accounts.iter().collect();
-        aliases.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        for (alias, entry) in aliases {
-            let kind = match entry {
-                crate::auth::AuthEntry::OAuth(_) => "oauth",
-                crate::auth::AuthEntry::Api { .. } => "api",
-            };
-            let active = config
-                .defaults
-                .active_accounts
-                .get(&provider.name)
-                .is_some_and(|selected| selected == alias);
-            let marker = if active { " [ativa]" } else { "" };
-            out.push_str(&format!("{}/{alias} ({kind}){marker}\n", provider.name));
-        }
+    for a in provider_accounts(config_path)?
+        .into_iter()
+        .flat_map(|p| p.accounts)
+    {
+        let marker = if a.is_default { " [ativa]" } else { "" };
+        out.push_str(&format!(
+            "{}/{} ({}){marker}\n",
+            a.provider, a.alias, a.kind
+        ));
     }
     if out.is_empty() {
         return Ok(
@@ -1594,15 +1637,18 @@ pub fn statusline_setup(config_path: PathBuf, settings: Option<PathBuf>) -> miet
 #[allow(clippy::needless_pass_by_value, clippy::cast_possible_wrap)]
 pub fn stats(config_path: PathBuf, since: String, json: bool) -> miette::Result<()> {
     let _ = config_path;
+    if json {
+        match stats_json(&since)? {
+            Some(out) => println!("{out}"),
+            None => println!(
+                "nenhuma estatística registrada ainda (a primeira requisição proxy cria o banco)"
+            ),
+        }
+        return Ok(());
+    }
     // `window_seconds` returning `None` is only reachable for `all`, which the
     // clap value parser guarantees is the sentinel for "no time filter".
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let window = crate::stats::TimeWindow {
-        since: window_seconds(&since).map(|s| now - s),
-    };
-
+    let window = stats_window(&since);
     let summary = crate::stats::summary(window).map_err(CliError::from)?;
     let by_provider = crate::stats::by_provider(window).map_err(CliError::from)?;
     let recent = crate::stats::recent(window, 10).map_err(CliError::from)?;
@@ -1612,14 +1658,44 @@ pub fn stats(config_path: PathBuf, since: String, json: bool) -> miette::Result<
         return Ok(());
     };
 
-    let by_provider = by_provider.unwrap_or_default();
-    let recent = recent.unwrap_or_default();
-    if json {
-        render_stats_json(&summary, &by_provider, &recent);
-    } else {
-        render_stats_text(&summary, &by_provider, &recent);
-    }
+    render_stats_text(
+        &summary,
+        &by_provider.unwrap_or_default(),
+        &recent.unwrap_or_default(),
+    );
     Ok(())
+}
+
+/// The `stats --json` report for `since` (`day|week|month|all`), or `None`
+/// when no stats have been recorded yet. Shared with `GET /admin/stats`.
+///
+/// # Errors
+///
+/// Returns [`CliError::Stats`] if the stats database cannot be read.
+#[allow(clippy::result_large_err)]
+pub fn stats_json(since: &str) -> Result<Option<serde_json::Value>, CliError> {
+    let window = stats_window(since);
+    let Some(summary) = crate::stats::summary(window).map_err(CliError::from)? else {
+        return Ok(None);
+    };
+    let by_provider = crate::stats::by_provider(window)
+        .map_err(CliError::from)?
+        .unwrap_or_default();
+    let recent = crate::stats::recent(window, 10)
+        .map_err(CliError::from)?
+        .unwrap_or_default();
+    Ok(Some(render_stats_json(&summary, &by_provider, &recent)))
+}
+
+/// The `--since` window ending now (`all` or unknown means no filter).
+#[allow(clippy::cast_possible_wrap)]
+fn stats_window(since: &str) -> crate::stats::TimeWindow {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    crate::stats::TimeWindow {
+        since: window_seconds(since).map(|s| now - s),
+    }
 }
 
 /// Render the human-readable stats report.
@@ -1694,7 +1770,7 @@ fn render_stats_json(
     summary: &crate::stats::RowSummary,
     by_provider: &[crate::stats::ProviderStats],
     recent: &[crate::stats::RequestRow],
-) {
+) -> serde_json::Value {
     let summary_json = serde_json::json!({
         "requests": summary.requests,
         "input_tokens": summary.input_tokens,
@@ -1742,12 +1818,11 @@ fn render_stats_json(
             v
         })
         .collect();
-    let out = serde_json::json!({
+    serde_json::json!({
         "summary": summary_json,
         "providers": providers_json,
         "recent": recent_json,
-    });
-    println!("{out}");
+    })
 }
 
 /// Resolve the config path from an explicit flag, the environment, the current
