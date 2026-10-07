@@ -466,7 +466,7 @@ fn where_clause(window: TimeWindow) -> (String, Vec<rusqlite::types::Value>) {
     )
 }
 
-/// Aggregated figures for a single client session (drives the status line).
+/// Aggregated figures for a single client session (served by `/admin`).
 #[derive(Debug, Clone, Default, serde::Serialize)]
 pub struct SessionStats {
     /// Number of recorded requests in the session.
@@ -547,7 +547,7 @@ pub fn session_on(
 
 /// Remember the reasoning effort `session_id` last requested, best-effort.
 ///
-/// Feeds the status line's `effort` param; failures are logged and ignored.
+/// Served by `/admin` per session; failures are logged and ignored.
 pub fn record_effort(session_id: &str, effort: &str) {
     let res = open(&stats_db()).and_then(|conn| {
         conn.execute_batch(
@@ -569,8 +569,7 @@ pub fn record_effort(session_id: &str, effort: &str) {
 
 /// Remember the latest subscription usage percents (5h, weekly), best-effort.
 ///
-/// Account-wide, so a single row; feeds the status line's `rate_5h` and
-/// `rate_week` params. Failures are logged and ignored.
+/// Account-wide, so a single row; served by `/admin`. Failures are logged and ignored.
 pub fn record_rate_limits(h5: f64, week: f64) {
     let res = open(&stats_db()).and_then(|conn| {
         conn.execute_batch(
@@ -621,31 +620,6 @@ pub fn session_effort(session_id: &str) -> Option<String> {
             |r| r.get(0),
         )
         .ok()
-}
-
-/// Sum of reported cost (USD) over a time window, or `None` when the database
-/// does not exist. Used for the month/total cost params in the status line.
-///
-/// # Errors
-///
-/// Returns a [`StatsError::Open`] if the database cannot be opened or a
-/// [`StatsError::Query`] if the query fails.
-pub fn cost_over(window: TimeWindow) -> Result<Option<f64>, StatsError> {
-    let path = stats_db();
-    if !path.exists() {
-        return Ok(None);
-    }
-    let conn = open(&path)?;
-    let (wsql, params) = where_clause(window);
-    let mut stmt = conn
-        .prepare(&format!(
-            "SELECT COALESCE(SUM(cost_usd_um),0) FROM requests {wsql}"
-        ))
-        .map_err(|source| StatsError::Query { source })?;
-    let sum = stmt
-        .query_row(rusqlite::params_from_iter(params), |r| r.get::<_, i64>(0))
-        .map_err(|source| StatsError::Query { source })?;
-    Ok(Some(sum as f64 / 1_000_000.0))
 }
 
 #[cfg(test)]

@@ -238,16 +238,6 @@ pub struct Defaults {
     pub active_accounts: HashMap<String, String>,
 }
 
-/// Template for the Claude Code status line, rendered by `local-proxy
-/// statusline`. The script is a sandboxed Rhai expression evaluated inside the
-/// proxy against the current session's recorded stats.
-#[derive(Debug, Clone, Default, Deserialize, Serialize)]
-#[serde(default)]
-pub struct StatuslineConfig {
-    /// The Rhai template. A `--template` CLI flag overrides this value.
-    pub template: Option<String>,
-}
-
 /// Top-level parsed configuration.
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -262,9 +252,6 @@ pub struct Config {
     pub defaults: Defaults,
     /// `$proxy` local-command-execution settings.
     pub exec: Exec,
-    /// Status line template for the Claude Code status line.
-    #[serde(default)]
-    pub statusline: StatuslineConfig,
 }
 
 /// Errors that can occur while loading, parsing, or creating configuration.

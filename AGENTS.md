@@ -88,7 +88,7 @@ std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
 ```
 
 O lock serializa todos os testes que mexem no env (config.rs, upstream.rs,
-handlers.rs, cli.rs, statusline.rs). Como defesa extra, `auth::with_db` falha
+handlers.rs, cli.rs). Como defesa extra, `auth::with_db` falha
 em `cfg(test)` sem `LOCAL_PROXY_CONFIG_DIR`: um teste esquecido falha alto em
 vez de migrar o store real — foi assim que o `auth.json` do usuário foi
 migrado por engano em 06/10/2026 (teste

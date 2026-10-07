@@ -8,8 +8,6 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::collections::HashMap;
-
 use miette::Diagnostic;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -95,11 +93,6 @@ pub enum CliError {
         help("check the config file and the embedded catalog are valid")
     )]
     Runtime(#[from] crate::handlers::RuntimeError),
-
-    /// The status line could not be set up (script/settings write failed).
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    StatuslineSetup(#[from] crate::statusline::SetupError),
 
     /// The local usage statistics could not be read.
     #[error("failed to read usage statistics")]
@@ -550,25 +543,6 @@ fn start_ephemeral_proxy(
     Ok(child)
 }
 
-/// `--settings` JSON that overrides Claude's status line with
-/// `local-proxy statusline`, which reads Claude's status JSON from stdin.
-///
-/// Paths use forward slashes since Claude runs the command through a POSIX
-/// shell (Git Bash on Windows). `None` if the current exe path is unknown.
-fn claude_statusline_settings(config_path: &Path, model: Option<&str>) -> Option<String> {
-    let slash = |p: &Path| p.display().to_string().replace('\\', "/");
-    let exe = std::env::current_exe().ok()?;
-    let mut command = format!(
-        "\"{}\" statusline --config \"{}\"",
-        slash(&exe),
-        slash(config_path)
-    );
-    if let Some(m) = model.filter(|m| !m.is_empty()) {
-        command = format!("{command} --model \"{m}\"");
-    }
-    Some(serde_json::json!({ "statusLine": { "type": "command", "command": command } }).to_string())
-}
-
 /// Launch the given CLI tool against this proxy, starting the proxy in the
 /// background first if it is not already serving.
 ///
@@ -642,12 +616,6 @@ pub fn launch(
     if yes && tool_cmd != "cursor" {
         cmd.arg("--yes");
     }
-    // The Claude Code mod draws its own status line; only inject ours without it.
-    if tool_cmd == "claude" && !claude_mod_enabled() {
-        if let Some(settings) = claude_statusline_settings(&config_path, model) {
-            cmd.arg("--settings").arg(settings);
-        }
-    }
     cmd.args(&args);
     let status = cmd.status().map_err(|e| CliError::Tool {
         message: format!("failed to spawn '{tool_cmd}' (is it installed and on PATH?): {e}"),
@@ -666,25 +634,6 @@ pub fn launch(
 
 /// Marketplace (and plugin) name declared in `.claude-plugin/marketplace.json`.
 const CLAUDE_MARKETPLACE: &str = "local-proxy";
-
-/// Whether the `local-proxy` Claude Code mod is enabled in the user's
-/// `settings.json` (`claude plugin install` adds it to `enabledPlugins`).
-fn claude_mod_enabled() -> bool {
-    crate::statusline::claude_settings_path()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .is_some_and(|s| mod_enabled_in(&s))
-}
-
-fn mod_enabled_in(settings: &str) -> bool {
-    serde_json::from_str::<serde_json::Value>(settings)
-        .ok()
-        .and_then(|v| v.get("enabledPlugins")?.as_object().cloned())
-        .is_some_and(|m| {
-            m.iter().any(|(k, v)| {
-                k.split('@').next() == Some(CLAUDE_MARKETPLACE) && v.as_bool() == Some(true)
-            })
-        })
-}
 
 /// `owner/repo` GitHub slug derived from the `repository` field in Cargo.toml.
 fn repo_slug() -> &'static str {
@@ -1511,189 +1460,6 @@ fn window_seconds(kind: &str) -> Option<i64> {
     }
 }
 
-/// Render the status line for a client session from its recorded stats.
-///
-/// The script (typically the status line command configured in Claude Code's
-/// `settings.json`) passes this session's `session_id` plus optional `model`
-/// and `context_pct` fields from the status line JSON; the proxy computes the
-/// numeric params from `stats.db` and evaluates the template (from `--template`
-/// or the config `statusline:` block) against them. Formatting is entirely up
-/// to the template — the proxy exposes raw values only.
-///
-/// # Errors
-///
-/// Returns [`CliError::Stats`] if the stats database cannot be read.
-#[allow(clippy::needless_pass_by_value, clippy::cast_possible_wrap)]
-pub fn statusline(
-    config_path: PathBuf,
-    session: Option<String>,
-    model: Option<String>,
-    context_pct: Option<f64>,
-    template_flag: Option<String>,
-    setup: bool,
-    settings: Option<PathBuf>,
-) -> miette::Result<()> {
-    if setup {
-        return statusline_setup(config_path, settings);
-    }
-    // Resolve the template: flag > config `statusline:` block. If neither is
-    // set, we fall back to an adaptive default built from the params that have
-    // data (see below), instead of a fixed string showing `?` everywhere.
-    let config = effective_config(&config_path)?;
-
-    // Claude Code pipes its status-line JSON on stdin when it runs the command
-    // directly (as `launch claude` configures it); a terminal means no JSON.
-    let claude_params = {
-        use std::io::{IsTerminal, Read};
-        let mut raw = String::new();
-        if std::io::stdin().is_terminal() {
-            Vec::new()
-        } else {
-            let _ = std::io::stdin().read_to_string(&mut raw);
-            serde_json::from_str::<serde_json::Value>(&raw)
-                .map(|v| crate::statusline::params_from_claude_json(&v))
-                .unwrap_or_default()
-        }
-    };
-    let session = session
-        .or_else(|| {
-            claude_params
-                .iter()
-                .find(|(k, _)| k == "session_id")
-                .map(|(_, v)| v.clone())
-        })
-        .unwrap_or_default();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let month_window = crate::stats::TimeWindow {
-        since: window_seconds("month").map(|s| now - s),
-    };
-    let all_window = crate::stats::TimeWindow { since: None };
-
-    let sess = crate::stats::session(&session).map_err(CliError::from)?;
-    let cost_month = crate::stats::cost_over(month_window).map_err(CliError::from)?;
-    let cost_total = crate::stats::cost_over(all_window).map_err(CliError::from)?;
-
-    // Build the param map. Every known name is bound (defaulting to the
-    // no-data marker) so a template referencing any of them never errors on an
-    // unbound variable; present values replace the marker.
-    let mut params: HashMap<String, String> = [
-        "cost_session",
-        "cost_month",
-        "cost_total",
-        "cost_known",
-        "tokens_in",
-        "tokens_out",
-        "requests",
-        "model",
-        "context_pct",
-        "effort",
-        "ctx_tokens",
-        "rate_5h",
-        "rate_week",
-    ]
-    .iter()
-    .map(|k| ((*k).to_string(), crate::statusline::NO_DATA.to_string()))
-    .collect();
-
-    if let Some(s) = &sess {
-        params.insert("tokens_in".to_string(), s.tokens_in.to_string());
-        params.insert("tokens_out".to_string(), s.tokens_out.to_string());
-        params.insert("requests".to_string(), s.requests.to_string());
-        params.insert("cost_known".to_string(), s.cost_known_requests.to_string());
-        if s.cost_known_requests > 0 {
-            // only a cost figure when the session actually has reported cost
-            params.insert("cost_session".to_string(), s.cost_usd.to_string());
-        }
-    }
-    if let Some(c) = cost_month {
-        params.insert("cost_month".to_string(), c.to_string());
-    }
-    if let Some(c) = cost_total {
-        params.insert("cost_total".to_string(), c.to_string());
-    }
-    // The `model` param reflects the proxy's current model: an explicit
-    // `--model` flag (from the status line JSON) wins, then the active model
-    // selected via `local-proxy model`, then the first model available from a
-    // connected provider. Falling back to the last model used by the session is
-    // avoided so the status line tracks what the proxy would route now.
-    let proxy_model = config
-        .defaults
-        .active_model
-        .clone()
-        .or_else(|| first_available_model(&config_path).ok().flatten());
-    if let Some(m) = &model {
-        params.insert("model".to_string(), m.clone());
-    } else if let Some(m) = proxy_model {
-        params.insert("model".to_string(), m);
-    }
-    // Upstream-reported usage (ChatGPT/Codex); Claude's own JSON wins below.
-    if let Some((h5, week)) = crate::stats::rate_limits() {
-        params.insert("rate_5h".to_string(), format!("{}", h5.round()));
-        params.insert("rate_week".to_string(), format!("{}", week.round()));
-    }
-    params.extend(claude_params);
-    if let Some(e) = config
-        .defaults
-        .active_effort
-        .clone()
-        .or_else(|| crate::stats::session_effort(&session))
-    {
-        params.insert("effort".to_string(), e);
-    }
-    if let Some(p) = context_pct {
-        params.insert("context_pct".to_string(), p.to_string());
-    }
-
-    let template = template_flag
-        .or_else(|| config.statusline.template.clone())
-        .unwrap_or_else(|| crate::statusline::default_template(&params));
-
-    let line = crate::statusline::render(&template, &params);
-    println!("{line}");
-    Ok(())
-}
-
-/// Write the status-line script into the config dir and register it in Claude's
-/// `settings.json`.
-///
-/// Keeps every existing setting and only adds the `statusLine` entry pointing at
-/// the generated script. The script path is resolved from the same `config_dir`
-/// (so it follows `LOCAL_PROXY_CONFIG_DIR` and `--config`, keeping tests and
-/// isolated installs consistent). If no settings file exists yet (and no custom
-/// `--settings` path was given) the script alone is written and the command is
-/// printed for the user to add manually.
-///
-/// # Errors
-///
-/// Returns an error if the script or settings file cannot be written.
-#[allow(clippy::needless_pass_by_value)]
-pub fn statusline_setup(config_path: PathBuf, settings: Option<PathBuf>) -> miette::Result<()> {
-    // `setup` only touches the config dir and Claude's settings, not the
-    // config contents, so the config path is unused here.
-    let _ = config_path;
-    let script = crate::statusline::script_path(&config_dir());
-    let exists = script.exists();
-    let paths = crate::statusline::setup(&config_dir(), settings).map_err(CliError::from)?;
-
-    println!(
-        "status line script: {} ({})",
-        paths.script.display(),
-        if exists { "atualizado" } else { "criado" }
-    );
-    if let Some(s) = &paths.settings {
-        println!("settings.json atualizado: {}", s.display());
-        println!("reinicie o Claude Code para aplicar a status line.");
-    } else {
-        // No settings file was written; tell the user how to wire it manually.
-        let cmd = crate::statusline::settings_statusline_command(&script);
-        println!("nenhum settings.json encontrado; adicione manualmente:");
-        println!("  {cmd}");
-    }
-    Ok(())
-}
-
 /// Print aggregate usage statistics collected from upstream requests.
 ///
 /// Renders a human summary (with a per-provider breakdown) by default, or the
@@ -2478,7 +2244,6 @@ mod tests {
             routes: Vec::new(),
             defaults: Defaults::default(),
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         }
     }
 
@@ -2498,20 +2263,6 @@ mod tests {
                 vec!["plugin", "marketplace", "remove", "local-proxy"],
             ]
         );
-    }
-
-    #[test]
-    fn mod_enabled_detects_enabled_plugins() {
-        assert!(mod_enabled_in(
-            r#"{"enabledPlugins":{"local-proxy@local-proxy":true}}"#
-        ));
-        assert!(!mod_enabled_in(
-            r#"{"enabledPlugins":{"local-proxy@x":false}}"#
-        ));
-        assert!(!mod_enabled_in(
-            r#"{"enabledPlugins":{"other@local-proxy":true}}"#
-        ));
-        assert!(!mod_enabled_in("{}"));
     }
 
     #[test]

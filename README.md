@@ -101,7 +101,6 @@ Claude Code sends `/v1/messages`; the proxy routes to a connected provider and t
 | `account [<provider>/<alias>]` | List stored accounts (the active one is marked) or select the active account for a provider. `account clear [<provider>]` unsets one or all selections. |
 | `providers` | List effective providers (catalog plus config) with their account aliases and auth kind (`api`, `oauth`, or `-`). |
 | `stats [--since day\|week\|month\|all] [--json]` | Show usage statistics from recorded requests. |
-| `statusline --session <uuid>` | Render the Claude Code status line for a session from its recorded stats. |
 | `setup claude [--uninstall]` | Install (or remove) the Claude Code mod via `claude plugin`. |
 | `update` | Check for and apply a newer release. |
 
@@ -391,8 +390,6 @@ local-proxy setup claude            # install
 local-proxy setup claude --uninstall
 ```
 
-When the mod is enabled, `launch claude` stops injecting its own `statusLine` setting and leaves the status line to the mod.
-
 ## Using with Cursor
 
 Cursor reads a custom base URL from `ANTHROPIC_BASE_URL` (like Claude Code), which sends it straight to the proxy's `/v1/messages` endpoint; the proxy routes and translates from there. The same dedicated-launch flow works with a Cursor target, which also sets the OpenAI-compatible overrides:
@@ -429,7 +426,7 @@ exec:
 
 Security: it only runs `exec.command` (default `local-proxy`) with args parsed without a shell. No arbitrary execution. It requires the proxy key like any endpoint.
 
-## Statistics and status line
+## Statistics
 
 The proxy records every proxied request in the local `stats.db` in the global config directory. Best effort: a write failure is logged and never breaks the proxy. Tokens come from the upstream `usage`: in the response body for non-streaming requests, and for streaming by accumulating `usage` from the SSE frames (OpenAI chunks, Anthropic `message_start` and `message_delta`, Responses `response.completed`). Requests are recorded when the stream finishes.
 
@@ -439,47 +436,6 @@ Providers with energy-based pricing (NeuralWatt) return energy and cost metadata
 local-proxy stats               # today's summary, per provider, and recent requests
 local-proxy stats --since week  # day | week | month | all
 local-proxy stats --json        # same report as JSON, keys summary/providers/recent
-```
-
-### Status line
-
-The Claude Code status line is computed client-side from Claude's own price table, which is wrong when traffic goes through a multi-provider proxy. The proxy renders the line from the stats it records instead.
-
-The flow: Claude Code sends `X-Claude-Code-Session-Id` (a UUID per session) on every request. The proxy stores `session_id` on each `stats.db` row. The status line script passes its `session_id` to `local-proxy statusline`, which aggregates that session's stats and renders a Rhai template, sandboxed.
-
-```bash
-local-proxy statusline --session "<uuid>" --model "claude-..." --context-pct 42
-local-proxy statusline --session "<uuid>" --template "{model} · {cost_session} · {context_pct}% ctx"
-```
-
-Template params (absent values render as `?`): `cost_session`, `cost_month`, `cost_total`, `cost_known`, `tokens_in`, `tokens_out`, `requests`, `model`, `context_pct`. Cost only appears when the upstream reports it; it is never estimated. Formatting is entirely the template's job.
-
-The `model` param reflects the proxy's current model: an explicit `--model` (from the status line JSON) wins, then the active model selected via `local-proxy model`, then the first model available from a connected provider.
-
-The template can come from the config (`statusline:` block) or from `--template`, which wins:
-
-```yaml
-statusline:
-  template: "{model} · {cost_session} · {context_pct}% ctx"
-```
-
-When no template is configured, the proxy uses an **adaptive default**: it builds the line only from the params that have data for that session, omitting the absent ones, and shows `local-proxy: sem dados` when there is no data yet.
-
-### Automatic setup (`statusline setup`)
-
-To write the status-line script into the config dir and register it in Claude Code's `settings.json` in one step:
-
-```powershell
-local-proxy statusline setup                                 # uses ~/.claude/settings.json (default)
-local-proxy statusline setup --settings C:\path\settings.json  # custom target
-```
-
-The command writes `statusline.ps1` (Windows) or `statusline.sh` (POSIX) into the config dir (the same `LOCAL_PROXY_CONFIG_DIR`) and adds/updates the `statusLine` entry in `settings.json`, **preserving all other settings**. If no `settings.json` exists (and no `--settings` was given), it only writes the script and prints the manual snippet — it never creates a `.claude` directory you didn't have. The same action is available as a flag on the rendering subcommand: `local-proxy statusline --setup`.
-
-Ready scripts that read the JSON from stdin, extract `session_id`, and call the binary also live in `scripts/statusline.sh` and `scripts/statusline.ps1`. Point Claude Code's `settings.json` at one of them:
-
-```json
-{ "statusLine": { "type": "command", "command": "/abs/path/scripts/statusline.ps1" } }
 ```
 
 ## Update
@@ -534,7 +490,7 @@ src/
 ├── catalog.rs     embedded catalog and catalog to config merge
 ├── auth.rs        encrypted account store (SQLCipher), OS vault key, legacy migration
 ├── oauth.rs       generic OAuth 2.0 + PKCE engine (login flows, exchange, refresh)
-├── cli.rs         serve, launch, status, stop, models, model, connect, disconnect, providers, stats, statusline, update
+├── cli.rs         serve, launch, status, stop, models, model, connect, disconnect, providers, stats, setup, update
 ├── router.rs      resolve_model to (provider, upstream_model, reasoning_effort)
 ├── upstream.rs    HTTP calls, key resolution, per-provider headers
 ├── ir/           format-neutral IR: one decoder + encoder per format (anthropic, openai, responses)
@@ -544,10 +500,8 @@ src/
 ├── exec.rs        $proxy executor, token detection, arg parsing, timeout
 ├── error.rs       ApiError and per-format error shape
 ├── stats.rs       local statistics (SQLite stats.db) and stats command
-├── statusline.rs  sandboxed Rhai template + `statusline setup` (embedded script + settings.json)
 └── handlers.rs    axum endpoints, hot-reload state, /v1/models, count_tokens, $proxy
 e2e/               Bun test suite (mock and live)
-scripts/           status line scripts (bash and PowerShell)
 ```
 
 ## Troubleshooting

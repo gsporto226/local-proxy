@@ -1088,7 +1088,7 @@ fn exec_responses_response(text: &str, model: &str) -> Response {
 // ---------------------------------------------------------------------------
 
 /// The reasoning effort an Anthropic request asks for (`output_config.effort`,
-/// as Claude Code sends it), for the status line.
+/// as Claude Code sends it), for the `/admin` session stats.
 fn request_effort(body: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct OutputConfig {
@@ -1611,7 +1611,6 @@ mod tests {
             routes: Vec::new(),
             defaults: crate::config::Defaults::default(),
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         };
         let state = RuntimeState {
             config: Arc::new(cfg),
@@ -1794,7 +1793,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let mut clients = HashMap::new();
         let openai = cfg
@@ -1865,7 +1863,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let mut clients = HashMap::new();
         let openai = cfg
@@ -1942,7 +1939,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let mut clients = HashMap::new();
         let openai = cfg
@@ -2008,7 +2004,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let mut clients = HashMap::new();
         let openai = cfg
@@ -2065,7 +2060,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let state = RuntimeState {
             config: cfg.clone(),
@@ -2402,7 +2396,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let state = RuntimeState {
             config: cfg.clone(),

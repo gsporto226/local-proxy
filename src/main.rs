@@ -127,36 +127,6 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Render the Claude Code status line for a session from its recorded stats
-    Statusline {
-        /// Client session id from the status line JSON (`session_id`)
-        #[arg(long)]
-        session: Option<String>,
-        /// Model name from the status line JSON (`model.display_name`)
-        #[arg(long)]
-        model: Option<String>,
-        /// Context window usage percent from the status line JSON
-        #[arg(long)]
-        context_pct: Option<f64>,
-        /// Rhai template (overrides the config `statusline:` block)
-        #[arg(long)]
-        template: Option<String>,
-        /// Write the status-line script to the config dir and register it in
-        /// Claude's settings.json (`statusline setup`)
-        #[arg(long)]
-        setup: bool,
-        /// Claude settings.json to update (with `--setup`; defaults to the
-        /// platform `~/.claude/settings.json`)
-        #[arg(long)]
-        settings: Option<PathBuf>,
-    },
-    /// Write the status-line script and register it in Claude's settings.
-    StatuslineSetup {
-        /// Claude settings.json to update (defaults to
-        /// `~/.claude/settings.json`; skipped if that file does not exist)
-        #[arg(long)]
-        settings: Option<PathBuf>,
-    },
     /// Install the Claude Code mod (`claude plugin marketplace add` + `install`)
     Setup {
         /// Target tool (only `claude`)
@@ -258,23 +228,6 @@ fn main() -> miette::Result<()> {
             let since = since.unwrap_or_else(|| "day".to_string());
             cli::stats(config, since, json)
         }
-        Some(Command::Statusline {
-            session,
-            model,
-            context_pct,
-            template,
-            setup,
-            settings,
-        }) => cli::statusline(
-            config,
-            session,
-            model,
-            context_pct,
-            template,
-            setup,
-            settings,
-        ),
-        Some(Command::StatuslineSetup { settings }) => cli::statusline_setup(config, settings),
         Some(Command::Setup { uninstall, .. }) => cli::setup_claude(uninstall),
         Some(Command::Update {
             repo,

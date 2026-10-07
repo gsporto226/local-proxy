@@ -2,6 +2,13 @@
 
 Estado atual do proxy `local-proxy`. Última atualização: 2026-08-21.
 
+### Removido — `statusline` / `statusline-setup`
+- Subcomandos `statusline` e `statusline-setup`, `src/statusline.rs`, a dependência `rhai`, o bloco
+  `statusline:` do config, os scripts `scripts/statusline.{ps1,sh}` e a injeção de `statusLine` no
+  `launch claude` foram removidos. A status line agora vem do mod do Claude Code (`claude-mod/`,
+  `local-proxy setup claude`), alimentado pela API `/admin`. Um bloco `statusline:` antigo no config
+  é ignorado.
+
 ## ✅ TODAS AS TASKS CONCLUÍDAS (kanban: backend 001-004 + 006-009, qa 005 + 010 — todas `done`)
 
 ### Nova rodada — modelo do cliente vence; override vira flag do proxy

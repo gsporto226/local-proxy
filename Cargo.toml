@@ -36,10 +36,6 @@ notify-debouncer-full = "0.4"
 # need no system OpenSSL (Perl is required at build time; see README).
 rusqlite = { version = "0.32", features = ["bundled-sqlcipher-vendored-openssl"] }
 getrandom = "0.2"
-# Sandboxed script template for the status line: isolated by default (no
-# file/network/host access unless explicitly registered), so a user template
-# can do arithmetic/comparisons but is never arbitrary code.
-rhai = { version = "1", default-features = false }
 
 [target.'cfg(target_os = "windows")'.dependencies]
 keyring = { version = "3.6", default-features = false, features = ["windows-native"] }

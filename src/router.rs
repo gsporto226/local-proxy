@@ -366,7 +366,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         }
     }
 
