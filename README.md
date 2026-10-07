@@ -102,6 +102,7 @@ Claude Code sends `/v1/messages`; the proxy routes to a connected provider and t
 | `providers` | List effective providers (catalog plus config) with their account aliases and auth kind (`api`, `oauth`, or `-`). |
 | `stats [--since day\|week\|month\|all] [--json]` | Show usage statistics from recorded requests. |
 | `statusline --session <uuid>` | Render the Claude Code status line for a session from its recorded stats. |
+| `setup claude [--uninstall]` | Install (or remove) the Claude Code mod via `claude plugin`. |
 | `update` | Check for and apply a newer release. |
 
 ## Configuration
@@ -368,6 +369,29 @@ Claude Code talks `/v1/messages`; the proxy routes to the configured provider an
 ```bash
 local-proxy launch claude --model kimi-k2.6 --yes
 ```
+
+### Claude Code mod
+
+The `claude-mod/` folder is a Claude Code plugin (mod), and this repository is its marketplace. It adds:
+
+- `/proxy <args>`: runs the `local-proxy` CLI inside the session (for example `/proxy model kimi-k2.6`).
+- `/proxy` with no arguments: opens a panel with status, accounts, models, stats and logs, fed by the `/admin` API.
+- A status line with model, context, rate limits and cost. Pick the segments in the plugin's `segments` option.
+
+Install it from a terminal session of Claude Code:
+
+```
+/plugin install local-proxy --marketplace gsporto226/local-proxy
+```
+
+or from the shell, which runs `claude plugin marketplace add` and `claude plugin install` for you:
+
+```bash
+local-proxy setup claude            # install
+local-proxy setup claude --uninstall
+```
+
+When the mod is enabled, `launch claude` stops injecting its own `statusLine` setting and leaves the status line to the mod.
 
 ## Using with Cursor
 

@@ -157,6 +157,15 @@ enum Command {
         #[arg(long)]
         settings: Option<PathBuf>,
     },
+    /// Install the Claude Code mod (`claude plugin marketplace add` + `install`)
+    Setup {
+        /// Target tool (only `claude`)
+        #[arg(value_parser = ["claude"])]
+        tool: String,
+        /// Remove the mod and its marketplace instead
+        #[arg(long)]
+        uninstall: bool,
+    },
     /// Check for a newer release and stage a manual update from GitHub Releases
     Update {
         /// GitHub owner/repo (overrides `LOCAL_PROXY_REPO`)
@@ -266,6 +275,7 @@ fn main() -> miette::Result<()> {
             settings,
         ),
         Some(Command::StatuslineSetup { settings }) => cli::statusline_setup(config, settings),
+        Some(Command::Setup { uninstall, .. }) => cli::setup_claude(uninstall),
         Some(Command::Update {
             repo,
             check,

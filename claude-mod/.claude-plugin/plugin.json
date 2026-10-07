@@ -1,0 +1,16 @@
+{
+  "name": "local-proxy",
+  "version": "0.2.0",
+  "author": { "name": "Gabriel Porto" },
+  "description": "local-proxy inside Claude Code: /proxy <args> runs the CLI, /proxy opens the panel, plus a status line",
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "segments": {
+      "type": "string",
+      "multiple": true,
+      "title": "Status line segments",
+      "description": "Ordered list of: model, context, rate5h, rateWeek, sessionCost, todayCost",
+      "default": ["model", "context", "rate5h", "rateWeek", "sessionCost", "todayCost"]
+    }
+  }
+}

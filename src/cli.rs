@@ -642,7 +642,8 @@ pub fn launch(
     if yes && tool_cmd != "cursor" {
         cmd.arg("--yes");
     }
-    if tool_cmd == "claude" {
+    // The Claude Code mod draws its own status line; only inject ours without it.
+    if tool_cmd == "claude" && !claude_mod_enabled() {
         if let Some(settings) = claude_statusline_settings(&config_path, model) {
             cmd.arg("--settings").arg(settings);
         }
@@ -661,6 +662,74 @@ pub fn launch(
 
     let status = status?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Marketplace (and plugin) name declared in `.claude-plugin/marketplace.json`.
+const CLAUDE_MARKETPLACE: &str = "local-proxy";
+
+/// Whether the `local-proxy` Claude Code mod is enabled in the user's
+/// `settings.json` (`claude plugin install` adds it to `enabledPlugins`).
+fn claude_mod_enabled() -> bool {
+    crate::statusline::claude_settings_path()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .is_some_and(|s| mod_enabled_in(&s))
+}
+
+fn mod_enabled_in(settings: &str) -> bool {
+    serde_json::from_str::<serde_json::Value>(settings)
+        .ok()
+        .and_then(|v| v.get("enabledPlugins")?.as_object().cloned())
+        .is_some_and(|m| {
+            m.iter().any(|(k, v)| {
+                k.split('@').next() == Some(CLAUDE_MARKETPLACE) && v.as_bool() == Some(true)
+            })
+        })
+}
+
+/// `owner/repo` GitHub slug derived from the `repository` field in Cargo.toml.
+fn repo_slug() -> &'static str {
+    env!("CARGO_PKG_REPOSITORY").trim_start_matches("https://github.com/")
+}
+
+/// The `claude` invocations `setup claude` runs, in order.
+fn claude_setup_argv(uninstall: bool) -> Vec<Vec<String>> {
+    let plugin = format!("{CLAUDE_MARKETPLACE}@{CLAUDE_MARKETPLACE}");
+    let v = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
+    if uninstall {
+        vec![
+            v(&["plugin", "uninstall", &plugin]),
+            v(&["plugin", "marketplace", "remove", CLAUDE_MARKETPLACE]),
+        ]
+    } else {
+        vec![
+            v(&["plugin", "marketplace", "add", repo_slug()]),
+            v(&["plugin", "install", &plugin]),
+        ]
+    }
+}
+
+/// Install (or with `uninstall`, remove) the Claude Code mod via `claude plugin`.
+///
+/// Re-running is harmless: each step is attempted and a
+/// failure (e.g. "already installed") is reported without aborting.
+///
+/// # Errors
+///
+/// Returns an error if `claude` cannot be spawned.
+pub fn setup_claude(uninstall: bool) -> miette::Result<()> {
+    for argv in claude_setup_argv(uninstall) {
+        println!("$ claude {}", argv.join(" "));
+        let status = Command::new("claude")
+            .args(&argv)
+            .status()
+            .map_err(|e| CliError::Tool {
+                message: format!("failed to spawn 'claude' (is it installed and on PATH?): {e}"),
+            })?;
+        if !status.success() {
+            eprintln!("(passo terminou com {status}; seguindo)");
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -2411,6 +2480,38 @@ mod tests {
             exec: crate::config::Exec::default(),
             statusline: crate::config::StatuslineConfig::default(),
         }
+    }
+
+    #[test]
+    fn claude_setup_argv_install_and_uninstall() {
+        assert_eq!(
+            claude_setup_argv(false),
+            vec![
+                vec!["plugin", "marketplace", "add", "gsporto226/local-proxy"],
+                vec!["plugin", "install", "local-proxy@local-proxy"],
+            ]
+        );
+        assert_eq!(
+            claude_setup_argv(true),
+            vec![
+                vec!["plugin", "uninstall", "local-proxy@local-proxy"],
+                vec!["plugin", "marketplace", "remove", "local-proxy"],
+            ]
+        );
+    }
+
+    #[test]
+    fn mod_enabled_detects_enabled_plugins() {
+        assert!(mod_enabled_in(
+            r#"{"enabledPlugins":{"local-proxy@local-proxy":true}}"#
+        ));
+        assert!(!mod_enabled_in(
+            r#"{"enabledPlugins":{"local-proxy@x":false}}"#
+        ));
+        assert!(!mod_enabled_in(
+            r#"{"enabledPlugins":{"other@local-proxy":true}}"#
+        ));
+        assert!(!mod_enabled_in("{}"));
     }
 
     #[test]
