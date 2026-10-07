@@ -296,7 +296,7 @@ pub fn responses_usage(u: &TokenUsage) -> Value {
 // anthropic -> anthropic normalization (passthrough hygiene)
 // ---------------------------------------------------------------------------
 
-/// Strip the reasoning-effort knobs some Anthropic-format upstreams reject.
+/// Strip the fields some Anthropic-format upstreams reject.
 ///
 /// `cache_control` markers are kept: stripping them turns prompt caching off.
 #[must_use]
@@ -310,6 +310,10 @@ pub fn normalize_anthropic_request(body: &Value) -> Value {
         "level",
         "depth",
         "output_config",
+        // Claude Code sends this on every request; upstreams that do not
+        // implement context editing reject the whole body with
+        // "400 context_management: Extra inputs are not permitted".
+        "context_management",
     ] {
         remove(&mut out, key);
     }
@@ -418,11 +422,14 @@ mod tests {
             "model": "m",
             "thinking": {"type": "enabled"},
             "effort": "high",
+            "context_management": {"edits": []},
             "messages": [{"role": "user", "content": [{"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}]}]
         });
         let out = normalize_anthropic_request(&body);
         assert!(out.get("thinking").is_none());
         assert!(out.get("effort").is_none());
+        // a backend without context editing 400s the whole body on this
+        assert!(out.get("context_management").is_none());
         let text = serde_json::to_string(&out).unwrap();
         // prompt caching stays on for the passthrough
         assert!(text.contains("cache_control"));
