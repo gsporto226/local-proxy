@@ -64,7 +64,7 @@ describe("e2e: statusline renders the session's recorded stats", () => {
       const r = await postJson(
         proxy.base,
         "/v1/messages",
-        { model: "ignored", max_tokens: 10, messages: [{ role: "user", content: "hi" }] },
+        { model: "claude-via-openai", max_tokens: 10, messages: [{ role: "user", content: "hi" }] },
         { "x-claude-code-session-id": session },
       );
       expect(r.status).toBe(200);
@@ -96,5 +96,17 @@ describe("e2e: statusline renders the session's recorded stats", () => {
     expect(line).toContain("tout=6"); // 3 x 2 output tokens
     // 3 x 0.0042, rendered raw by the template
     expect(line).toContain("cost=0.0126");
+  });
+
+  test("model is the one this session's proxy routed, not the flag/global config", async () => {
+    // The proxy routed SESSION through claude-via-openai -> mock_openai/gpt-4o.
+    // Claude's own `--model` (display name) and the global active_model must
+    // not override it: each launch runs its own proxy instance.
+    const res = await runCli(
+      ["statusline", "--session", SESSION, "--model", "Opus 5.5", "--template", "`${model}`"],
+      { LOCAL_PROXY_CONFIG_DIR: cfgDir },
+    );
+    expect(res.exit).toBe(0);
+    expect(res.output.trim()).toBe("mock_openai/gpt-4o");
   });
 });

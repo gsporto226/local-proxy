@@ -1501,18 +1501,19 @@ pub fn statusline(
     if let Some(c) = cost_total {
         params.insert("cost_total".to_string(), c.to_string());
     }
-    // The `model` param reflects the proxy's current model: an explicit
-    // `--model` flag (from the status line JSON) wins, then the active model
-    // selected via `local-proxy model`, then the first model available from a
-    // connected provider. Falling back to the last model used by the session is
-    // avoided so the status line tracks what the proxy would route now.
+    // The `model` param reflects the model this session's proxy instance
+    // routes: the one it last recorded for the session (each `launch` runs its
+    // own proxy whose in-memory model can differ from the global config), then
+    // an explicit `--model` flag, then the active model selected via
+    // `local-proxy model`, then the first model available from a connected
+    // provider.
     let proxy_model = config
         .defaults
         .active_model
         .clone()
         .or_else(|| first_available_model(&config_path).ok().flatten());
-    if let Some(m) = &model {
-        params.insert("model".to_string(), m.clone());
+    if let Some(m) = crate::stats::session_model(&session).or(model) {
+        params.insert("model".to_string(), m);
     } else if let Some(m) = proxy_model {
         params.insert("model".to_string(), m);
     }

@@ -839,7 +839,7 @@ async fn maybe_exec(
     let cmd = crate::exec::split_command(&text, &exec.token)?;
     let args = crate::exec::parse_args(cmd);
     if args.first().map(String::as_str) == Some("model") {
-        Some(handle_model_exec(app, state, &args).await)
+        Some(handle_model_exec(app, state, session_id, &args).await)
     } else if args.first().map(String::as_str) == Some("effort") {
         Some(handle_effort_exec(app, state, &args).await)
     } else if args.first().map(String::as_str) == Some("account") {
@@ -925,6 +925,7 @@ async fn handle_effort_exec(
 async fn handle_model_exec(
     app: &AppState,
     state: &RuntimeState,
+    session_id: &str,
     args: &[String],
 ) -> crate::exec::ExecOutput {
     let selection = args.get(1).map(String::as_str);
@@ -943,6 +944,8 @@ async fn handle_model_exec(
             Ok(msg) => {
                 if msg.starts_with("modelo ativo:") {
                     app.set_active_model(Some(selected.to_string())).await;
+                    // The status line shows the switch before the next request.
+                    stats::record_model(session_id, selected);
                 }
                 msg
             }
@@ -1205,6 +1208,10 @@ async fn handle_chat(
         upstream_model,
         streaming,
         "resolved route"
+    );
+    stats::record_model(
+        session_id,
+        &crate::config::qualified_id(&provider.name, &upstream_model),
     );
     body["model"] = json!(upstream_model);
     if client_format == Format::Anthropic {
