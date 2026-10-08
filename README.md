@@ -390,6 +390,16 @@ local-proxy setup claude            # install
 local-proxy setup claude --uninstall
 ```
 
+If `local-proxy` is already registered from a local directory, migrate it to GitHub once before running setup:
+
+```bash
+claude plugin marketplace remove local-proxy
+claude plugin marketplace add gsporto226/local-proxy
+claude plugin install local-proxy@local-proxy
+```
+
+Removing a marketplace uninstalls its plugins and deletes their saved options and data. Save any plugin configuration or data you need before migrating.
+
 ## Using with Cursor
 
 Cursor reads a custom base URL from `ANTHROPIC_BASE_URL` (like Claude Code), which sends it straight to the proxy's `/v1/messages` endpoint; the proxy routes and translates from there. The same dedicated-launch flow works with a Cursor target, which also sets the OpenAI-compatible overrides:
@@ -440,7 +450,7 @@ local-proxy stats --json        # same report as JSON, keys summary/providers/re
 
 ## Update
 
-`update` downloads the latest release binary from GitHub, verifies the SHA256, and applies it in place. On Linux the swap is atomic (POSIX rename, safe while the binary is running). On Windows the running executable is renamed to a backup and the new one takes its place, with cleanup of the backup on exit and at the next start. Cargo installs delegate to cargo.
+`update` refreshes the `local-proxy` GitHub marketplace and Claude Code plugin, then downloads the latest release binary from GitHub, verifies the SHA256, and applies it in place. Plugin and binary update failures are independent. On Linux the swap is atomic (POSIX rename, safe while the binary is running). On Windows the running executable is renamed to a backup and the new one takes its place, with cleanup of the backup on exit and at the next start. Cargo installs delegate to cargo. `--check` only checks the binary version and does not update the plugin. The plugin must be installed from the GitHub marketplace; see the migration steps above if it currently comes from a local directory.
 
 ```bash
 local-proxy update --check        # report the latest version only

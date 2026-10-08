@@ -791,7 +791,7 @@ fn cache_usage_is_reported_across_formats() {
     });
     let r = decode_response(Format::Anthropic, &body);
     assert_eq!(r.usage.input, 105);
-    assert_eq!(r.usage.cache_read, 90);
+    assert_eq!(r.usage.cache_read, Some(90));
     let openai = encode_response(Format::Openai, &r);
     assert_eq!(openai["usage"]["prompt_tokens"], 105);
     assert_eq!(
@@ -807,6 +807,17 @@ fn cache_usage_is_reported_across_formats() {
     let back = encode_response(Format::Anthropic, &decode_response(Format::Openai, &openai));
     assert_eq!(back["usage"]["cache_read_input_tokens"], 90);
     assert_eq!(back["usage"]["input_tokens"], 15);
+}
+
+#[test]
+fn emitter_preserves_an_explicit_zero_cache_read_report() {
+    let mut emitter = Emitter::default();
+    emitter.usage(crate::translate::TokenUsage {
+        cache_read: Some(0),
+        ..crate::translate::TokenUsage::default()
+    });
+    emitter.usage(crate::translate::TokenUsage::default());
+    assert_eq!(emitter.usage.cache_read, Some(0));
 }
 
 #[test]

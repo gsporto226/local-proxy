@@ -174,11 +174,25 @@ async fn models(State(app): State<AppState>) -> ApiResult {
 #[derive(Deserialize)]
 struct SinceQuery {
     since: Option<String>,
+    session_id: Option<String>,
 }
 
 async fn stats(Query(q): Query<SinceQuery>) -> ApiResult {
     let since = q.since.unwrap_or_else(|| "day".to_string());
-    let stats = blocking(move || crate::cli::stats_json(&since)).await?;
+    if q.session_id.as_deref() == Some("") {
+        return Err(bad_request("session_id must not be empty"));
+    }
+    if since == "session" && q.session_id.is_none() {
+        return Err(bad_request("session_id is required when since=session"));
+    }
+    let stats = blocking(move || {
+        let scope = q.session_id.as_deref().map_or(
+            crate::stats::StatsScope::All,
+            crate::stats::StatsScope::Session,
+        );
+        crate::cli::stats_json_scoped(&since, scope)
+    })
+    .await?;
     Ok(Json(stats.unwrap_or(Value::Null)))
 }
 
@@ -475,6 +489,88 @@ mod tests {
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
         });
+    }
+
+    #[test]
+    fn stats_route_filters_cache_rate_to_the_active_session() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", dir.path());
+        for (session_id, cache_hit) in [
+            ("sess-1", Some(false)),
+            ("sess-1", Some(true)),
+            ("sess-1", None),
+            ("sess-2", Some(true)),
+        ] {
+            crate::stats::record(
+                std::time::Instant::now(),
+                crate::stats::StatLine {
+                    endpoint: "/v1/messages",
+                    provider: "anthropic".to_string(),
+                    alias: "work".to_string(),
+                    model: "claude-test".to_string(),
+                    session_id: session_id.to_string(),
+                    cache_hit,
+                    ..crate::stats::StatLine::default()
+                },
+            );
+        }
+        let app = crate::handlers::app(app_state(dir.path().join("config.yaml")));
+        block_on(async {
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    "/admin/stats?since=session&session_id=sess-1",
+                    "",
+                    [127, 0, 0, 1],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::OK);
+            let body = axum::body::to_bytes(response.into_body(), usize::MAX)
+                .await
+                .unwrap();
+            let value: Value = serde_json::from_slice(&body).unwrap();
+            assert_eq!(value["scope"]["kind"], "session");
+            assert_eq!(value["scope"]["session_id"], "sess-1");
+            assert_eq!(value["summary"]["requests"], 3);
+            assert_eq!(value["summary"]["cache"]["hit_requests"], 1);
+            assert_eq!(value["summary"]["cache"]["reported_requests"], 2);
+            assert_eq!(value["summary"]["cache"]["rate_percent"], 50.0);
+            assert!(
+                (value["summary"]["cache"]["coverage_percent"]
+                    .as_f64()
+                    .unwrap()
+                    - 200.0 / 3.0)
+                    .abs()
+                    < 0.01
+            );
+
+            let response = app
+                .clone()
+                .oneshot(request(
+                    "GET",
+                    "/admin/stats?since=session",
+                    "",
+                    [127, 0, 0, 1],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+            let response = app
+                .oneshot(request(
+                    "GET",
+                    "/admin/stats?since=session&session_id=",
+                    "",
+                    [127, 0, 0, 1],
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        });
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
     }
 
     #[test]
