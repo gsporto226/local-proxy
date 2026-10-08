@@ -33,6 +33,8 @@ pub struct StatLine {
     pub endpoint: &'static str,
     /// The upstream provider the request was routed to.
     pub provider: String,
+    /// The account alias the request was routed through, or `"default"`.
+    pub alias: String,
     /// The upstream model used.
     pub model: String,
     /// Number of input (prompt) tokens as reported by the upstream, if known.
@@ -83,6 +85,7 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             ts INTEGER NOT NULL,
             endpoint TEXT NOT NULL,
             provider TEXT NOT NULL,
+            alias TEXT NOT NULL DEFAULT 'default',
             model TEXT NOT NULL,
             input_tokens INTEGER NOT NULL DEFAULT 0,
             output_tokens INTEGER NOT NULL DEFAULT 0,
@@ -99,7 +102,7 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
     )?;
     // Lightweight migration for databases created before energy/cost existed.
     // Guarded by a column-exists check so prior stats survive in place.
-    let cols = ["energy_kwh_um", "cost_usd_um", "session_id"];
+    let cols = ["energy_kwh_um", "cost_usd_um", "session_id", "alias"];
     for col in cols {
         let exists: bool = conn
             .query_row(
@@ -109,17 +112,19 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             )
             .unwrap_or(false);
         if !exists {
-            // `session_id` is TEXT; the others are INTEGER.
-            let ty = if col == "session_id" {
-                "TEXT NOT NULL DEFAULT ''"
-            } else {
-                "INTEGER"
+            let ty = match col {
+                "alias" => "TEXT NOT NULL DEFAULT 'default'",
+                "session_id" => "TEXT NOT NULL DEFAULT ''",
+                _ => "INTEGER",
             };
             conn.execute_batch(&format!("ALTER TABLE requests ADD COLUMN {col} {ty}"))?;
         }
     }
     // Created after the migration so it works on pre-existing databases too.
     conn.execute_batch("CREATE INDEX IF NOT EXISTS idx_requests_session ON requests(session_id);")?;
+    conn.execute_batch(
+        "CREATE INDEX IF NOT EXISTS idx_requests_alias ON requests(provider, alias);",
+    )?;
     Ok(())
 }
 
@@ -146,6 +151,12 @@ fn open(path: &Path) -> Result<rusqlite::Connection, StatsError> {
         .map_err(|source| StatsError::Query { source })?;
     conn.pragma_update(None, "synchronous", "NORMAL")
         .map_err(|source| StatsError::Query { source })?;
+    Ok(conn)
+}
+
+fn open_stats(path: &Path) -> Result<rusqlite::Connection, StatsError> {
+    let conn = open(path)?;
+    ensure_schema(&conn).map_err(|source| StatsError::Query { source })?;
     Ok(conn)
 }
 
@@ -185,18 +196,18 @@ pub fn record(started: Instant, stat: StatLine) {
 }
 
 fn write_line(path: &Path, stat: &StatLine, ts: i64, latency_ms: u64) -> Result<(), StatsError> {
-    let conn = open(path)?;
-    ensure_schema(&conn).map_err(|source| StatsError::Query { source })?;
+    let conn = open_stats(path)?;
     conn.execute(
         "INSERT INTO requests
-            (ts, endpoint, provider, model, input_tokens, output_tokens,
+            (ts, endpoint, provider, alias, model, input_tokens, output_tokens,
              streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
              session_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
         rusqlite::params![
             ts,
             stat.endpoint,
             stat.provider,
+            stat.alias,
             stat.model,
             stat.input_tokens,
             stat.output_tokens,
@@ -246,6 +257,53 @@ pub struct RowSummary {
     pub cost_usd_um: u64,
 }
 
+/// Per-account (provider + alias) aggregate over the matching window.
+#[derive(Debug, Clone)]
+pub struct AccountStats {
+    /// Provider name.
+    pub provider: String,
+    /// Account alias.
+    pub alias: String,
+    /// Number of requests routed through this account.
+    pub requests: u64,
+    /// Sum of input tokens.
+    pub input_tokens: u64,
+    /// Sum of output tokens.
+    pub output_tokens: u64,
+    /// Sum of latency, in milliseconds.
+    pub latency_ms: u64,
+    /// Sum of energy in micro-kWh.
+    pub energy_kwh_um: u64,
+    /// Sum of cost in micro-USD.
+    pub cost_usd_um: u64,
+}
+
+/// One upstream-reported quota window for a subscription account.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct UsageWindow {
+    /// Percentage of the limit consumed.
+    pub utilization: f64,
+    /// Provider-reported reset time (ISO-8601 or Unix seconds).
+    pub resets_at: Option<String>,
+}
+
+/// Latest upstream quota snapshot for one provider account.
+#[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct AccountUsage {
+    /// Provider name.
+    pub provider: String,
+    /// Account alias.
+    pub alias: String,
+    /// Five-hour usage window, when the provider reports one.
+    pub five_hour: Option<UsageWindow>,
+    /// Seven-day usage window, when the provider reports one.
+    pub seven_day: Option<UsageWindow>,
+    /// Monthly extra-usage window, when the provider reports one.
+    pub monthly: Option<UsageWindow>,
+    /// Last-observed Unix timestamp in seconds.
+    pub fetched_at: i64,
+}
+
 /// Per-provider aggregate over the matching window.
 #[derive(Debug, Clone)]
 pub struct ProviderStats {
@@ -274,6 +332,8 @@ pub struct RequestRow {
     pub endpoint: String,
     /// Upstream provider.
     pub provider: String,
+    /// Account alias.
+    pub alias: String,
     /// Upstream model.
     pub model: String,
     /// Input tokens.
@@ -307,7 +367,7 @@ pub fn summary(window: TimeWindow) -> Result<Option<RowSummary>, StatsError> {
     if !path.exists() {
         return Ok(None);
     }
-    let conn = open(&path)?;
+    let conn = open_stats(&path)?;
     summary_on(&conn, window).map(Some)
 }
 
@@ -355,7 +415,7 @@ pub fn by_provider(window: TimeWindow) -> Result<Option<Vec<ProviderStats>>, Sta
     if !path.exists() {
         return Ok(None);
     }
-    let conn = open(&path)?;
+    let conn = open_stats(&path)?;
     by_provider_on(&conn, window).map(Some)
 }
 
@@ -396,6 +456,60 @@ pub fn by_provider_on(
     Ok(rows)
 }
 
+/// Per-account aggregates for the window, or `None` if the database does not
+/// exist yet.
+///
+/// # Errors
+///
+/// Returns a [`StatsError::Open`] if the database cannot be opened or a
+/// [`StatsError::Query`] if the query fails.
+pub fn by_account(window: TimeWindow) -> Result<Option<Vec<AccountStats>>, StatsError> {
+    let path = stats_db();
+    if !path.exists() {
+        return Ok(None);
+    }
+    let conn = open_stats(&path)?;
+    by_account_on(&conn, window).map(Some)
+}
+
+/// Per-account aggregates for `window` over a live connection.
+///
+/// # Errors
+///
+/// Returns a [`StatsError::Query`] if the query fails.
+pub fn by_account_on(
+    conn: &rusqlite::Connection,
+    window: TimeWindow,
+) -> Result<Vec<AccountStats>, StatsError> {
+    let (wsql, params) = where_clause(window);
+    let mut stmt = conn
+        .prepare(&format!(
+            "SELECT provider, COALESCE(CAST(alias AS TEXT), 'default'), COUNT(*), COALESCE(SUM(input_tokens),0),
+                    COALESCE(SUM(output_tokens),0), COALESCE(SUM(latency_ms),0),
+                    COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0)
+             FROM requests {wsql}
+             GROUP BY provider, 2 ORDER BY provider, 2"
+        ))
+        .map_err(|source| StatsError::Query { source })?;
+    let rows = stmt
+        .query_map(rusqlite::params_from_iter(params), |r| {
+            Ok(AccountStats {
+                provider: r.get(0)?,
+                alias: r.get(1)?,
+                requests: r.get::<_, i64>(2)? as u64,
+                input_tokens: r.get::<_, i64>(3)? as u64,
+                output_tokens: r.get::<_, i64>(4)? as u64,
+                latency_ms: r.get::<_, i64>(5)? as u64,
+                energy_kwh_um: r.get::<_, i64>(6)? as u64,
+                cost_usd_um: r.get::<_, i64>(7)? as u64,
+            })
+        })
+        .map_err(|source| StatsError::Query { source })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| StatsError::Query { source })?;
+    Ok(rows)
+}
+
 /// The most recent request rows in the window, newest first, or `None` if the
 /// database does not exist yet.
 ///
@@ -408,7 +522,7 @@ pub fn recent(window: TimeWindow, limit: u32) -> Result<Option<Vec<RequestRow>>,
     if !path.exists() {
         return Ok(None);
     }
-    let conn = open(&path)?;
+    let conn = open_stats(&path)?;
     recent_on(&conn, window, limit).map(Some)
 }
 
@@ -425,7 +539,7 @@ pub fn recent_on(
 ) -> Result<Vec<RequestRow>, StatsError> {
     let (wsql, params) = where_clause(window);
     let sql = format!(
-        "SELECT ts, endpoint, provider, model, input_tokens, output_tokens,
+        "SELECT ts, endpoint, provider, COALESCE(CAST(alias AS TEXT), 'default'), model, input_tokens, output_tokens,
                 streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
                 session_id
          FROM requests {wsql}
@@ -440,16 +554,17 @@ pub fn recent_on(
                 ts: r.get(0)?,
                 endpoint: r.get(1)?,
                 provider: r.get(2)?,
-                model: r.get(3)?,
-                input_tokens: r.get::<_, i64>(4)? as u64,
-                output_tokens: r.get::<_, i64>(5)? as u64,
-                streamed: r.get::<_, i64>(6)? != 0,
-                status: r.get::<_, i64>(7)? as u16,
-                latency_ms: r.get::<_, i64>(8)? as u64,
-                error: r.get::<_, i64>(9)? != 0,
-                energy_kwh_um: r.get::<_, Option<i64>>(10)?.map(|v| v as u64),
-                cost_usd_um: r.get::<_, Option<i64>>(11)?.map(|v| v as u64),
-                session_id: r.get(12)?,
+                alias: r.get(3)?,
+                model: r.get(4)?,
+                input_tokens: r.get::<_, i64>(5)? as u64,
+                output_tokens: r.get::<_, i64>(6)? as u64,
+                streamed: r.get::<_, i64>(7)? != 0,
+                status: r.get::<_, i64>(8)? as u16,
+                latency_ms: r.get::<_, i64>(9)? as u64,
+                error: r.get::<_, i64>(10)? != 0,
+                energy_kwh_um: r.get::<_, Option<i64>>(11)?.map(|v| v as u64),
+                cost_usd_um: r.get::<_, Option<i64>>(12)?.map(|v| v as u64),
+                session_id: r.get(13)?,
             })
         })
         .map_err(|source| StatsError::Query { source })?
@@ -498,7 +613,7 @@ pub fn session(session_id: &str) -> Result<Option<SessionStats>, StatsError> {
     if session_id.is_empty() {
         return Ok(None);
     }
-    let conn = open(&path)?;
+    let conn = open_stats(&path)?;
     session_on(&conn, session_id)
 }
 
@@ -567,7 +682,140 @@ pub fn record_effort(session_id: &str, effort: &str) {
     }
 }
 
-/// Remember the latest subscription usage percents (5h, weekly), best-effort.
+fn ensure_account_usage_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS account_usage (
+            provider TEXT NOT NULL,
+            alias TEXT NOT NULL,
+            five_hour REAL,
+            five_hour_resets_at TEXT,
+            seven_day REAL,
+            seven_day_resets_at TEXT,
+            monthly REAL,
+            monthly_resets_at TEXT,
+            fetched_at INTEGER NOT NULL,
+            PRIMARY KEY (provider, alias)
+        );",
+    )
+}
+
+/// Store a complete provider usage response for one account.
+///
+/// # Errors
+///
+/// Returns a [`StatsError`] if the database cannot be opened or written.
+pub fn save_account_usage(usage: &AccountUsage) -> Result<(), StatsError> {
+    let conn = open(&stats_db())?;
+    ensure_account_usage_schema(&conn).map_err(|source| StatsError::Query { source })?;
+    conn.execute(
+        "INSERT INTO account_usage
+            (provider, alias, five_hour, five_hour_resets_at, seven_day,
+             seven_day_resets_at, monthly, monthly_resets_at, fetched_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+         ON CONFLICT(provider, alias) DO UPDATE SET
+            five_hour = excluded.five_hour,
+            five_hour_resets_at = excluded.five_hour_resets_at,
+            seven_day = excluded.seven_day,
+            seven_day_resets_at = excluded.seven_day_resets_at,
+            monthly = excluded.monthly,
+            monthly_resets_at = excluded.monthly_resets_at,
+            fetched_at = excluded.fetched_at",
+        rusqlite::params![
+            usage.provider,
+            usage.alias,
+            usage.five_hour.as_ref().map(|window| window.utilization),
+            usage
+                .five_hour
+                .as_ref()
+                .and_then(|window| window.resets_at.as_deref()),
+            usage.seven_day.as_ref().map(|window| window.utilization),
+            usage
+                .seven_day
+                .as_ref()
+                .and_then(|window| window.resets_at.as_deref()),
+            usage.monthly.as_ref().map(|window| window.utilization),
+            usage
+                .monthly
+                .as_ref()
+                .and_then(|window| window.resets_at.as_deref()),
+            usage.fetched_at,
+        ],
+    )
+    .map_err(|source| StatsError::Query { source })?;
+    Ok(())
+}
+
+/// Load the latest cached usage snapshots for all supported accounts.
+///
+/// # Errors
+///
+/// Returns a [`StatsError`] if the database cannot be read.
+pub fn account_usage_cache() -> Result<Vec<AccountUsage>, StatsError> {
+    let path = stats_db();
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let conn = open(&path)?;
+    ensure_account_usage_schema(&conn).map_err(|source| StatsError::Query { source })?;
+    let mut stmt = conn
+        .prepare(
+            "SELECT provider, alias, five_hour, five_hour_resets_at, seven_day,
+                    seven_day_resets_at, monthly, monthly_resets_at, fetched_at
+             FROM account_usage ORDER BY provider, alias",
+        )
+        .map_err(|source| StatsError::Query { source })?;
+    let rows = stmt
+        .query_map([], |row| {
+            let window = |utilization: Option<f64>, resets_at: Option<String>| {
+                utilization.map(|utilization| UsageWindow {
+                    utilization,
+                    resets_at,
+                })
+            };
+            Ok(AccountUsage {
+                provider: row.get(0)?,
+                alias: row.get(1)?,
+                five_hour: window(row.get(2)?, row.get(3)?),
+                seven_day: window(row.get(4)?, row.get(5)?),
+                monthly: window(row.get(6)?, row.get(7)?),
+                fetched_at: row.get(8)?,
+            })
+        })
+        .map_err(|source| StatsError::Query { source })?
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|source| StatsError::Query { source })?;
+    Ok(rows)
+}
+
+/// Record subscription quota percentages observed on a model response.
+/// Existing monthly usage remains intact when only the 5h/week headers arrive.
+pub fn record_account_rate_limits(provider: &str, alias: &str, h5: f64, week: f64) {
+    let res = open(&stats_db()).and_then(|conn| {
+        ensure_account_usage_schema(&conn).map_err(|source| StatsError::Query { source })?;
+        conn.execute(
+            "INSERT INTO account_usage
+                (provider, alias, five_hour, seven_day, fetched_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(provider, alias) DO UPDATE SET
+                five_hour = excluded.five_hour,
+                seven_day = excluded.seven_day,
+                fetched_at = excluded.fetched_at",
+            rusqlite::params![provider, alias, h5, week, unix_seconds()],
+        )
+        .map_err(|source| StatsError::Query { source })
+    });
+    if let Err(error) = res {
+        tracing::warn!(target: "local_proxy", error = %error, "failed to record account quota headers");
+    }
+}
+
+fn unix_seconds() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs() as i64)
+}
+
+/// Remember the latest account-wide subscription usage percents (5h, weekly), best-effort.
 ///
 /// Account-wide, so a single row; served by `/admin`. Failures are logged and ignored.
 pub fn record_rate_limits(h5: f64, week: f64) {
@@ -646,13 +894,14 @@ mod tests {
     fn insert_line(conn: &rusqlite::Connection, line: &StatLine) {
         conn.execute(
             "INSERT INTO requests
-                (ts, endpoint, provider, model, input_tokens, output_tokens,
+                (ts, endpoint, provider, alias, model, input_tokens, output_tokens,
                  streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
                  session_id)
-             VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12)",
+             VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
             rusqlite::params![
                 line.endpoint,
                 line.provider,
+                line.alias,
                 line.model,
                 line.input_tokens as i64,
                 line.output_tokens as i64,
@@ -681,6 +930,177 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM requests", [], |r| r.get(0))
             .unwrap();
         assert_eq!(count, 0);
+    }
+
+    #[test]
+    fn migration_adds_default_text_alias_for_existing_requests() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(db.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    streamed INTEGER NOT NULL DEFAULT 0,
+                    status INTEGER NOT NULL,
+                    latency_ms INTEGER NOT NULL DEFAULT 0,
+                    error INTEGER NOT NULL DEFAULT 0,
+                    energy_kwh_um INTEGER,
+                    cost_usd_um INTEGER,
+                    session_id TEXT NOT NULL DEFAULT ''
+                );
+                INSERT INTO requests (ts, endpoint, provider, model, status)
+                VALUES (1, '/v1/messages', 'openai', 'gpt-x', 200);",
+            )
+            .unwrap();
+        }
+        let conn = open_stats(db.path()).unwrap();
+
+        let accounts = by_account_on(&conn, all()).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].provider, "openai");
+        assert_eq!(accounts[0].alias, "default");
+    }
+
+    #[test]
+    fn migration_reads_aliases_from_an_earlier_integer_column() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        {
+            let conn = rusqlite::Connection::open(db.path()).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE requests (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    ts INTEGER NOT NULL,
+                    endpoint TEXT NOT NULL,
+                    provider TEXT NOT NULL,
+                    alias INTEGER,
+                    model TEXT NOT NULL,
+                    input_tokens INTEGER NOT NULL DEFAULT 0,
+                    output_tokens INTEGER NOT NULL DEFAULT 0,
+                    streamed INTEGER NOT NULL DEFAULT 0,
+                    status INTEGER NOT NULL,
+                    latency_ms INTEGER NOT NULL DEFAULT 0,
+                    error INTEGER NOT NULL DEFAULT 0,
+                    energy_kwh_um INTEGER,
+                    cost_usd_um INTEGER,
+                    session_id TEXT NOT NULL DEFAULT ''
+                );
+                INSERT INTO requests (ts, endpoint, provider, model, status)
+                VALUES (1, '/v1/messages', 'openai', 'gpt-x', 200);
+                INSERT INTO requests (ts, endpoint, provider, alias, model, status)
+                VALUES (2, '/v1/messages', 'openai', 123, 'gpt-x', 200);",
+            )
+            .unwrap();
+        }
+
+        let conn = open_stats(db.path()).unwrap();
+        let accounts = by_account_on(&conn, all()).unwrap();
+        assert_eq!(accounts.len(), 2);
+        assert_eq!(accounts[0].alias, "123");
+        assert_eq!(accounts[1].alias, "default");
+        let recent = recent_on(&conn, all(), 2).unwrap();
+        assert_eq!(recent[0].alias, "123");
+        assert_eq!(recent[1].alias, "default");
+    }
+
+    #[test]
+    fn writes_preserve_the_routed_account_alias() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let line = StatLine {
+            endpoint: "/v1/messages",
+            provider: "openai".to_string(),
+            alias: "work".to_string(),
+            model: "gpt-x".to_string(),
+            status: 200,
+            ..StatLine::default()
+        };
+
+        write_line(db.path(), &line, 1, 0).unwrap();
+
+        let conn = open_stats(db.path()).unwrap();
+        let accounts = by_account_on(&conn, all()).unwrap();
+        assert_eq!(accounts.len(), 1);
+        assert_eq!(accounts[0].alias, "work");
+    }
+
+    #[test]
+    fn account_usage_cache_isolated_by_provider_and_alias() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", dir.path());
+        let chatgpt = AccountUsage {
+            provider: "chatgpt".to_string(),
+            alias: "personal".to_string(),
+            five_hour: Some(UsageWindow {
+                utilization: 25.0,
+                resets_at: Some("2000000000".to_string()),
+            }),
+            seven_day: None,
+            monthly: None,
+            fetched_at: 100,
+        };
+        let claude = AccountUsage {
+            provider: "claude".to_string(),
+            alias: "max".to_string(),
+            five_hour: Some(UsageWindow {
+                utilization: 60.0,
+                resets_at: None,
+            }),
+            seven_day: Some(UsageWindow {
+                utilization: 35.0,
+                resets_at: Some("2026-10-12T00:00:00Z".to_string()),
+            }),
+            monthly: Some(UsageWindow {
+                utilization: 10.0,
+                resets_at: None,
+            }),
+            fetched_at: 200,
+        };
+
+        save_account_usage(&chatgpt).unwrap();
+        save_account_usage(&claude).unwrap();
+
+        let cached = account_usage_cache().unwrap();
+        assert_eq!(cached, [chatgpt, claude]);
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
+    }
+
+    #[test]
+    fn account_quota_headers_update_only_the_matching_account() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", dir.path());
+        save_account_usage(&AccountUsage {
+            provider: "chatgpt".to_string(),
+            alias: "work".to_string(),
+            five_hour: None,
+            seven_day: None,
+            monthly: Some(UsageWindow {
+                utilization: 15.0,
+                resets_at: None,
+            }),
+            fetched_at: 10,
+        })
+        .unwrap();
+
+        record_account_rate_limits("chatgpt", "work", 25.0, 40.0);
+        record_account_rate_limits("chatgpt", "personal", 5.0, 10.0);
+
+        let cached = account_usage_cache().unwrap();
+        assert_eq!(cached.len(), 2);
+        let work = cached.iter().find(|item| item.alias == "work").unwrap();
+        assert!((work.five_hour.as_ref().unwrap().utilization - 25.0).abs() < f64::EPSILON);
+        assert!((work.seven_day.as_ref().unwrap().utilization - 40.0).abs() < f64::EPSILON);
+        assert!((work.monthly.as_ref().unwrap().utilization - 15.0).abs() < f64::EPSILON);
+        let personal = cached.iter().find(|item| item.alias == "personal").unwrap();
+        assert!((personal.five_hour.as_ref().unwrap().utilization - 5.0).abs() < f64::EPSILON);
+        assert!((personal.seven_day.as_ref().unwrap().utilization - 10.0).abs() < f64::EPSILON);
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
     }
 
     #[test]
@@ -767,6 +1187,7 @@ mod tests {
         let line = StatLine {
             endpoint: "/v1/messages",
             provider: "neuralwatt".to_string(),
+            alias: "default".to_string(),
             model: "glm-5.2".to_string(),
             input_tokens: 10,
             output_tokens: 5,
@@ -833,6 +1254,7 @@ mod tests {
         let mut line = StatLine {
             endpoint: "/v1/messages",
             provider: "openrouter".to_string(),
+            alias: "default".to_string(),
             model: "model-a".to_string(),
             input_tokens: 10,
             output_tokens: 5,

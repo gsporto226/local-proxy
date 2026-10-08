@@ -408,8 +408,12 @@ fn init_tracing() {
         .and_then(|()| std::fs::File::create(log_file()))
         .map(std::sync::Arc::new);
 
+    // One formatter feeds the console, the log file and the `/admin/events` tap,
+    // so colour only when a person reads stdout: escape codes in the file or the
+    // tap break whatever renders them (the Claude Code mod's Logs tab).
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_target(true);
     let console = std::io::stdout.and(crate::admin::LogTap::default);
     if let Ok(file) = file_writer {
@@ -1516,10 +1520,18 @@ pub fn stats_json(since: &str) -> Result<Option<serde_json::Value>, CliError> {
     let by_provider = crate::stats::by_provider(window)
         .map_err(CliError::from)?
         .unwrap_or_default();
+    let by_account = crate::stats::by_account(window)
+        .map_err(CliError::from)?
+        .unwrap_or_default();
     let recent = crate::stats::recent(window, 10)
         .map_err(CliError::from)?
         .unwrap_or_default();
-    Ok(Some(render_stats_json(&summary, &by_provider, &recent)))
+    Ok(Some(render_stats_json(
+        &summary,
+        &by_provider,
+        &by_account,
+        &recent,
+    )))
 }
 
 /// The `--since` window ending now (`all` or unknown means no filter).
@@ -1604,6 +1616,7 @@ fn render_stats_text(
 fn render_stats_json(
     summary: &crate::stats::RowSummary,
     by_provider: &[crate::stats::ProviderStats],
+    by_account: &[crate::stats::AccountStats],
     recent: &[crate::stats::RequestRow],
 ) -> serde_json::Value {
     let summary_json = serde_json::json!({
@@ -1629,6 +1642,21 @@ fn render_stats_json(
             })
         })
         .collect();
+    let accounts_json: Vec<serde_json::Value> = by_account
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "provider": a.provider,
+                "alias": a.alias,
+                "requests": a.requests,
+                "input_tokens": a.input_tokens,
+                "output_tokens": a.output_tokens,
+                "total_latency_ms": a.latency_ms,
+                "energy_kwh": a.energy_kwh_um as f64 / 1_000_000.0,
+                "cost_usd": a.cost_usd_um as f64 / 1_000_000.0,
+            })
+        })
+        .collect();
     let recent_json: Vec<serde_json::Value> = recent
         .iter()
         .map(|r| {
@@ -1636,6 +1664,7 @@ fn render_stats_json(
                 "ts": r.ts,
                 "endpoint": r.endpoint,
                 "provider": r.provider,
+                "alias": r.alias,
                 "model": r.model,
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
@@ -1656,6 +1685,7 @@ fn render_stats_json(
     serde_json::json!({
         "summary": summary_json,
         "providers": providers_json,
+        "accounts": accounts_json,
         "recent": recent_json,
     })
 }
@@ -2270,6 +2300,7 @@ mod tests {
         let cfg = config_with(vec!["sk-proxy".to_string()]);
         let env = launch_environment(&cfg, 8787, Some("kimi-k2.6"));
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(map["LOCAL_PROXY_PORT"], "8787");
         assert_eq!(map["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787");
         assert_eq!(map["ANTHROPIC_API_KEY"], "sk-proxy");
         assert_eq!(map["ANTHROPIC_AUTH_TOKEN"], "sk-proxy");

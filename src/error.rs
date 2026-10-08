@@ -187,6 +187,17 @@ impl From<UpstreamError> for ApiError {
                 "api_error",
                 format!("upstream request to {url} failed: {source}"),
             ),
+            UpstreamError::UsageRequiresOAuth { provider }
+            | UpstreamError::UsageData { provider } => Self::new(
+                502,
+                "api_error",
+                format!("provider {provider} usage is unavailable"),
+            ),
+            UpstreamError::UsageStatus { provider, status } => Self::new(
+                502,
+                "api_error",
+                format!("provider {provider} usage endpoint returned HTTP {status}"),
+            ),
         }
     }
 }

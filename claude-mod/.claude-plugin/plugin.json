@@ -9,8 +9,8 @@
       "type": "string",
       "multiple": true,
       "title": "Status line segments",
-      "description": "Ordered list of: model, context, rate5h, rateWeek, sessionCost, todayCost",
-      "default": ["model", "context", "rate5h", "rateWeek", "sessionCost", "todayCost"]
+      "description": "Ordered list of: model, effort, account, context, rate5h, rateWeek",
+      "default": ["model", "effort", "account", "context", "rate5h", "rateWeek"]
     }
   }
 }

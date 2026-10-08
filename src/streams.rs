@@ -23,6 +23,7 @@ pub type UpstreamStream = Pin<Box<dyn Stream<Item = Result<Event, Infallible>> +
 pub struct StreamCapture {
     endpoint: &'static str,
     provider: String,
+    alias: String,
     model: String,
     status: u16,
     started: Instant,
@@ -35,6 +36,7 @@ impl StreamCapture {
     pub fn new(
         endpoint: &'static str,
         provider: &str,
+        alias: &str,
         model: &str,
         status: u16,
         started: Instant,
@@ -43,6 +45,7 @@ impl StreamCapture {
         Self {
             endpoint,
             provider: provider.to_string(),
+            alias: alias.to_string(),
             model: model.to_string(),
             status,
             started,
@@ -60,6 +63,7 @@ impl StreamCapture {
             StatLine {
                 endpoint: self.endpoint,
                 provider: self.provider.clone(),
+                alias: self.alias.clone(),
                 model: self.model.clone(),
                 input_tokens: usage.input,
                 output_tokens: usage.output,

@@ -369,8 +369,10 @@ pub fn app(state: AppState) -> AxumRouter {
         .route("/v1/chat/completions", post(chat_completions_handler))
         .route("/v1/responses", post(responses_handler))
         .route("/v1/models", get(models_handler))
-        .merge(crate::admin::routes())
         .layer(tower_http::trace::TraceLayer::new_for_http())
+        // Merged after the trace layer: the mod polls /admin, and tracing those
+        // calls would feed its own `log` event stream back to it.
+        .merge(crate::admin::routes())
         .with_state(state)
 }
 
@@ -772,6 +774,7 @@ fn client_for(
 fn capture(
     endpoint: &'static str,
     provider: &str,
+    alias: &str,
     model: &str,
     streamed: bool,
     status: u16,
@@ -797,6 +800,7 @@ fn capture(
         StatLine {
             endpoint,
             provider: provider.to_string(),
+            alias: alias.to_string(),
             model: model.to_string(),
             input_tokens: tokens.input,
             output_tokens: tokens.output,
@@ -1262,6 +1266,7 @@ async fn handle_chat(
         capture(
             endpoint,
             &provider.name,
+            client.alias(),
             &upstream_model,
             streaming,
             status,
@@ -1283,6 +1288,7 @@ async fn handle_chat(
         let cap = StreamCapture::new(
             endpoint,
             &provider.name,
+            client.alias(),
             &upstream_model,
             status,
             started,
@@ -1308,6 +1314,7 @@ async fn handle_chat(
         capture(
             endpoint,
             &provider.name,
+            client.alias(),
             &upstream_model,
             false,
             status,
@@ -1325,6 +1332,7 @@ async fn handle_chat(
     capture(
         endpoint,
         &provider.name,
+        client.alias(),
         &upstream_model,
         false,
         status,

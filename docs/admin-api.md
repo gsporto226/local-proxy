@@ -4,7 +4,9 @@ Served by the running proxy under `/admin`. **Loopback only**: requests whose
 peer address is not loopback get `403`. No API key. JSON in/out.
 
 Port: `LOCAL_PROXY_PORT` env (set by `launch`, honoured by `serve`), default
-`8787`. Clients (the Claude Code mod) use `http://127.0.0.1:$LOCAL_PROXY_PORT`.
+`8787`. The Claude Code mod finds the proxy through Claude's own
+`ANTHROPIC_BASE_URL` (loopback only) and stays inert unless `/admin/status`
+answers there.
 
 ## Reads
 
@@ -16,6 +18,7 @@ Port: `LOCAL_PROXY_PORT` env (set by `launch`, honoured by `serve`), default
 | `GET /admin/models` | `[string]` |
 | `GET /admin/stats?since=day\|week\|month\|all` | same JSON as `local-proxy stats --json`; `null` before any stats exist |
 | `GET /admin/rate-limits` | `{ h5, week }` (percent, nullable) |
+| `GET /admin/account-usage` | Account quota snapshots for ChatGPT and Claude subscriptions. Results are cached for 60 seconds. |
 | `GET /admin/logs?n=200` | `{ lines: [string] }` |
 | `GET /admin/session/{id}` | `{ account: { provider: alias }, effort, stats }` for that session |
 
@@ -32,6 +35,12 @@ Port: `LOCAL_PROXY_PORT` env (set by `launch`, honoured by `serve`), default
 
 Successful writes return `{ message }` (the CLI's message); session pin
 routes return the session's resulting `{ provider: alias }` map.
+
+`GET /admin/account-usage` returns entries tagged `available` or `unavailable`.
+Available entries contain the account's 5-hour, 7-day, and optional monthly
+extra-usage windows. Each window contains `utilization` and `resets_at`.
+Unavailable entries contain the fetch error. A stale available entry includes
+the last good snapshot and the latest refresh error.
 
 `connect` is intentionally absent: credentials only via the CLI.
 
