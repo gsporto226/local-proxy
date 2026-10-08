@@ -27,8 +27,20 @@ jobs:
       - name: toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # Prefix restore instead of rust-cache: rust-cache keys on the Cargo.lock
+      # hash, and the release version bump rewrites the lock, so every tag built
+      # from scratch (~9min of vendored OpenSSL/SQLCipher on Windows). Cargo is
+      # safe with a stale target dir - it recompiles only what actually changed.
       - name: cargo cache
-        uses: Swatinem/rust-cache@v2
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: v0-release-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: |
+            v0-release-${{ runner.os }}-
 
       - name: secret service build deps (Linux)
         if: runner.os == 'Linux'
