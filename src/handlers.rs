@@ -80,6 +80,16 @@ impl AppState {
             .cloned()
     }
 
+    /// All account pins of `session_id` (`provider -> alias`).
+    pub async fn session_accounts(&self, session_id: &str) -> HashMap<String, String> {
+        self.sessions
+            .read()
+            .await
+            .get(session_id)
+            .cloned()
+            .unwrap_or_default()
+    }
+
     /// Pin `alias` as the account of `session_id` for `provider`. A request
     /// without a session id cannot pin anything (there is no session).
     pub async fn set_session_account(&self, session_id: &str, provider: &str, alias: &str) {
@@ -360,6 +370,9 @@ pub fn app(state: AppState) -> AxumRouter {
         .route("/v1/responses", post(responses_handler))
         .route("/v1/models", get(models_handler))
         .layer(tower_http::trace::TraceLayer::new_for_http())
+        // Merged after the trace layer: the mod polls /admin, and tracing those
+        // calls would feed its own `log` event stream back to it.
+        .merge(crate::admin::routes())
         .with_state(state)
 }
 
@@ -761,6 +774,7 @@ fn client_for(
 fn capture(
     endpoint: &'static str,
     provider: &str,
+    alias: &str,
     model: &str,
     streamed: bool,
     status: u16,
@@ -786,6 +800,7 @@ fn capture(
         StatLine {
             endpoint,
             provider: provider.to_string(),
+            alias: alias.to_string(),
             model: model.to_string(),
             input_tokens: tokens.input,
             output_tokens: tokens.output,
@@ -839,7 +854,7 @@ async fn maybe_exec(
     let cmd = crate::exec::split_command(&text, &exec.token)?;
     let args = crate::exec::parse_args(cmd);
     if args.first().map(String::as_str) == Some("model") {
-        Some(handle_model_exec(app, state, session_id, &args).await)
+        Some(handle_model_exec(app, state, &args).await)
     } else if args.first().map(String::as_str) == Some("effort") {
         Some(handle_effort_exec(app, state, &args).await)
     } else if args.first().map(String::as_str) == Some("account") {
@@ -890,26 +905,57 @@ fn handle_logs_exec(args: &[String]) -> crate::exec::ExecOutput {
     }
 }
 
-/// Handle `$proxy effort [level|clear]` in-process: persist via the CLI logic
-/// and apply it to this instance right away (others follow via hot-reload).
+/// Persist the reasoning effort (`level` or `clear`) via the CLI logic and
+/// apply it to this instance right away (others follow via hot-reload).
+/// Shared by `$proxy effort` and `PUT /admin/effort`.
+pub(crate) async fn apply_effort(app: &AppState, level: &str) -> Result<String, String> {
+    let config_path = app.snapshot().await.config_path;
+    let msg = crate::cli::effort_result(&config_path, Some(level)).map_err(|e| e.to_string())?;
+    {
+        let mut guard = app.inner.write().await;
+        let mut cfg = (*guard.config).clone();
+        cfg.defaults.active_effort = (level != "clear").then(|| level.to_string());
+        guard.config = Arc::new(cfg);
+    }
+    crate::admin::emit_config(app).await;
+    Ok(msg)
+}
+
+/// Validate/persist the active model (`clear` unsets it) via the CLI logic and
+/// update this instance's in-memory `active_model` (per-instance, no
+/// broadcast to other running proxies). Shared by `$proxy model` and
+/// `PUT /admin/model`.
+pub(crate) async fn apply_model(app: &AppState, model: &str) -> Result<String, String> {
+    let config_path = app.snapshot().await.config_path;
+    let msg = crate::cli::model_result(&config_path, Some(model)).map_err(|e| e.to_string())?;
+    if model == "clear" {
+        app.set_active_model(None).await;
+    } else if msg.starts_with("modelo ativo:") {
+        app.set_active_model(Some(model.to_string())).await;
+    }
+    crate::admin::emit_config(app).await;
+    Ok(msg)
+}
+
+/// Handle `$proxy effort [level|clear]` in-process.
 async fn handle_effort_exec(
     app: &AppState,
     state: &RuntimeState,
     args: &[String],
 ) -> crate::exec::ExecOutput {
-    let level = args.get(1).map(String::as_str);
-    let (stdout, stderr, code) = match crate::cli::effort_result(&state.config_path, level) {
-        Ok(msg) => {
-            if let Some(l) = level {
-                let value = (l != "clear").then(|| l.to_string());
-                let mut guard = app.inner.write().await;
-                let mut cfg = (*guard.config).clone();
-                cfg.defaults.active_effort = value;
-                guard.config = Arc::new(cfg);
-            }
-            (msg, String::new(), 0)
-        }
-        Err(e) => (String::new(), e.to_string(), 1),
+    let result = match args.get(1) {
+        Some(level) => apply_effort(app, level).await,
+        None => crate::cli::effort_result(&state.config_path, None).map_err(|e| e.to_string()),
+    };
+    exec_output(result)
+}
+
+/// An [`ExecOutput`](crate::exec::ExecOutput) carrying `result` on stdout
+/// (code 0) or stderr (code 1).
+fn exec_output(result: Result<String, String>) -> crate::exec::ExecOutput {
+    let (stdout, stderr, code) = match result {
+        Ok(msg) => (msg, String::new(), 0),
+        Err(e) => (String::new(), e, 1),
     };
     crate::exec::ExecOutput {
         stdout,
@@ -920,51 +966,19 @@ async fn handle_effort_exec(
 }
 
 /// Handle `$proxy model ...` in-process: report this instance's in-memory
-/// model, or validate/persist via the CLI logic and update the in-memory
-/// `active_model` (per-instance, no broadcast to other running proxies).
+/// model, or set/clear it via [`apply_model`].
 async fn handle_model_exec(
     app: &AppState,
     state: &RuntimeState,
-    session_id: &str,
     args: &[String],
 ) -> crate::exec::ExecOutput {
-    let selection = args.get(1).map(String::as_str);
-    let stdout = match selection {
-        None => state.config.defaults.active_model.as_deref().map_or_else(
+    exec_output(match args.get(1) {
+        None => Ok(state.config.defaults.active_model.as_deref().map_or_else(
             || "nenhum modelo ativo".to_string(),
             |m| format!("modelo ativo: {m}"),
-        ),
-        Some("clear") => {
-            let msg = crate::cli::model_result(&state.config_path, Some("clear"))
-                .unwrap_or_else(|e| e.to_string());
-            app.set_active_model(None).await;
-            msg
-        }
-        Some(selected) => match crate::cli::model_result(&state.config_path, Some(selected)) {
-            Ok(msg) => {
-                if msg.starts_with("modelo ativo:") {
-                    app.set_active_model(Some(selected.to_string())).await;
-                    // The status line shows the switch before the next request.
-                    stats::record_model(session_id, selected);
-                }
-                msg
-            }
-            Err(e) => {
-                return crate::exec::ExecOutput {
-                    stdout: String::new(),
-                    stderr: e.to_string(),
-                    code: 1,
-                    timed_out: false,
-                };
-            }
-        },
-    };
-    crate::exec::ExecOutput {
-        stdout,
-        stderr: String::new(),
-        code: 0,
-        timed_out: false,
-    }
+        )),
+        Some(model) => apply_model(app, model).await,
+    })
 }
 
 /// Handle `$proxy account ...` in-process: list accounts, switch this session
@@ -997,6 +1011,7 @@ async fn handle_account_exec(
                 }
                 _ => {}
             }
+            crate::admin::emit_config(app).await;
             crate::exec::ExecOutput {
                 stdout: msg,
                 stderr: String::new(),
@@ -1077,7 +1092,7 @@ fn exec_responses_response(text: &str, model: &str) -> Response {
 // ---------------------------------------------------------------------------
 
 /// The reasoning effort an Anthropic request asks for (`output_config.effort`,
-/// as Claude Code sends it), for the status line.
+/// as Claude Code sends it), for the `/admin` session stats.
 fn request_effort(body: &[u8]) -> Option<String> {
     #[derive(serde::Deserialize)]
     struct OutputConfig {
@@ -1209,10 +1224,6 @@ async fn handle_chat(
         streaming,
         "resolved route"
     );
-    stats::record_model(
-        session_id,
-        &crate::config::qualified_id(&provider.name, &upstream_model),
-    );
     body["model"] = json!(upstream_model);
     if client_format == Format::Anthropic {
         if let Some(effort) = &state.config.defaults.active_effort {
@@ -1255,6 +1266,7 @@ async fn handle_chat(
         capture(
             endpoint,
             &provider.name,
+            client.alias(),
             &upstream_model,
             streaming,
             status,
@@ -1276,6 +1288,7 @@ async fn handle_chat(
         let cap = StreamCapture::new(
             endpoint,
             &provider.name,
+            client.alias(),
             &upstream_model,
             status,
             started,
@@ -1301,6 +1314,7 @@ async fn handle_chat(
         capture(
             endpoint,
             &provider.name,
+            client.alias(),
             &upstream_model,
             false,
             status,
@@ -1318,6 +1332,7 @@ async fn handle_chat(
     capture(
         endpoint,
         &provider.name,
+        client.alias(),
         &upstream_model,
         false,
         status,
@@ -1604,7 +1619,6 @@ mod tests {
             routes: Vec::new(),
             defaults: crate::config::Defaults::default(),
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         };
         let state = RuntimeState {
             config: Arc::new(cfg),
@@ -1787,7 +1801,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let mut clients = HashMap::new();
         let openai = cfg
@@ -1858,7 +1871,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let mut clients = HashMap::new();
         let openai = cfg
@@ -1935,7 +1947,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let mut clients = HashMap::new();
         let openai = cfg
@@ -2001,7 +2012,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let mut clients = HashMap::new();
         let openai = cfg
@@ -2058,7 +2068,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let state = RuntimeState {
             config: cfg.clone(),
@@ -2395,7 +2404,6 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         });
         let state = RuntimeState {
             config: cfg.clone(),

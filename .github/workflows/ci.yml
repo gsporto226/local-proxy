@@ -102,6 +102,25 @@ jobs:
           bun install
           bun test mock.test.ts
 
+  claude-mod:
+    name: claude-mod (validate + test)
+    runs-on: ubuntu-latest
+    if: github.event_name != 'schedule'
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+      - name: install Claude Code
+        run: npm i -g @anthropic-ai/claude-code
+      - name: validate
+        run: |
+          claude plugin validate .
+          claude plugin validate claude-mod
+      - name: test
+        run: claude plugin test claude-mod
+
   audit:
     name: cargo-audit (segurança)
     runs-on: ubuntu-latest

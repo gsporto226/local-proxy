@@ -2,11 +2,20 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use reqwest::header::{HeaderMap, HeaderValue, AUTHORIZATION, CONTENT_TYPE, USER_AGENT};
+use serde::Deserialize;
 use serde_json::{json, Value};
 
 use crate::auth::{AuthEntry, OAuthTokens};
 use crate::config::{OAuthProvider, Provider, ProviderFormat};
 const ANTHROPIC_VERSION: &str = "2023-06-01";
+
+fn usage_endpoint(provider: &str) -> Option<&'static str> {
+    match provider {
+        "chatgpt" => Some("https://chatgpt.com/backend-api/wham/usage"),
+        "claude" => Some("https://api.anthropic.com/api/oauth/usage"),
+        _ => None,
+    }
+}
 
 /// Errors that can occur while building clients or talking to upstreams.
 #[derive(Debug, thiserror::Error)]
@@ -40,6 +49,26 @@ pub enum UpstreamError {
         /// Underlying request error.
         source: reqwest::Error,
     },
+    /// The provider's usage endpoint requires an OAuth subscription account.
+    #[error("provider {provider} usage endpoint requires an OAuth account")]
+    UsageRequiresOAuth {
+        /// Provider name.
+        provider: String,
+    },
+    /// The provider's usage endpoint rejected the request.
+    #[error("provider {provider} usage endpoint returned HTTP {status}")]
+    UsageStatus {
+        /// Provider name.
+        provider: String,
+        /// HTTP response status.
+        status: u16,
+    },
+    /// The provider returned a successful response without recognized usage windows.
+    #[error("provider {provider} usage response contained no supported quota windows")]
+    UsageData {
+        /// Provider name.
+        provider: String,
+    },
 }
 
 /// Mutable OAuth state shared by every clone of a provider's client: the token
@@ -48,6 +77,103 @@ pub enum UpstreamError {
 struct OAuthState {
     tokens: OAuthTokens,
     config: OAuthProvider,
+}
+
+#[derive(Deserialize)]
+struct ChatGptUsageResponse {
+    rate_limit: Option<ChatGptRateLimit>,
+}
+
+#[derive(Deserialize)]
+struct ChatGptRateLimit {
+    primary_window: Option<ChatGptWindow>,
+    secondary_window: Option<ChatGptWindow>,
+}
+
+#[derive(Deserialize)]
+struct ChatGptWindow {
+    used_percent: Option<f64>,
+    limit_window_seconds: Option<u64>,
+    reset_at: Option<i64>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeUsageResponse {
+    five_hour: Option<ClaudeWindow>,
+    seven_day: Option<ClaudeWindow>,
+    extra_usage: Option<ClaudeExtraUsage>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeWindow {
+    utilization: f64,
+    resets_at: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct ClaudeExtraUsage {
+    utilization: Option<f64>,
+    resets_at: Option<String>,
+}
+
+fn parse_chatgpt_usage(
+    body: &Value,
+) -> Option<(
+    Option<crate::stats::UsageWindow>,
+    Option<crate::stats::UsageWindow>,
+    Option<crate::stats::UsageWindow>,
+)> {
+    let response: ChatGptUsageResponse = serde_json::from_value(body.clone()).ok()?;
+    let mut windows = (None, None, None);
+    let rate_limit = response.rate_limit?;
+    for window in [rate_limit.primary_window, rate_limit.secondary_window]
+        .into_iter()
+        .flatten()
+    {
+        let (Some(utilization), Some(seconds)) = (window.used_percent, window.limit_window_seconds)
+        else {
+            continue;
+        };
+        let quota = crate::stats::UsageWindow {
+            utilization,
+            resets_at: window.reset_at.map(|timestamp| timestamp.to_string()),
+        };
+        match seconds {
+            18_000 => windows.0 = Some(quota),
+            604_800 => windows.1 = Some(quota),
+            2_592_000 => windows.2 = Some(quota),
+            _ => {}
+        }
+    }
+    (windows.0.is_some() || windows.1.is_some() || windows.2.is_some()).then_some(windows)
+}
+
+fn parse_claude_usage(
+    body: &Value,
+) -> Option<(
+    Option<crate::stats::UsageWindow>,
+    Option<crate::stats::UsageWindow>,
+    Option<crate::stats::UsageWindow>,
+)> {
+    let response: ClaudeUsageResponse = serde_json::from_value(body.clone()).ok()?;
+    let five_hour = response.five_hour.map(|window| crate::stats::UsageWindow {
+        utilization: window.utilization,
+        resets_at: window.resets_at,
+    });
+    let seven_day = response.seven_day.map(|window| crate::stats::UsageWindow {
+        utilization: window.utilization,
+        resets_at: window.resets_at,
+    });
+    let monthly = response.extra_usage.and_then(|usage| {
+        usage
+            .utilization
+            .map(|utilization| crate::stats::UsageWindow {
+                utilization,
+                resets_at: usage.resets_at,
+            })
+    });
+    (five_hour.is_some() || seven_day.is_some() || monthly.is_some())
+        .then_some((five_hour, seven_day, monthly))
 }
 
 /// A per-provider HTTP client that knows how to authenticate against the
@@ -134,7 +260,13 @@ impl ProviderClient {
         })
     }
 
-    /// The provider's name.
+    /// The account alias this client authenticates as.
+    #[must_use]
+    pub fn alias(&self) -> &str {
+        &self.alias
+    }
+
+    /// The provider name.
     #[must_use]
     pub fn name(&self) -> &str {
         &self.name
@@ -151,6 +283,102 @@ impl ProviderClient {
     #[must_use]
     pub fn has_key(&self) -> bool {
         self.auth.as_ref().is_some_and(AuthEntry::usable)
+    }
+
+    /// Whether this provider has a configured subscription usage endpoint.
+    #[must_use]
+    pub fn has_usage_endpoint(&self) -> bool {
+        usage_endpoint(&self.name).is_some()
+    }
+
+    /// Fetch this OAuth account's latest quota windows from its provider endpoint.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error when the account lacks OAuth credentials or the
+    /// provider endpoint rejects the request or returns an unrecognized shape.
+    pub async fn fetch_usage(&self) -> Result<Option<crate::stats::AccountUsage>, UpstreamError> {
+        let Some(url) = usage_endpoint(&self.name) else {
+            return Ok(None);
+        };
+        self.fetch_usage_at(url).await.map(Some)
+    }
+
+    async fn fetch_usage_at(&self, url: &str) -> Result<crate::stats::AccountUsage, UpstreamError> {
+        let Some(access) = self.oauth_access().await else {
+            return Err(UpstreamError::UsageRequiresOAuth {
+                provider: self.name.clone(),
+            });
+        };
+
+        let mut headers = HeaderMap::new();
+        headers.insert(
+            AUTHORIZATION,
+            Self::header_value(&format!("Bearer {access}"))?,
+        );
+        self.insert_oauth_headers(&mut headers);
+        if let (Some(name), Some(account)) = (&self.account_header, self.oauth_account().await) {
+            let name =
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()).map_err(|error| {
+                    UpstreamError::InvalidHeader {
+                        detail: error.to_string(),
+                    }
+                })?;
+            headers.insert(name, Self::header_value(&account)?);
+        }
+        for (name, value) in &self.headers {
+            let (Ok(name), Ok(value)) = (
+                reqwest::header::HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(value),
+            ) else {
+                continue;
+            };
+            headers.insert(name, value);
+        }
+
+        let response = self
+            .http
+            .get(url)
+            .headers(headers)
+            .timeout(Duration::from_secs(10))
+            .send()
+            .await
+            .map_err(|source| UpstreamError::Request {
+                url: url.to_string(),
+                source,
+            })?;
+        if !response.status().is_success() {
+            return Err(UpstreamError::UsageStatus {
+                provider: self.name.clone(),
+                status: response.status().as_u16(),
+            });
+        }
+        let body = response
+            .json::<Value>()
+            .await
+            .map_err(|source| UpstreamError::Request {
+                url: url.to_string(),
+                source,
+            })?;
+        let windows = match self.name.as_str() {
+            "chatgpt" => parse_chatgpt_usage(&body),
+            "claude" => parse_claude_usage(&body),
+            _ => None,
+        }
+        .ok_or_else(|| UpstreamError::UsageData {
+            provider: self.name.clone(),
+        })?;
+        let fetched_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map_or(0, |duration| duration.as_secs().cast_signed());
+        Ok(crate::stats::AccountUsage {
+            provider: self.name.clone(),
+            alias: self.alias.clone(),
+            five_hour: windows.0,
+            seven_day: windows.1,
+            monthly: windows.2,
+            fetched_at,
+        })
     }
 
     /// Default endpoint path for this provider's format.
@@ -414,6 +642,7 @@ impl ProviderClient {
             .map(|(h5, week)| (h5 * 100.0, week * 100.0));
         if let Some((h5, week)) = codex.or(claude) {
             crate::stats::record_rate_limits(h5, week);
+            crate::stats::record_account_rate_limits(&self.name, &self.alias, h5, week);
         }
         Ok(resp)
     }
@@ -675,6 +904,12 @@ mod tests {
     /// receives and returns them in the response body as JSON. Returns
     /// `(base_url, received_headers)`.
     async fn header_capture_server() -> (String, tokio::sync::oneshot::Receiver<HeaderMap>) {
+        json_capture_server("{}").await
+    }
+
+    async fn json_capture_server(
+        body: &'static str,
+    ) -> (String, tokio::sync::oneshot::Receiver<HeaderMap>) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         use tokio::net::TcpListener;
 
@@ -703,7 +938,7 @@ mod tests {
                 }
             }
             let _ = tx.send(headers);
-            let body = b"{}";
+            let body = body.as_bytes();
             let _ = sock
                 .write_all(
                     format!(
@@ -716,6 +951,89 @@ mod tests {
             let _ = sock.write_all(body).await;
         });
         (format!("http://{addr}"), rx)
+    }
+
+    fn usage_oauth_entry(account_id: Option<&str>) -> AuthEntry {
+        AuthEntry::OAuth(OAuthTokens {
+            access: "test-access".to_string(),
+            refresh: "test-refresh".to_string(),
+            expires: i64::MAX,
+            account_id: account_id.map(str::to_string),
+        })
+    }
+
+    #[tokio::test]
+    async fn chatgpt_usage_uses_the_account_oauth_and_reads_quota_windows() {
+        let (url, received) = json_capture_server(
+            r#"{"rate_limit":{"primary_window":{"used_percent":20,"limit_window_seconds":18000,"reset_at":2000000000},"secondary_window":{"used_percent":35,"limit_window_seconds":604800,"reset_at":2000000100}}}"#,
+        )
+        .await;
+        let mut provider = provider(ProviderFormat::OpenaiResponses);
+        provider.name = "chatgpt".to_string();
+        provider.oauth = Some(crate::config::OAuthProvider {
+            account_id_header: Some("chatgpt-account-id".to_string()),
+            ..crate::config::OAuthProvider::default()
+        });
+        let client = ProviderClient::new_for_alias(
+            &provider,
+            "personal",
+            false,
+            Some(usage_oauth_entry(Some("account-123"))),
+        )
+        .unwrap();
+
+        let usage = client.fetch_usage_at(&url).await.unwrap();
+        let headers = received.await.unwrap();
+
+        assert_eq!(
+            headers.get("authorization").and_then(|v| v.to_str().ok()),
+            Some("Bearer test-access")
+        );
+        assert_eq!(
+            headers
+                .get("chatgpt-account-id")
+                .and_then(|v| v.to_str().ok()),
+            Some("account-123")
+        );
+        assert_eq!(usage.provider, "chatgpt");
+        assert_eq!(usage.alias, "personal");
+        assert!((usage.five_hour.as_ref().unwrap().utilization - 20.0).abs() < f64::EPSILON);
+        assert!((usage.seven_day.as_ref().unwrap().utilization - 35.0).abs() < f64::EPSILON);
+        assert_eq!(
+            usage.five_hour.as_ref().unwrap().resets_at.as_deref(),
+            Some("2000000000")
+        );
+    }
+
+    #[tokio::test]
+    async fn claude_usage_uses_oauth_headers_and_reads_extra_usage() {
+        let (url, received) = json_capture_server(
+            r#"{"five_hour":{"utilization":12.5,"resets_at":"2026-10-08T01:00:00Z"},"seven_day":{"utilization":45.0,"resets_at":"2026-10-12T00:00:00Z"},"extra_usage":{"is_enabled":true,"utilization":30.0}}"#,
+        )
+        .await;
+        let mut provider = provider(ProviderFormat::Anthropic);
+        provider.name = "claude".to_string();
+        provider.oauth = Some(crate::config::OAuthProvider {
+            headers: std::collections::HashMap::from([(
+                "anthropic-beta".to_string(),
+                "oauth-2025-04-20".to_string(),
+            )]),
+            ..crate::config::OAuthProvider::default()
+        });
+        let client =
+            ProviderClient::new_for_alias(&provider, "max", false, Some(usage_oauth_entry(None)))
+                .unwrap();
+
+        let usage = client.fetch_usage_at(&url).await.unwrap();
+        let headers = received.await.unwrap();
+
+        assert_eq!(
+            headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),
+            Some("oauth-2025-04-20")
+        );
+        assert!((usage.five_hour.as_ref().unwrap().utilization - 12.5).abs() < f64::EPSILON);
+        assert!((usage.seven_day.as_ref().unwrap().utilization - 45.0).abs() < f64::EPSILON);
+        assert!((usage.monthly.as_ref().unwrap().utilization - 30.0).abs() < f64::EPSILON);
     }
 
     #[tokio::test]

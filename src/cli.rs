@@ -8,8 +8,6 @@ use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::Duration;
 
-use std::collections::HashMap;
-
 use miette::Diagnostic;
 use serde::Deserialize;
 use sha2::{Digest, Sha256};
@@ -95,11 +93,6 @@ pub enum CliError {
         help("check the config file and the embedded catalog are valid")
     )]
     Runtime(#[from] crate::handlers::RuntimeError),
-
-    /// The status line could not be set up (script/settings write failed).
-    #[error(transparent)]
-    #[diagnostic(transparent)]
-    StatuslineSetup(#[from] crate::statusline::SetupError),
 
     /// The local usage statistics could not be read.
     #[error("failed to read usage statistics")]
@@ -373,7 +366,10 @@ pub async fn serve(
     }
 
     let host = host_flag.unwrap_or_else(|| runtime.config.server.host.clone());
-    let port = port_flag.unwrap_or(runtime.config.server.port);
+    let port = port_flag
+        .or_else(|| std::env::var("LOCAL_PROXY_PORT").ok()?.parse().ok())
+        .unwrap_or(runtime.config.server.port);
+    crate::admin::set_port(port);
     let addr = format!("{host}:{port}");
 
     let state = AppState::new(runtime);
@@ -387,7 +383,11 @@ pub async fn serve(
         write_pid(std::process::id()).map_err(CliError::from)?;
     }
     tracing::info!(target: crate::LOG_TARGET, %addr, "listening");
-    let result = axum::serve(listener, app).await;
+    let result = axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .await;
     if !ephemeral {
         remove_pid();
     }
@@ -396,6 +396,7 @@ pub async fn serve(
 }
 
 fn init_tracing() {
+    use tracing_subscriber::fmt::writer::MakeWriterExt;
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| format!("{}={},tower_http=debug", crate::LOG_TARGET, "debug").into());
 
@@ -407,17 +408,18 @@ fn init_tracing() {
         .and_then(|()| std::fs::File::create(log_file()))
         .map(std::sync::Arc::new);
 
+    // One formatter feeds the console, the log file and the `/admin/events` tap,
+    // so colour only when a person reads stdout: escape codes in the file or the
+    // tap break whatever renders them (the Claude Code mod's Logs tab).
     let builder = tracing_subscriber::fmt()
         .with_env_filter(filter)
+        .with_ansi(std::io::IsTerminal::is_terminal(&std::io::stdout()))
         .with_target(true);
-    match file_writer {
-        Ok(file) => {
-            use tracing_subscriber::fmt::writer::MakeWriterExt;
-            let _ = builder.with_writer(std::io::stdout.and(file)).try_init();
-        }
-        Err(_) => {
-            let _ = builder.try_init();
-        }
+    let console = std::io::stdout.and(crate::admin::LogTap::default);
+    if let Ok(file) = file_writer {
+        let _ = builder.with_writer(console.and(file)).try_init();
+    } else {
+        let _ = builder.with_writer(console).try_init();
     }
 }
 
@@ -440,6 +442,7 @@ pub fn launch_environment(
         .cloned()
         .unwrap_or_else(|| "unused".to_string());
     let mut env = vec![
+        ("LOCAL_PROXY_PORT".to_string(), port.to_string()),
         ("ANTHROPIC_BASE_URL".to_string(), base),
         ("ANTHROPIC_API_KEY".to_string(), auth.clone()),
         ("ANTHROPIC_AUTH_TOKEN".to_string(), auth),
@@ -544,25 +547,6 @@ fn start_ephemeral_proxy(
     Ok(child)
 }
 
-/// `--settings` JSON that overrides Claude's status line with
-/// `local-proxy statusline`, which reads Claude's status JSON from stdin.
-///
-/// Paths use forward slashes since Claude runs the command through a POSIX
-/// shell (Git Bash on Windows). `None` if the current exe path is unknown.
-fn claude_statusline_settings(config_path: &Path, model: Option<&str>) -> Option<String> {
-    let slash = |p: &Path| p.display().to_string().replace('\\', "/");
-    let exe = std::env::current_exe().ok()?;
-    let mut command = format!(
-        "\"{}\" statusline --config \"{}\"",
-        slash(&exe),
-        slash(config_path)
-    );
-    if let Some(m) = model.filter(|m| !m.is_empty()) {
-        command = format!("{command} --model \"{m}\"");
-    }
-    Some(serde_json::json!({ "statusLine": { "type": "command", "command": command } }).to_string())
-}
-
 /// Launch the given CLI tool against this proxy, starting the proxy in the
 /// background first if it is not already serving.
 ///
@@ -636,11 +620,6 @@ pub fn launch(
     if yes && tool_cmd != "cursor" {
         cmd.arg("--yes");
     }
-    if tool_cmd == "claude" {
-        if let Some(settings) = claude_statusline_settings(&config_path, model) {
-            cmd.arg("--settings").arg(settings);
-        }
-    }
     cmd.args(&args);
     let status = cmd.status().map_err(|e| CliError::Tool {
         message: format!("failed to spawn '{tool_cmd}' (is it installed and on PATH?): {e}"),
@@ -655,6 +634,55 @@ pub fn launch(
 
     let status = status?;
     std::process::exit(status.code().unwrap_or(1));
+}
+
+/// Marketplace (and plugin) name declared in `.claude-plugin/marketplace.json`.
+const CLAUDE_MARKETPLACE: &str = "local-proxy";
+
+/// `owner/repo` GitHub slug derived from the `repository` field in Cargo.toml.
+fn repo_slug() -> &'static str {
+    env!("CARGO_PKG_REPOSITORY").trim_start_matches("https://github.com/")
+}
+
+/// The `claude` invocations `setup claude` runs, in order.
+fn claude_setup_argv(uninstall: bool) -> Vec<Vec<String>> {
+    let plugin = format!("{CLAUDE_MARKETPLACE}@{CLAUDE_MARKETPLACE}");
+    let v = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
+    if uninstall {
+        vec![
+            v(&["plugin", "uninstall", &plugin]),
+            v(&["plugin", "marketplace", "remove", CLAUDE_MARKETPLACE]),
+        ]
+    } else {
+        vec![
+            v(&["plugin", "marketplace", "add", repo_slug()]),
+            v(&["plugin", "install", &plugin]),
+        ]
+    }
+}
+
+/// Install (or with `uninstall`, remove) the Claude Code mod via `claude plugin`.
+///
+/// Re-running is harmless: each step is attempted and a
+/// failure (e.g. "already installed") is reported without aborting.
+///
+/// # Errors
+///
+/// Returns an error if `claude` cannot be spawned.
+pub fn setup_claude(uninstall: bool) -> miette::Result<()> {
+    for argv in claude_setup_argv(uninstall) {
+        println!("$ claude {}", argv.join(" "));
+        let status = Command::new("claude")
+            .args(&argv)
+            .status()
+            .map_err(|e| CliError::Tool {
+                message: format!("failed to spawn 'claude' (is it installed and on PATH?): {e}"),
+            })?;
+        if !status.success() {
+            eprintln!("(passo terminou com {status}; seguindo)");
+        }
+    }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
@@ -1011,35 +1039,84 @@ pub fn disconnect_provider(
     })
 }
 
-/// Render the effective provider list (catalog ∪ config) with account aliases.
+/// One stored account of a provider, as listed by `providers`/`account` and
+/// `GET /admin/accounts`.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct AccountInfo {
+    /// Provider name.
+    pub provider: String,
+    /// Account alias.
+    pub alias: String,
+    /// Credential kind: `api` or `oauth`.
+    pub kind: &'static str,
+    /// Whether this alias is the persisted default (`defaults.active_accounts`).
+    pub is_default: bool,
+}
+
+/// One effective provider (catalog and config) with its stored accounts.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct ProviderInfo {
+    /// Provider name.
+    pub name: String,
+    /// Wire format of the provider.
+    pub format: String,
+    /// Stored accounts, sorted by alias.
+    pub accounts: Vec<AccountInfo>,
+}
+
+/// The effective providers with their stored accounts, shared by the
+/// `providers`/`account` CLI output and the admin API.
+///
+/// # Errors
+///
+/// Returns a [`CliError`] if the catalog, config, or auth store cannot be loaded.
+#[allow(clippy::result_large_err)]
+pub fn provider_accounts(config_path: &Path) -> Result<Vec<ProviderInfo>, CliError> {
+    let config = effective_config(config_path)?;
+    let auth = crate::auth::read_auth().map_err(CliError::from)?;
+    Ok(config
+        .providers
+        .iter()
+        .map(|p| {
+            let mut accounts: Vec<AccountInfo> = auth
+                .get(&p.name)
+                .into_iter()
+                .flat_map(|entries| entries.iter())
+                .map(|(alias, entry)| AccountInfo {
+                    provider: p.name.clone(),
+                    alias: alias.clone(),
+                    kind: match entry {
+                        crate::auth::AuthEntry::OAuth(_) => "oauth",
+                        crate::auth::AuthEntry::Api { .. } => "api",
+                    },
+                    is_default: config.defaults.active_accounts.get(&p.name) == Some(alias),
+                })
+                .collect();
+            accounts.sort_unstable_by(|a, b| a.alias.cmp(&b.alias));
+            ProviderInfo {
+                name: p.name.clone(),
+                format: p.format.to_string(),
+                accounts,
+            }
+        })
+        .collect())
+}
+
+/// Render the effective provider list (catalog and config) with account aliases.
 ///
 /// # Errors
 ///
 /// Returns a [`CliError`] if the catalog, config, or auth store cannot be loaded.
 #[allow(clippy::result_large_err, clippy::format_push_string)]
 pub fn list_providers(config_path: &Path) -> Result<String, CliError> {
-    let effective = effective_config(config_path)?;
-    let auth = crate::auth::read_auth().map_err(CliError::from)?;
     let mut out = String::new();
-    for p in &effective.providers {
-        let accounts = auth.get(&p.name);
-        let mut aliases: Vec<_> = accounts
-            .into_iter()
-            .flat_map(|entries| entries.iter())
-            .collect();
-        aliases.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        let status = if aliases.is_empty() {
+    for p in provider_accounts(config_path)? {
+        let status = if p.accounts.is_empty() {
             "-".to_string()
         } else {
-            aliases
+            p.accounts
                 .iter()
-                .map(|(alias, entry)| {
-                    let kind = match entry {
-                        crate::auth::AuthEntry::OAuth(_) => "oauth",
-                        crate::auth::AuthEntry::Api { .. } => "api",
-                    };
-                    format!("{alias} ({kind})")
-                })
+                .map(|a| format!("{} ({})", a.alias, a.kind))
                 .collect::<Vec<_>>()
                 .join(", ")
         };
@@ -1288,28 +1365,16 @@ pub fn providers(config_path: PathBuf) -> miette::Result<()> {
 /// Returns a [`CliError`] if the catalog, config, or auth store cannot be loaded.
 #[allow(clippy::result_large_err, clippy::format_push_string)]
 pub fn list_accounts(config_path: &Path) -> Result<String, CliError> {
-    let config = effective_config(config_path)?;
-    let auth = crate::auth::read_auth().map_err(CliError::from)?;
     let mut out = String::new();
-    for provider in &config.providers {
-        let Some(accounts) = auth.get(&provider.name) else {
-            continue;
-        };
-        let mut aliases: Vec<_> = accounts.iter().collect();
-        aliases.sort_unstable_by(|a, b| a.0.cmp(b.0));
-        for (alias, entry) in aliases {
-            let kind = match entry {
-                crate::auth::AuthEntry::OAuth(_) => "oauth",
-                crate::auth::AuthEntry::Api { .. } => "api",
-            };
-            let active = config
-                .defaults
-                .active_accounts
-                .get(&provider.name)
-                .is_some_and(|selected| selected == alias);
-            let marker = if active { " [ativa]" } else { "" };
-            out.push_str(&format!("{}/{alias} ({kind}){marker}\n", provider.name));
-        }
+    for a in provider_accounts(config_path)?
+        .into_iter()
+        .flat_map(|p| p.accounts)
+    {
+        let marker = if a.is_default { " [ativa]" } else { "" };
+        out.push_str(&format!(
+            "{}/{} ({}){marker}\n",
+            a.provider, a.alias, a.kind
+        ));
     }
     if out.is_empty() {
         return Ok(
@@ -1399,190 +1464,6 @@ fn window_seconds(kind: &str) -> Option<i64> {
     }
 }
 
-/// Render the status line for a client session from its recorded stats.
-///
-/// The script (typically the status line command configured in Claude Code's
-/// `settings.json`) passes this session's `session_id` plus optional `model`
-/// and `context_pct` fields from the status line JSON; the proxy computes the
-/// numeric params from `stats.db` and evaluates the template (from `--template`
-/// or the config `statusline:` block) against them. Formatting is entirely up
-/// to the template — the proxy exposes raw values only.
-///
-/// # Errors
-///
-/// Returns [`CliError::Stats`] if the stats database cannot be read.
-#[allow(clippy::needless_pass_by_value, clippy::cast_possible_wrap)]
-pub fn statusline(
-    config_path: PathBuf,
-    session: Option<String>,
-    model: Option<String>,
-    context_pct: Option<f64>,
-    template_flag: Option<String>,
-    setup: bool,
-    settings: Option<PathBuf>,
-) -> miette::Result<()> {
-    if setup {
-        return statusline_setup(config_path, settings);
-    }
-    // Resolve the template: flag > config `statusline:` block. If neither is
-    // set, we fall back to an adaptive default built from the params that have
-    // data (see below), instead of a fixed string showing `?` everywhere.
-    let config = effective_config(&config_path)?;
-
-    // Claude Code pipes its status-line JSON on stdin when it runs the command
-    // directly (as `launch claude` configures it); a terminal means no JSON.
-    let claude_params = {
-        use std::io::{IsTerminal, Read};
-        let mut raw = String::new();
-        if std::io::stdin().is_terminal() {
-            Vec::new()
-        } else {
-            let _ = std::io::stdin().read_to_string(&mut raw);
-            serde_json::from_str::<serde_json::Value>(&raw)
-                .map(|v| crate::statusline::params_from_claude_json(&v))
-                .unwrap_or_default()
-        }
-    };
-    let session = session
-        .or_else(|| {
-            claude_params
-                .iter()
-                .find(|(k, _)| k == "session_id")
-                .map(|(_, v)| v.clone())
-        })
-        .unwrap_or_default();
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let month_window = crate::stats::TimeWindow {
-        since: window_seconds("month").map(|s| now - s),
-    };
-    let all_window = crate::stats::TimeWindow { since: None };
-
-    let sess = crate::stats::session(&session).map_err(CliError::from)?;
-    let cost_month = crate::stats::cost_over(month_window).map_err(CliError::from)?;
-    let cost_total = crate::stats::cost_over(all_window).map_err(CliError::from)?;
-
-    // Build the param map. Every known name is bound (defaulting to the
-    // no-data marker) so a template referencing any of them never errors on an
-    // unbound variable; present values replace the marker.
-    let mut params: HashMap<String, String> = [
-        "cost_session",
-        "cost_month",
-        "cost_total",
-        "cost_known",
-        "tokens_in",
-        "tokens_out",
-        "requests",
-        "model",
-        "context_pct",
-        "effort",
-        "ctx_tokens",
-        "rate_5h",
-        "rate_week",
-    ]
-    .iter()
-    .map(|k| ((*k).to_string(), crate::statusline::NO_DATA.to_string()))
-    .collect();
-
-    if let Some(s) = &sess {
-        params.insert("tokens_in".to_string(), s.tokens_in.to_string());
-        params.insert("tokens_out".to_string(), s.tokens_out.to_string());
-        params.insert("requests".to_string(), s.requests.to_string());
-        params.insert("cost_known".to_string(), s.cost_known_requests.to_string());
-        if s.cost_known_requests > 0 {
-            // only a cost figure when the session actually has reported cost
-            params.insert("cost_session".to_string(), s.cost_usd.to_string());
-        }
-    }
-    if let Some(c) = cost_month {
-        params.insert("cost_month".to_string(), c.to_string());
-    }
-    if let Some(c) = cost_total {
-        params.insert("cost_total".to_string(), c.to_string());
-    }
-    // The `model` param reflects the model this session's proxy instance
-    // routes: the one it last recorded for the session (each `launch` runs its
-    // own proxy whose in-memory model can differ from the global config), then
-    // an explicit `--model` flag, then the active model selected via
-    // `local-proxy model`, then the first model available from a connected
-    // provider.
-    let proxy_model = config
-        .defaults
-        .active_model
-        .clone()
-        .or_else(|| first_available_model(&config_path).ok().flatten());
-    if let Some(m) = crate::stats::session_model(&session).or(model) {
-        params.insert("model".to_string(), m);
-    } else if let Some(m) = proxy_model {
-        params.insert("model".to_string(), m);
-    }
-    // Upstream-reported usage (ChatGPT/Codex); Claude's own JSON wins below.
-    if let Some((h5, week)) = crate::stats::rate_limits() {
-        params.insert("rate_5h".to_string(), format!("{}", h5.round()));
-        params.insert("rate_week".to_string(), format!("{}", week.round()));
-    }
-    params.extend(claude_params);
-    if let Some(e) = config
-        .defaults
-        .active_effort
-        .clone()
-        .or_else(|| crate::stats::session_effort(&session))
-    {
-        params.insert("effort".to_string(), e);
-    }
-    if let Some(p) = context_pct {
-        params.insert("context_pct".to_string(), p.to_string());
-    }
-
-    let template = template_flag
-        .or_else(|| config.statusline.template.clone())
-        .unwrap_or_else(|| crate::statusline::default_template(&params));
-
-    let line = crate::statusline::render(&template, &params);
-    println!("{line}");
-    Ok(())
-}
-
-/// Write the status-line script into the config dir and register it in Claude's
-/// `settings.json`.
-///
-/// Keeps every existing setting and only adds the `statusLine` entry pointing at
-/// the generated script. The script path is resolved from the same `config_dir`
-/// (so it follows `LOCAL_PROXY_CONFIG_DIR` and `--config`, keeping tests and
-/// isolated installs consistent). If no settings file exists yet (and no custom
-/// `--settings` path was given) the script alone is written and the command is
-/// printed for the user to add manually.
-///
-/// # Errors
-///
-/// Returns an error if the script or settings file cannot be written.
-#[allow(clippy::needless_pass_by_value)]
-pub fn statusline_setup(config_path: PathBuf, settings: Option<PathBuf>) -> miette::Result<()> {
-    // `setup` only touches the config dir and Claude's settings, not the
-    // config contents, so the config path is unused here.
-    let _ = config_path;
-    let script = crate::statusline::script_path(&config_dir());
-    let exists = script.exists();
-    let paths = crate::statusline::setup(&config_dir(), settings).map_err(CliError::from)?;
-
-    println!(
-        "status line script: {} ({})",
-        paths.script.display(),
-        if exists { "atualizado" } else { "criado" }
-    );
-    if let Some(s) = &paths.settings {
-        println!("settings.json atualizado: {}", s.display());
-        println!("reinicie o Claude Code para aplicar a status line.");
-    } else {
-        // No settings file was written; tell the user how to wire it manually.
-        let cmd = crate::statusline::settings_statusline_command(&script);
-        println!("nenhum settings.json encontrado; adicione manualmente:");
-        println!("  {cmd}");
-    }
-    Ok(())
-}
-
 /// Print aggregate usage statistics collected from upstream requests.
 ///
 /// Renders a human summary (with a per-provider breakdown) by default, or the
@@ -1595,15 +1476,18 @@ pub fn statusline_setup(config_path: PathBuf, settings: Option<PathBuf>) -> miet
 #[allow(clippy::needless_pass_by_value, clippy::cast_possible_wrap)]
 pub fn stats(config_path: PathBuf, since: String, json: bool) -> miette::Result<()> {
     let _ = config_path;
+    if json {
+        match stats_json(&since)? {
+            Some(out) => println!("{out}"),
+            None => println!(
+                "nenhuma estatística registrada ainda (a primeira requisição proxy cria o banco)"
+            ),
+        }
+        return Ok(());
+    }
     // `window_seconds` returning `None` is only reachable for `all`, which the
     // clap value parser guarantees is the sentinel for "no time filter".
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map_or(0, |d| d.as_secs() as i64);
-    let window = crate::stats::TimeWindow {
-        since: window_seconds(&since).map(|s| now - s),
-    };
-
+    let window = stats_window(&since);
     let summary = crate::stats::summary(window).map_err(CliError::from)?;
     let by_provider = crate::stats::by_provider(window).map_err(CliError::from)?;
     let recent = crate::stats::recent(window, 10).map_err(CliError::from)?;
@@ -1613,14 +1497,52 @@ pub fn stats(config_path: PathBuf, since: String, json: bool) -> miette::Result<
         return Ok(());
     };
 
-    let by_provider = by_provider.unwrap_or_default();
-    let recent = recent.unwrap_or_default();
-    if json {
-        render_stats_json(&summary, &by_provider, &recent);
-    } else {
-        render_stats_text(&summary, &by_provider, &recent);
-    }
+    render_stats_text(
+        &summary,
+        &by_provider.unwrap_or_default(),
+        &recent.unwrap_or_default(),
+    );
     Ok(())
+}
+
+/// The `stats --json` report for `since` (`day|week|month|all`), or `None`
+/// when no stats have been recorded yet. Shared with `GET /admin/stats`.
+///
+/// # Errors
+///
+/// Returns [`CliError::Stats`] if the stats database cannot be read.
+#[allow(clippy::result_large_err)]
+pub fn stats_json(since: &str) -> Result<Option<serde_json::Value>, CliError> {
+    let window = stats_window(since);
+    let Some(summary) = crate::stats::summary(window).map_err(CliError::from)? else {
+        return Ok(None);
+    };
+    let by_provider = crate::stats::by_provider(window)
+        .map_err(CliError::from)?
+        .unwrap_or_default();
+    let by_account = crate::stats::by_account(window)
+        .map_err(CliError::from)?
+        .unwrap_or_default();
+    let recent = crate::stats::recent(window, 10)
+        .map_err(CliError::from)?
+        .unwrap_or_default();
+    Ok(Some(render_stats_json(
+        &summary,
+        &by_provider,
+        &by_account,
+        &recent,
+    )))
+}
+
+/// The `--since` window ending now (`all` or unknown means no filter).
+#[allow(clippy::cast_possible_wrap)]
+fn stats_window(since: &str) -> crate::stats::TimeWindow {
+    let now = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| d.as_secs() as i64);
+    crate::stats::TimeWindow {
+        since: window_seconds(since).map(|s| now - s),
+    }
 }
 
 /// Render the human-readable stats report.
@@ -1694,8 +1616,9 @@ fn render_stats_text(
 fn render_stats_json(
     summary: &crate::stats::RowSummary,
     by_provider: &[crate::stats::ProviderStats],
+    by_account: &[crate::stats::AccountStats],
     recent: &[crate::stats::RequestRow],
-) {
+) -> serde_json::Value {
     let summary_json = serde_json::json!({
         "requests": summary.requests,
         "input_tokens": summary.input_tokens,
@@ -1719,6 +1642,21 @@ fn render_stats_json(
             })
         })
         .collect();
+    let accounts_json: Vec<serde_json::Value> = by_account
+        .iter()
+        .map(|a| {
+            serde_json::json!({
+                "provider": a.provider,
+                "alias": a.alias,
+                "requests": a.requests,
+                "input_tokens": a.input_tokens,
+                "output_tokens": a.output_tokens,
+                "total_latency_ms": a.latency_ms,
+                "energy_kwh": a.energy_kwh_um as f64 / 1_000_000.0,
+                "cost_usd": a.cost_usd_um as f64 / 1_000_000.0,
+            })
+        })
+        .collect();
     let recent_json: Vec<serde_json::Value> = recent
         .iter()
         .map(|r| {
@@ -1726,6 +1664,7 @@ fn render_stats_json(
                 "ts": r.ts,
                 "endpoint": r.endpoint,
                 "provider": r.provider,
+                "alias": r.alias,
                 "model": r.model,
                 "input_tokens": r.input_tokens,
                 "output_tokens": r.output_tokens,
@@ -1743,12 +1682,12 @@ fn render_stats_json(
             v
         })
         .collect();
-    let out = serde_json::json!({
+    serde_json::json!({
         "summary": summary_json,
         "providers": providers_json,
+        "accounts": accounts_json,
         "recent": recent_json,
-    });
-    println!("{out}");
+    })
 }
 
 /// Resolve the config path from an explicit flag, the environment, the current
@@ -2335,8 +2274,25 @@ mod tests {
             routes: Vec::new(),
             defaults: Defaults::default(),
             exec: crate::config::Exec::default(),
-            statusline: crate::config::StatuslineConfig::default(),
         }
+    }
+
+    #[test]
+    fn claude_setup_argv_install_and_uninstall() {
+        assert_eq!(
+            claude_setup_argv(false),
+            vec![
+                vec!["plugin", "marketplace", "add", "gsporto226/local-proxy"],
+                vec!["plugin", "install", "local-proxy@local-proxy"],
+            ]
+        );
+        assert_eq!(
+            claude_setup_argv(true),
+            vec![
+                vec!["plugin", "uninstall", "local-proxy@local-proxy"],
+                vec!["plugin", "marketplace", "remove", "local-proxy"],
+            ]
+        );
     }
 
     #[test]
@@ -2344,6 +2300,7 @@ mod tests {
         let cfg = config_with(vec!["sk-proxy".to_string()]);
         let env = launch_environment(&cfg, 8787, Some("kimi-k2.6"));
         let map: std::collections::HashMap<_, _> = env.into_iter().collect();
+        assert_eq!(map["LOCAL_PROXY_PORT"], "8787");
         assert_eq!(map["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787");
         assert_eq!(map["ANTHROPIC_API_KEY"], "sk-proxy");
         assert_eq!(map["ANTHROPIC_AUTH_TOKEN"], "sk-proxy");

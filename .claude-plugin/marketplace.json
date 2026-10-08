@@ -1,0 +1,6 @@
+{
+  "name": "local-proxy",
+  "owner": { "name": "Gabriel Porto" },
+  "description": "local-proxy Claude Code mod: /proxy, panel and status line",
+  "plugins": [{ "name": "local-proxy", "source": "./claude-mod" }]
+}
