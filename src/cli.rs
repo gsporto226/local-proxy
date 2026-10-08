@@ -661,6 +661,31 @@ fn claude_setup_argv(uninstall: bool) -> Vec<Vec<String>> {
     }
 }
 
+/// The `claude` invocations that refresh the GitHub marketplace and plugin.
+fn claude_plugin_update_argv() -> Vec<Vec<String>> {
+    let plugin = format!("{CLAUDE_MARKETPLACE}@{CLAUDE_MARKETPLACE}");
+    let v = |a: &[&str]| a.iter().map(ToString::to_string).collect::<Vec<_>>();
+    vec![
+        v(&["plugin", "marketplace", "update", CLAUDE_MARKETPLACE]),
+        v(&["plugin", "update", &plugin]),
+    ]
+}
+
+/// Refresh the remote Claude Code marketplace and plugin; report failures but
+/// let the binary update continue independently.
+fn update_claude_plugin() {
+    for argv in claude_plugin_update_argv() {
+        println!("$ claude {}", argv.join(" "));
+        match Command::new("claude").args(&argv).status() {
+            Ok(status) if !status.success() => {
+                eprintln!("(passo terminou com {status}; seguindo)");
+            }
+            Err(error) => eprintln!("falha ao executar claude: {error}"),
+            Ok(_) => {}
+        }
+    }
+}
+
 /// Install (or with `uninstall`, remove) the Claude Code mod via `claude plugin`.
 ///
 /// Re-running is harmless: each step is attempted and a
@@ -2182,6 +2207,9 @@ pub async fn update(
     force: bool,
     no_verify: bool,
 ) -> miette::Result<()> {
+    if !check {
+        update_claude_plugin();
+    }
     let repo = resolve_repo(repo_flag);
     let bin = asset_name(CURRENT_OS, CURRENT_ARCH).ok_or_else(|| UpdateError::Unsupported {
         os: CURRENT_OS.to_string(),
@@ -2291,6 +2319,17 @@ mod tests {
             vec![
                 vec!["plugin", "uninstall", "local-proxy@local-proxy"],
                 vec!["plugin", "marketplace", "remove", "local-proxy"],
+            ]
+        );
+    }
+
+    #[test]
+    fn claude_plugin_update_argv_refreshes_marketplace_then_plugin() {
+        assert_eq!(
+            claude_plugin_update_argv(),
+            vec![
+                vec!["plugin", "marketplace", "update", "local-proxy"],
+                vec!["plugin", "update", "local-proxy@local-proxy"],
             ]
         );
     }
