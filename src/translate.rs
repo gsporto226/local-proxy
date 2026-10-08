@@ -49,8 +49,8 @@ pub struct TokenUsage {
     pub output: u64,
     /// Number of reasoning tokens, when reported by the upstream.
     pub reasoning: u64,
-    /// Input tokens served from the prompt cache.
-    pub cache_read: u64,
+    /// Input tokens served from the prompt cache, or `None` when unreported.
+    pub cache_read: Option<u64>,
     /// Input tokens written to the prompt cache.
     pub cache_write: u64,
     /// The request's monetary cost in USD, when reported by the upstream.
@@ -76,6 +76,12 @@ pub struct EnergyCost {
 }
 
 impl TokenUsage {
+    /// Whether the upstream reported at least one cached input token.
+    #[must_use]
+    pub fn cache_hit(&self) -> Option<bool> {
+        self.cache_read.map(|tokens| tokens > 0)
+    }
+
     /// The request cost as an [`EnergyCost`], when the upstream reported it via
     /// `usage.cost` / `prompt_cost`+`completion_cost`. This lets the recording
     /// layer persist an OpenAI/OpenRouter-reported cost (which has no energy
@@ -170,14 +176,13 @@ pub fn parse_usage(value: &Value) -> TokenUsage {
         let anthropic_read = num(obj.get("cache_read_input_tokens"));
         let anthropic_write = num(obj.get("cache_creation_input_tokens"));
         if anthropic_read.is_some() || anthropic_write.is_some() {
-            usage.cache_read = anthropic_read.unwrap_or(0);
+            usage.cache_read = anthropic_read;
             usage.cache_write = anthropic_write.unwrap_or(0);
-            usage.input += usage.cache_read + usage.cache_write;
+            usage.input += usage.cache_read.unwrap_or(0) + usage.cache_write;
         } else {
             usage.cache_read = ["prompt_tokens_details", "input_tokens_details"]
                 .iter()
-                .find_map(|k| num(obj.get(*k).and_then(|d| d.get("cached_tokens"))))
-                .unwrap_or(0);
+                .find_map(|k| num(obj.get(*k).and_then(|d| d.get("cached_tokens"))));
         }
         usage.cost_usd = cost_from_usage(obj);
     }
@@ -253,9 +258,11 @@ fn num(v: Option<&Value>) -> Option<u64> {
 #[must_use]
 pub fn anthropic_usage(u: &TokenUsage) -> Value {
     json!({
-        "input_tokens": u.input.saturating_sub(u.cache_read + u.cache_write),
+        "input_tokens": u.input.saturating_sub(
+            u.cache_read.unwrap_or(0).saturating_add(u.cache_write)
+        ),
         "output_tokens": u.output,
-        "cache_read_input_tokens": u.cache_read,
+        "cache_read_input_tokens": u.cache_read.unwrap_or(0),
         "cache_creation_input_tokens": u.cache_write
     })
 }
@@ -271,7 +278,7 @@ pub fn openai_usage(u: &TokenUsage) -> Value {
         "prompt_tokens": u.input,
         "completion_tokens": u.output,
         "total_tokens": u.input + u.output,
-        "prompt_tokens_details": {"cached_tokens": u.cache_read},
+        "prompt_tokens_details": {"cached_tokens": u.cache_read.unwrap_or(0)},
         "completion_tokens_details": details
     })
 }
@@ -287,7 +294,7 @@ pub fn responses_usage(u: &TokenUsage) -> Value {
         "input_tokens": u.input,
         "output_tokens": u.output,
         "total_tokens": u.input + u.output,
-        "input_tokens_details": {"cached_tokens": u.cache_read},
+        "input_tokens_details": {"cached_tokens": u.cache_read.unwrap_or(0)},
         "output_tokens_details": out_details
     })
 }
@@ -371,6 +378,57 @@ mod tests {
         // Anthropic reports no cost -> None (never synthesized).
         let anthro = json!({"input_tokens": 1, "output_tokens": 1});
         assert_eq!(parse_usage(&anthro).cost_usd, None);
+    }
+
+    #[test]
+    fn cache_read_telemetry_distinguishes_missing_zero_and_positive() {
+        assert_eq!(parse_usage(&json!({"input_tokens": 10})).cache_read, None);
+        assert_eq!(
+            parse_usage(&json!({"input_tokens": 10, "cache_read_input_tokens": 0})).cache_read,
+            Some(0)
+        );
+        assert_eq!(
+            parse_usage(&json!({
+                "prompt_tokens": 10,
+                "prompt_tokens_details": {"cached_tokens": 4}
+            }))
+            .cache_read,
+            Some(4)
+        );
+        assert_eq!(
+            parse_usage(&json!({
+                "input_tokens": 10,
+                "input_tokens_details": {"cached_tokens": 0}
+            }))
+            .cache_read,
+            Some(0)
+        );
+        assert_eq!(
+            parse_usage(&json!({
+                "input_tokens": 10,
+                "cache_creation_input_tokens": 5
+            }))
+            .cache_read,
+            None
+        );
+    }
+
+    #[test]
+    fn merge_usage_keeps_reported_zero_when_later_frames_omit_cache_data() {
+        let mut usage = TokenUsage {
+            cache_read: Some(0),
+            ..TokenUsage::default()
+        };
+        merge_usage(&mut usage, TokenUsage::default());
+        assert_eq!(usage.cache_read, Some(0));
+        merge_usage(
+            &mut usage,
+            TokenUsage {
+                cache_read: Some(7),
+                ..TokenUsage::default()
+            },
+        );
+        assert_eq!(usage.cache_read, Some(7));
     }
 
     #[test]

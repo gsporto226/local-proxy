@@ -1,9 +1,40 @@
 export type ProxyStatus = { version: string; port: number; pid: number; model: string | null; effort: string | null }
 export type ProxyAccount = { provider: string; alias: string; is_default: boolean }
 export type ProxyRateLimits = { h5: number | null; week: number | null }
-export type ProxyStatsRow = { provider?: string; requests: number; input_tokens: number; output_tokens: number; errors?: number; cost_usd: number }
-export type ProxyAccountStats = { provider: string; alias: string; requests: number; input_tokens: number; output_tokens: number; cost_usd: number }
-export type ProxyStats = { summary: ProxyStatsRow; providers: ProxyStatsRow[]; accounts: ProxyAccountStats[] }
+export type ProxyStatsWindow = 'session' | 'day' | 'week' | 'month' | 'all'
+export type ProxyStatsScope =
+  | { kind: 'all' }
+  | { kind: 'session'; session_id: string }
+export type ProxyCacheStats = {
+  hit_requests: number
+  reported_requests: number
+  rate_percent: number | null
+  coverage_percent: number | null
+}
+export type ProxyStatsRow = {
+  provider?: string
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  errors?: number
+  cost_usd: number
+  cache?: ProxyCacheStats
+}
+export type ProxyAccountStats = {
+  provider: string
+  alias: string
+  requests: number
+  input_tokens: number
+  output_tokens: number
+  cost_usd: number
+  cache?: ProxyCacheStats
+}
+export type ProxyStats = {
+  scope?: ProxyStatsScope
+  summary: ProxyStatsRow
+  providers: ProxyStatsRow[]
+  accounts: ProxyAccountStats[]
+}
 export type UsageWindow = { utilization: number; resets_at: string | null }
 export type AccountUsage = {
   provider: string
@@ -28,8 +59,9 @@ declare module 'claude-code' {
       models: string[]
       /** provider -> alias pinned for this session */
       pins: Record<string, string>
-      window: string
+      window: ProxyStatsWindow
       stats: ProxyStats | null
+      accountFilter: string
       usage: AccountUsageResult[]
       rate: ProxyRateLimits | null
       logs: string[]

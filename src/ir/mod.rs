@@ -551,12 +551,17 @@ impl Emitter {
             (&mut acc.input, part.input),
             (&mut acc.output, part.output),
             (&mut acc.reasoning, part.reasoning),
-            (&mut acc.cache_read, part.cache_read),
             (&mut acc.cache_write, part.cache_write),
         ] {
             if p > 0 {
                 *a = p;
             }
+        }
+        if let Some(cache_read) = part.cache_read {
+            acc.cache_read = Some(
+                acc.cache_read
+                    .map_or(cache_read, |previous| previous.max(cache_read)),
+            );
         }
         if part.cost_usd.is_some() {
             acc.cost_usd = part.cost_usd;

@@ -782,11 +782,38 @@ fn capture(
     started: &Instant,
     session_id: &str,
 ) {
-    let mut tokens = crate::translate::TokenUsage::default();
-    let (energy, cost) = upstream_body.map_or((None, None), |body| {
-        if let Some(u) = body.get("usage") {
-            tokens = crate::translate::parse_usage(u);
-        }
+    let tokens = upstream_body
+        .and_then(|body| body.get("usage"))
+        .map(crate::translate::parse_usage)
+        .unwrap_or_default();
+    capture_parsed(
+        endpoint,
+        provider,
+        alias,
+        model,
+        streamed,
+        status,
+        upstream_body,
+        started,
+        session_id,
+        tokens,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn capture_parsed(
+    endpoint: &'static str,
+    provider: &str,
+    alias: &str,
+    model: &str,
+    streamed: bool,
+    status: u16,
+    upstream_body: Option<&Value>,
+    started: &Instant,
+    session_id: &str,
+    tokens: crate::translate::TokenUsage,
+) {
+    let (energy, cost) = upstream_body.map_or((None, tokens.as_cost()), |body| {
         (
             crate::translate::energy_from_value(body),
             // A `NeuralWatt`-style top-level `cost` object wins; otherwise fall
@@ -810,6 +837,7 @@ fn capture(
             energy,
             cost,
             session_id: session_id.to_string(),
+            cache_hit: tokens.cache_hit(),
         },
     );
 }
@@ -1311,7 +1339,7 @@ async fn handle_chat(
     if upstream_format == Format::Responses {
         let mut folded = aggregate_responses_stream(resp).await;
         let usage = json!({"usage": translate::responses_usage(&folded.usage)});
-        capture(
+        capture_parsed(
             endpoint,
             &provider.name,
             client.alias(),
@@ -1321,6 +1349,7 @@ async fn handle_chat(
             Some(&usage),
             &started,
             session_id,
+            folded.usage,
         );
         folded.model.clone_from(&upstream_model);
         return Ok(json_response(
@@ -1604,6 +1633,55 @@ mod tests {
         let body = br#"{"model":"m","output_config":{"effort":"xhigh"},"messages":[]}"#;
         assert_eq!(request_effort(body).as_deref(), Some("xhigh"));
         assert_eq!(request_effort(br#"{"model":"m"}"#), None);
+    }
+
+    #[test]
+    fn capture_keeps_missing_zero_and_positive_cache_reports_distinct() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", dir.path());
+        for usage in [
+            serde_json::json!({"input_tokens": 10}),
+            serde_json::json!({"input_tokens": 10, "cache_read_input_tokens": 0}),
+            serde_json::json!({"input_tokens": 10, "cache_read_input_tokens": 4}),
+        ] {
+            capture(
+                "/v1/messages",
+                "anthropic",
+                "work",
+                "claude-test",
+                false,
+                200,
+                Some(&serde_json::json!({"usage": usage})),
+                &Instant::now(),
+                "sess-1",
+            );
+        }
+        let response_usage = serde_json::json!({
+            "usage": crate::translate::responses_usage(&crate::translate::TokenUsage::default())
+        });
+        capture_parsed(
+            "/v1/responses",
+            "openai",
+            "work",
+            "gpt-test",
+            false,
+            200,
+            Some(&response_usage),
+            &Instant::now(),
+            "sess-1",
+            crate::translate::TokenUsage::default(),
+        );
+        let summary = crate::stats::summary(crate::stats::StatsFilter {
+            window: crate::stats::TimeWindow { since: None },
+            scope: crate::stats::StatsScope::Session("sess-1"),
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(summary.requests, 4);
+        assert_eq!(summary.cache.hit_requests, 1);
+        assert_eq!(summary.cache.reported_requests, 2);
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
     }
 
     #[test]

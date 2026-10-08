@@ -53,6 +53,9 @@ pub struct StatLine {
     pub cost: Option<crate::translate::EnergyCost>,
     /// The client session (`X-Claude-Code-Session-Id`), or `""` when absent.
     pub session_id: String,
+    /// Whether the upstream reported a cache hit for this request.
+    /// `None` means cache-read telemetry was not reported.
+    pub cache_hit: Option<bool>,
 }
 
 /// Errors opening or querying the local statistics database.
@@ -95,14 +98,20 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             error INTEGER NOT NULL DEFAULT 0,
             energy_kwh_um INTEGER,
             cost_usd_um INTEGER,
-            session_id TEXT NOT NULL DEFAULT ''
+            session_id TEXT NOT NULL DEFAULT '',
+            cache_hit INTEGER CHECK (cache_hit IN (0, 1))
         );
         CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
         CREATE INDEX IF NOT EXISTS idx_requests_provider ON requests(provider);",
     )?;
-    // Lightweight migration for databases created before energy/cost existed.
-    // Guarded by a column-exists check so prior stats survive in place.
-    let cols = ["energy_kwh_um", "cost_usd_um", "session_id", "alias"];
+    // Add columns to older databases in place without changing stored requests.
+    let cols = [
+        "energy_kwh_um",
+        "cost_usd_um",
+        "session_id",
+        "alias",
+        "cache_hit",
+    ];
     for col in cols {
         let exists: bool = conn
             .query_row(
@@ -199,10 +208,10 @@ fn write_line(path: &Path, stat: &StatLine, ts: i64, latency_ms: u64) -> Result<
     let conn = open_stats(path)?;
     conn.execute(
         "INSERT INTO requests
-            (ts, endpoint, provider, alias, model, input_tokens, output_tokens,
-             streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
-             session_id)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14)",
+             (ts, endpoint, provider, alias, model, input_tokens, output_tokens,
+              streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
+              session_id, cache_hit)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
         rusqlite::params![
             ts,
             stat.endpoint,
@@ -218,6 +227,7 @@ fn write_line(path: &Path, stat: &StatLine, ts: i64, latency_ms: u64) -> Result<
             stat.energy.and_then(|e| e.energy_kwh).map(to_um),
             stat.cost.and_then(|c| c.request_cost_usd).map(to_um),
             stat.session_id,
+            stat.cache_hit.map(i64::from),
         ],
     )
     .map_err(|source| StatsError::Query { source })?;
@@ -238,6 +248,33 @@ pub struct TimeWindow {
     pub since: Option<i64>,
 }
 
+/// Which request set a statistics query covers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatsScope<'a> {
+    /// Requests across all Claude Code sessions.
+    All,
+    /// Requests carrying this Claude Code session ID.
+    Session(&'a str),
+}
+
+/// Time and session filters shared by stats aggregates and recent rows.
+#[derive(Debug, Clone, Copy)]
+pub struct StatsFilter<'a> {
+    /// The timestamp lower bound, if any.
+    pub window: TimeWindow,
+    /// All sessions or one specific session.
+    pub scope: StatsScope<'a>,
+}
+
+/// Request-level cache hit counts in an aggregate.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct CacheStats {
+    /// Requests with a positive upstream-reported cached-read count.
+    pub hit_requests: u64,
+    /// Requests whose upstream reported cached-read telemetry, including zero.
+    pub reported_requests: u64,
+}
+
 /// Aggregate totals over the matching window.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct RowSummary {
@@ -255,6 +292,8 @@ pub struct RowSummary {
     pub energy_kwh_um: u64,
     /// Sum of cost in micro-USD.
     pub cost_usd_um: u64,
+    /// Request-level prompt-cache hits in this aggregate.
+    pub cache: CacheStats,
 }
 
 /// Per-account (provider + alias) aggregate over the matching window.
@@ -276,6 +315,8 @@ pub struct AccountStats {
     pub energy_kwh_um: u64,
     /// Sum of cost in micro-USD.
     pub cost_usd_um: u64,
+    /// Request-level prompt-cache hits in this aggregate.
+    pub cache: CacheStats,
 }
 
 /// One upstream-reported quota window for a subscription account.
@@ -321,6 +362,8 @@ pub struct ProviderStats {
     pub energy_kwh_um: u64,
     /// Sum of cost in micro-USD.
     pub cost_usd_um: u64,
+    /// Request-level prompt-cache hits in this aggregate.
+    pub cache: CacheStats,
 }
 
 /// One raw request row, used for the recent/detail view.
@@ -362,13 +405,13 @@ pub struct RequestRow {
 ///
 /// Returns a [`StatsError::Open`] if the database cannot be opened or a
 /// [`StatsError::Query`] if the query fails.
-pub fn summary(window: TimeWindow) -> Result<Option<RowSummary>, StatsError> {
+pub fn summary(filter: StatsFilter<'_>) -> Result<Option<RowSummary>, StatsError> {
     let path = stats_db();
     if !path.exists() {
         return Ok(None);
     }
     let conn = open_stats(&path)?;
-    summary_on(&conn, window).map(Some)
+    summary_on(&conn, filter).map(Some)
 }
 
 /// Compute the overall totals for `window` over a live connection.
@@ -378,14 +421,16 @@ pub fn summary(window: TimeWindow) -> Result<Option<RowSummary>, StatsError> {
 /// Returns a [`StatsError::Query`] if the query fails.
 pub fn summary_on(
     conn: &rusqlite::Connection,
-    window: TimeWindow,
+    filter: StatsFilter<'_>,
 ) -> Result<RowSummary, StatsError> {
-    let (wsql, params) = where_clause(window);
+    let (wsql, params) = where_clause(filter);
     let mut stmt = conn
         .prepare(&format!(
             "SELECT COUNT(*), COALESCE(SUM(input_tokens),0), COALESCE(SUM(output_tokens),0),
                     COALESCE(SUM(latency_ms),0), COALESCE(SUM(error),0),
-                    COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0)
+                    COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0),
+                    COUNT(cache_hit),
+                    COALESCE(SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END),0)
              FROM requests {wsql}"
         ))
         .map_err(|source| StatsError::Query { source })?;
@@ -398,6 +443,10 @@ pub fn summary_on(
             errors: r.get::<_, i64>(4)? as u64,
             energy_kwh_um: r.get::<_, i64>(5)? as u64,
             cost_usd_um: r.get::<_, i64>(6)? as u64,
+            cache: CacheStats {
+                reported_requests: r.get::<_, i64>(7)? as u64,
+                hit_requests: r.get::<_, i64>(8)? as u64,
+            },
         })
     })
     .map_err(|source| StatsError::Query { source })
@@ -410,13 +459,13 @@ pub fn summary_on(
 ///
 /// Returns a [`StatsError::Open`] if the database cannot be opened or a
 /// [`StatsError::Query`] if the query fails.
-pub fn by_provider(window: TimeWindow) -> Result<Option<Vec<ProviderStats>>, StatsError> {
+pub fn by_provider(filter: StatsFilter<'_>) -> Result<Option<Vec<ProviderStats>>, StatsError> {
     let path = stats_db();
     if !path.exists() {
         return Ok(None);
     }
     let conn = open_stats(&path)?;
-    by_provider_on(&conn, window).map(Some)
+    by_provider_on(&conn, filter).map(Some)
 }
 
 /// Per-provider aggregates for `window` over a live connection.
@@ -426,14 +475,16 @@ pub fn by_provider(window: TimeWindow) -> Result<Option<Vec<ProviderStats>>, Sta
 /// Returns a [`StatsError::Query`] if the query fails.
 pub fn by_provider_on(
     conn: &rusqlite::Connection,
-    window: TimeWindow,
+    filter: StatsFilter<'_>,
 ) -> Result<Vec<ProviderStats>, StatsError> {
-    let (wsql, params) = where_clause(window);
+    let (wsql, params) = where_clause(filter);
     let mut stmt = conn
         .prepare(&format!(
             "SELECT provider, COUNT(*), COALESCE(SUM(input_tokens),0),
                     COALESCE(SUM(output_tokens),0), COALESCE(SUM(latency_ms),0),
-                    COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0)
+                    COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0),
+                    COUNT(cache_hit),
+                    COALESCE(SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END),0)
              FROM requests {wsql}
              GROUP BY provider ORDER BY provider"
         ))
@@ -448,6 +499,10 @@ pub fn by_provider_on(
                 latency_ms: r.get::<_, i64>(4)? as u64,
                 energy_kwh_um: r.get::<_, i64>(5)? as u64,
                 cost_usd_um: r.get::<_, i64>(6)? as u64,
+                cache: CacheStats {
+                    reported_requests: r.get::<_, i64>(7)? as u64,
+                    hit_requests: r.get::<_, i64>(8)? as u64,
+                },
             })
         })
         .map_err(|source| StatsError::Query { source })?
@@ -463,13 +518,13 @@ pub fn by_provider_on(
 ///
 /// Returns a [`StatsError::Open`] if the database cannot be opened or a
 /// [`StatsError::Query`] if the query fails.
-pub fn by_account(window: TimeWindow) -> Result<Option<Vec<AccountStats>>, StatsError> {
+pub fn by_account(filter: StatsFilter<'_>) -> Result<Option<Vec<AccountStats>>, StatsError> {
     let path = stats_db();
     if !path.exists() {
         return Ok(None);
     }
     let conn = open_stats(&path)?;
-    by_account_on(&conn, window).map(Some)
+    by_account_on(&conn, filter).map(Some)
 }
 
 /// Per-account aggregates for `window` over a live connection.
@@ -479,14 +534,16 @@ pub fn by_account(window: TimeWindow) -> Result<Option<Vec<AccountStats>>, Stats
 /// Returns a [`StatsError::Query`] if the query fails.
 pub fn by_account_on(
     conn: &rusqlite::Connection,
-    window: TimeWindow,
+    filter: StatsFilter<'_>,
 ) -> Result<Vec<AccountStats>, StatsError> {
-    let (wsql, params) = where_clause(window);
+    let (wsql, params) = where_clause(filter);
     let mut stmt = conn
         .prepare(&format!(
             "SELECT provider, COALESCE(CAST(alias AS TEXT), 'default'), COUNT(*), COALESCE(SUM(input_tokens),0),
                     COALESCE(SUM(output_tokens),0), COALESCE(SUM(latency_ms),0),
-                    COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0)
+                    COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0),
+                    COUNT(cache_hit),
+                    COALESCE(SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END),0)
              FROM requests {wsql}
              GROUP BY provider, 2 ORDER BY provider, 2"
         ))
@@ -502,6 +559,10 @@ pub fn by_account_on(
                 latency_ms: r.get::<_, i64>(5)? as u64,
                 energy_kwh_um: r.get::<_, i64>(6)? as u64,
                 cost_usd_um: r.get::<_, i64>(7)? as u64,
+                cache: CacheStats {
+                    reported_requests: r.get::<_, i64>(8)? as u64,
+                    hit_requests: r.get::<_, i64>(9)? as u64,
+                },
             })
         })
         .map_err(|source| StatsError::Query { source })?
@@ -517,13 +578,13 @@ pub fn by_account_on(
 ///
 /// Returns a [`StatsError::Open`] if the database cannot be opened or a
 /// [`StatsError::Query`] if the query fails.
-pub fn recent(window: TimeWindow, limit: u32) -> Result<Option<Vec<RequestRow>>, StatsError> {
+pub fn recent(filter: StatsFilter<'_>, limit: u32) -> Result<Option<Vec<RequestRow>>, StatsError> {
     let path = stats_db();
     if !path.exists() {
         return Ok(None);
     }
     let conn = open_stats(&path)?;
-    recent_on(&conn, window, limit).map(Some)
+    recent_on(&conn, filter, limit).map(Some)
 }
 
 /// The most recent request rows in `window`, newest first, over a live
@@ -534,10 +595,10 @@ pub fn recent(window: TimeWindow, limit: u32) -> Result<Option<Vec<RequestRow>>,
 /// Returns a [`StatsError::Query`] if the query fails.
 pub fn recent_on(
     conn: &rusqlite::Connection,
-    window: TimeWindow,
+    filter: StatsFilter<'_>,
     limit: u32,
 ) -> Result<Vec<RequestRow>, StatsError> {
-    let (wsql, params) = where_clause(window);
+    let (wsql, params) = where_clause(filter);
     let sql = format!(
         "SELECT ts, endpoint, provider, COALESCE(CAST(alias AS TEXT), 'default'), model, input_tokens, output_tokens,
                 streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
@@ -573,12 +634,24 @@ pub fn recent_on(
     Ok(rows)
 }
 
-/// Build the SQL `WHERE` clause and its parameters for a time window.
-fn where_clause(window: TimeWindow) -> (String, Vec<rusqlite::types::Value>) {
-    window.since.map_or_else(
-        || (String::new(), Vec::new()),
-        |since| ("WHERE ts >= ?1".to_string(), vec![since.into()]),
-    )
+/// Build the SQL `WHERE` clause and its parameters for a stats filter.
+fn where_clause(filter: StatsFilter<'_>) -> (String, Vec<rusqlite::types::Value>) {
+    let mut conditions = Vec::new();
+    let mut params = Vec::new();
+    if let Some(since) = filter.window.since {
+        params.push(since.into());
+        conditions.push(format!("ts >= ?{}", params.len()));
+    }
+    if let StatsScope::Session(session_id) = filter.scope {
+        params.push(session_id.to_string().into());
+        conditions.push(format!("session_id = ?{}", params.len()));
+    }
+    let where_clause = if conditions.is_empty() {
+        String::new()
+    } else {
+        format!("WHERE {}", conditions.join(" AND "))
+    };
+    (where_clause, params)
 }
 
 /// Aggregated figures for a single client session (served by `/admin`).
@@ -896,8 +969,8 @@ mod tests {
             "INSERT INTO requests
                 (ts, endpoint, provider, alias, model, input_tokens, output_tokens,
                  streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
-                 session_id)
-             VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13)",
+                 session_id, cache_hit)
+             VALUES (1,?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,?13,?14)",
             rusqlite::params![
                 line.endpoint,
                 line.provider,
@@ -912,13 +985,17 @@ mod tests {
                 line.energy.and_then(|e| e.energy_kwh).map(to_um),
                 line.cost.and_then(|c| c.request_cost_usd).map(to_um),
                 line.session_id,
+                line.cache_hit.map(i64::from),
             ],
         )
         .unwrap();
     }
 
-    fn all() -> TimeWindow {
-        TimeWindow { since: None }
+    fn all() -> StatsFilter<'static> {
+        StatsFilter {
+            window: TimeWindow { since: None },
+            scope: StatsScope::All,
+        }
     }
 
     #[test]
@@ -1141,14 +1218,20 @@ mod tests {
         insert(&conn, 300, "openai", 30, 2, true);
 
         // everything at or after ts=200
-        let window = TimeWindow { since: Some(200) };
+        let window = StatsFilter {
+            window: TimeWindow { since: Some(200) },
+            scope: StatsScope::All,
+        };
         let s = summary_on(&conn, window).unwrap();
         assert_eq!(s.requests, 2);
         let rows = by_provider_on(&conn, window).unwrap();
         assert_eq!(rows.iter().map(|r| r.requests).sum::<u64>(), 2);
 
         // nothing in the window
-        let empty = TimeWindow { since: Some(9999) };
+        let empty = StatsFilter {
+            window: TimeWindow { since: Some(9999) },
+            scope: StatsScope::All,
+        };
         assert_eq!(summary_on(&conn, empty).unwrap().requests, 0);
     }
 
@@ -1197,6 +1280,7 @@ mod tests {
             energy: Some(e),
             cost: Some(c),
             session_id: String::new(),
+            cache_hit: None,
         };
         insert_line(&conn, &line);
 
@@ -1245,6 +1329,11 @@ mod tests {
         assert_eq!(s.requests, 1);
         assert_eq!(s.input_tokens, 1);
         assert_eq!(s.energy_kwh_um, 0);
+        let cache_hit: Option<i64> = conn
+            .query_row("SELECT cache_hit FROM requests", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(cache_hit, None);
+        ensure_schema(&conn).unwrap();
     }
 
     #[test]
@@ -1270,6 +1359,7 @@ mod tests {
                 cache_savings_usd: None,
             }),
             session_id: "sess-1".to_string(),
+            cache_hit: None,
         };
         insert_line(&conn, &line);
         line.cost = None;
@@ -1291,5 +1381,77 @@ mod tests {
 
         // unknown session -> None
         assert!(session_on(&conn, "nope").unwrap().is_none());
+    }
+
+    #[test]
+    fn cache_hit_stats_exclude_unreported_requests_and_filter_session_accounts() {
+        let conn = in_memory();
+        let mut line = StatLine {
+            endpoint: "/v1/messages",
+            provider: "openai".to_string(),
+            alias: "work".to_string(),
+            model: "model-a".to_string(),
+            session_id: "sess-1".to_string(),
+            cache_hit: None,
+            ..StatLine::default()
+        };
+        insert_line(&conn, &line);
+
+        line.cache_hit = Some(false);
+        insert_line(&conn, &line);
+
+        line.provider = "anthropic".to_string();
+        line.alias = "personal".to_string();
+        line.cache_hit = Some(true);
+        insert_line(&conn, &line);
+
+        line.session_id = "sess-2".to_string();
+        insert_line(&conn, &line);
+
+        let filter = StatsFilter {
+            window: TimeWindow { since: None },
+            scope: StatsScope::Session("sess-1"),
+        };
+        let summary = summary_on(&conn, filter).unwrap();
+        assert_eq!(summary.requests, 3);
+        assert_eq!(summary.cache.hit_requests, 1);
+        assert_eq!(summary.cache.reported_requests, 2);
+
+        let accounts = by_account_on(&conn, filter).unwrap();
+        assert_eq!(accounts.len(), 2);
+        let work = accounts.iter().find(|row| row.alias == "work").unwrap();
+        assert_eq!(work.cache.hit_requests, 0);
+        assert_eq!(work.cache.reported_requests, 1);
+        let personal = accounts.iter().find(|row| row.alias == "personal").unwrap();
+        assert_eq!(personal.cache.hit_requests, 1);
+        assert_eq!(personal.cache.reported_requests, 1);
+    }
+
+    #[test]
+    fn write_line_preserves_unreported_miss_and_hit_states() {
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let mut line = StatLine {
+            endpoint: "/v1/messages",
+            provider: "openai".to_string(),
+            alias: "work".to_string(),
+            model: "model-a".to_string(),
+            ..StatLine::default()
+        };
+
+        for cache_hit in [None, Some(false), Some(true)] {
+            line.cache_hit = cache_hit;
+            write_line(db.path(), &line, 1, 0).unwrap();
+        }
+
+        let conn = open_stats(db.path()).unwrap();
+        let mut stmt = conn
+            .prepare("SELECT cache_hit FROM requests ORDER BY id")
+            .unwrap();
+        let rows = stmt
+            .query_map([], |row| row.get::<_, Option<i64>>(0))
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(rows, [None, Some(0), Some(1)]);
     }
 }

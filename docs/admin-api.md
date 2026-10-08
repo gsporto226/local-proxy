@@ -8,6 +8,19 @@ Port: `LOCAL_PROXY_PORT` env (set by `launch`, honoured by `serve`), default
 `ANTHROPIC_BASE_URL` (loopback only) and stays inert unless `/admin/status`
 answers there.
 
+Stats responses add a `cache` object to `summary`, each provider row, and each
+account row. They also include `scope`, either `{ kind: "all" }` or
+`{ kind: "session", session_id }`. The cache object contains `hit_requests`,
+`reported_requests`, `rate_percent`, and `coverage_percent`. A request is a cache hit when the upstream reports more
+than zero cached-read tokens. Requests without cached-read telemetry are
+excluded from the rate denominator. `rate_percent` is `null` when no requests
+reported cache telemetry; `coverage_percent` is `null` when there are no
+requests in the aggregate. Older database rows remain unreported, not misses.
+
+`since=session` selects the full Claude Code session and requires `session_id`.
+Other windows can also take `session_id` to filter their time range to one
+session. Omitting `session_id` keeps the existing all-sessions behavior.
+
 ## Reads
 
 | Route | Response |
@@ -16,7 +29,8 @@ answers there.
 | `GET /admin/accounts` | `[{ provider, alias, kind, is_default }]` (`kind`: `api`\|`oauth`) |
 | `GET /admin/providers` | `[{ name, format, accounts: [<account as above>] }]` (catalog + config, same data as `local-proxy providers`) |
 | `GET /admin/models` | `[string]` |
-| `GET /admin/stats?since=day\|week\|month\|all` | same JSON as `local-proxy stats --json`; `null` before any stats exist |
+| `GET /admin/stats?since=day\|week\|month\|all[&session_id=...]` | same JSON as `local-proxy stats --json`; optional session filter; `null` before any stats exist |
+| `GET /admin/stats?since=session&session_id=...` | Stats for the full Claude Code session; `session_id` is required |
 | `GET /admin/rate-limits` | `{ h5, week }` (percent, nullable) |
 | `GET /admin/account-usage` | Account quota snapshots for ChatGPT and Claude subscriptions. Results are cached for 60 seconds. |
 | `GET /admin/logs?n=200` | `{ lines: [string] }` |

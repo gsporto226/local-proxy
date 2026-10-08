@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { meter, plain } from './register'
+import { formatResetTime, fuzzyMatch, meter, plain, providerOrder } from './register'
 
 const BASE = 'http://127.0.0.1:9999'
 const ROUTES: Record<string, unknown> = {
@@ -8,6 +8,7 @@ const ROUTES: Record<string, unknown> = {
   'GET /admin/accounts': [
     { provider: 'openai', alias: 'work', is_default: true },
     { provider: 'openai', alias: 'home', is_default: false },
+    { provider: 'anthropic', alias: 'personal', is_default: false },
   ],
   'GET /admin/account-usage': [
     {
@@ -24,12 +25,28 @@ const ROUTES: Record<string, unknown> = {
       error: null,
     },
     { kind: 'unavailable', provider: 'openai', alias: 'home', error: 'OAuth required' },
+    { kind: 'unavailable', provider: 'anthropic', alias: 'personal', error: 'No usage endpoint' },
   ],
   'GET /admin/models': ['gpt-x', 'gpt-y'],
   'GET /admin/rate-limits': { h5: 12, week: 40 },
-  'GET /admin/stats?since=day': {
-    summary: { requests: 3, input_tokens: 10, output_tokens: 20, cost_usd: 0.25 },
-    providers: [{ provider: 'openai', requests: 3, input_tokens: 10, output_tokens: 20, cost_usd: 0.25 }],
+  'GET /admin/stats?since=session&session_id=sess-1': {
+    scope: { kind: 'session', session_id: 'sess-1' },
+    summary: {
+      requests: 3,
+      input_tokens: 10,
+      output_tokens: 20,
+      cost_usd: 0.25,
+      cache: { hit_requests: 2, reported_requests: 2, rate_percent: 100, coverage_percent: 66.67 },
+    },
+    providers: [{ provider: 'openai', requests: 3, input_tokens: 10, output_tokens: 20, cost_usd: 0.25,
+      cache: { hit_requests: 2, reported_requests: 2, rate_percent: 100, coverage_percent: 66.67 } }],
+    accounts: [
+      { provider: 'openai', alias: 'work', requests: 2, input_tokens: 10, output_tokens: 20, cost_usd: 0.25,
+        cache: { hit_requests: 2, reported_requests: 2, rate_percent: 100, coverage_percent: 100 } },
+      { provider: 'openai', alias: 'home', requests: 1, input_tokens: 0, output_tokens: 0, cost_usd: 0,
+        cache: { hit_requests: 0, reported_requests: 0, rate_percent: null, coverage_percent: 0 } },
+    ],
+    recent: [],
   },
   'GET /admin/session/sess-1': { account: {}, effort: null, stats: null },
   'GET /admin/logs?n=200': { lines: ['boot'] },
@@ -115,13 +132,14 @@ test('/proxy <args> runs the CLI and returns its output', async ($, on) => {
 })
 
 test('/proxy opens a focused pane; every tab renders on terminal and desktop', async ($, on) => {
-  mockProxy(on)
+  const { calls } = mockProxy(on)
   await start($)
   await $.command.run(run(''))
-  const expected = { Accounts: /openai\/home/, Usage: /40% used/, Logs: /boot|No log lines/, Config: /openai\/work/, Status: /running/ }
+  expect(calls).toContain('GET /admin/stats?since=session&session_id=sess-1')
+  const expected = { Accounts: /home/, Usage: /40% used/, Logs: /boot|No log lines/, Config: /openai\/work/, Status: /running/ }
   for (const surface of ['terminal', 'desktop'] as const) {
     const ui = await $.ui.mount({ ...PANE, surface })
-    expect(await ui.find({ text: /running/ }), `${surface} Status`).toBeDefined()
+    expect(await ui.find({ text: /work/ }), `${surface} opens Accounts`).toBeDefined()
     for (const [tab, text] of Object.entries(expected)) {
       await ui.press({ key: `tab-${tab}` })
       expect(await ui.find({ text }), `${surface} ${tab}`).toBeDefined()
@@ -140,13 +158,13 @@ test('/proxy opens the pane focused with Esc closing it; the next prompt closes 
   expect(opened).toEqual([])
 })
 
-test('the pane takes 80% of the terminal and closes once it loses focus', async ($, on) => {
+test('the pane requests 90% of the terminal and closes once it loses focus', async ($, on) => {
   const { opened, openArgs } = mockProxy(on)
   await start($)
   const band = await $.ui.mount({ ...BAND, surface: 'terminal', viewport: { columns: 120, rows: 50 } } as never)
   await band.unmount()
   await $.command.run(run(''))
-  expect(openArgs[0]).toMatchObject({ rows: 40 })
+  expect(openArgs[0]).toMatchObject({ rows: 45, columns: 108 })
   const focused = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await focused.unmount()
   expect(opened).toEqual(['proxy'])
@@ -156,13 +174,14 @@ test('the pane takes 80% of the terminal and closes once it loses focus', async 
 })
 
 test('pinning an account calls the session route with this session id', async ($, on) => {
-  const { calls } = mockProxy(on)
+  const { calls, opened } = mockProxy(on)
   await start($)
   await $.command.run(run(''))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'tab-Accounts' })
   await ui.press({ key: 'pin-openai/home' })
   expect(calls).toContain('PUT /admin/session/sess-1/account {"provider":"openai","alias":"home"}')
+  expect(opened).toEqual(['proxy'])
 })
 
 test('Accounts tab shows each account’s upstream quota windows and unavailable state', async ($, on) => {
@@ -171,16 +190,64 @@ test('Accounts tab shows each account’s upstream quota windows and unavailable
   await $.command.run(run(''))
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'tab-Accounts' })
-  expect(await ui.find({ text: /openai\/work/ })).toBeDefined()
-  expect(await ui.find({ text: /5h/ })).toBeDefined()
-  expect(await ui.find({ text: /25% used/ })).toBeDefined()
-  expect(await ui.find({ text: /7d/ })).toBeDefined()
-  expect(await ui.find({ text: /40% used/ })).toBeDefined()
-  expect(await ui.find({ text: /resets/ })).toBeDefined()
-  expect(await ui.find({ text: /OAuth required/ })).toBeDefined()
+  expect(await ui.find({ text: /work/ }), 'account alias').toBeDefined()
+  expect(await ui.find({ text: /5h/ }), 'five-hour usage').toBeDefined()
+  expect(await ui.find({ text: /25% used/ }), 'five-hour percent').toBeDefined()
+  expect(await ui.find({ text: /7d/ }), 'weekly window').toBeDefined()
+  expect(await ui.find({ text: /40% used/ }), 'weekly percent').toBeDefined()
+  expect(await ui.find({ text: /resets/ }), 'reset label').toBeDefined()
+  expect(await ui.find({ text: /2033/ }), 'full reset date').toBeDefined()
+  expect(await ui.find({ text: /cache 100%/ }), 'account cache rate').toBeDefined()
+  expect(await ui.find({ text: /cache n\/a/ }), 'cache rate remains visible without quota data').toBeDefined()
+  expect(await ui.find({ text: /OAuth required/ }), 'unavailable account').toBeDefined()
   const before = calls.filter(c => c === 'GET /admin/account-usage').length
   await ui.press({ key: 'usage-refresh' })
   expect(calls.filter(c => c === 'GET /admin/account-usage').length).toBe(before + 1)
+})
+
+test('Accounts fuzzy filter matches provider and alias', async ($, on) => {
+  mockProxy(on)
+  await start($)
+  await $.command.run(run(''))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ key: 'account-filter' })).toBeDefined()
+  expect(await ui.find({ key: 'filter-focus' })).toBeDefined()
+  await ui.input({ key: 'account-filter', text: 'oa/hm' })
+  expect(await ui.find({ text: /home/ })).toBeDefined()
+  expect(await ui.find({ text: /work/ })).toBeUndefined()
+  await ui.input({ key: 'account-filter', text: '' })
+  expect(await ui.find({ text: /work/ })).toBeDefined()
+})
+
+test('Usage shows request cache hit rate and telemetry coverage', async ($, on) => {
+  mockProxy(on)
+  await start($)
+  await $.command.run(run(''))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'tab-Usage' })
+  expect(await ui.find({ text: /Cache hit rate/ })).toBeDefined()
+  expect(await ui.find({ text: /100%.*2\/2/ })).toBeDefined()
+  expect(await ui.find({ text: /openai\/work.*100%/ })).toBeDefined()
+})
+
+test('an older proxy never presents global stats as current-session stats', async ($, on) => {
+  mockProxy(on, {
+    routes: {
+      ...ROUTES,
+      'GET /admin/stats?since=session&session_id=sess-1': {
+        summary: { requests: 8, input_tokens: 80, output_tokens: 20, cost_usd: 0.1 },
+        providers: [],
+        accounts: [{ provider: 'openai', alias: 'work', requests: 8, input_tokens: 80, output_tokens: 20, cost_usd: 0.1 }],
+      },
+    },
+  })
+  await start($)
+  await $.command.run(run(''))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ text: /update local-proxy/i })).toBeDefined()
+  await ui.press({ key: 'tab-Usage' })
+  expect(await ui.find({ text: /update local-proxy.*this session/i })).toBeDefined()
+  expect(await ui.find({ text: /8 req/ })).toBeUndefined()
 })
 
 test('disconnect waits for confirmation', async ($, on) => {
@@ -252,4 +319,27 @@ test('SSE log events from the curl child reach the Logs tab', async ($, on) => {
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'tab-Logs' })
   expect(await ui.find({ text: /hello sse/ })).toBeDefined()
+})
+
+test('fuzzy account search matches provider and alias characters in order', async () => {
+  expect(fuzzyMatch('oa/hm', 'openai/home')).toBe(true)
+  expect(fuzzyMatch('opw', 'openai/work')).toBe(true)
+  expect(fuzzyMatch('zz', 'openai/work')).toBe(false)
+})
+
+test('provider groups put pinned and default providers first', async () => {
+  expect(providerOrder([
+    { provider: 'zeta', alias: 'x', is_default: false },
+    { provider: 'openai', alias: 'work', is_default: true },
+    { provider: 'anthropic', alias: 'personal', is_default: false },
+    { provider: 'google', alias: 'default', is_default: true },
+  ], { anthropic: 'personal' })).toEqual(['anthropic', 'google', 'openai', 'zeta'])
+})
+
+test('quota reset time includes a local date-time and relative countdown', async () => {
+  const reset = Date.UTC(2026, 9, 8, 12)
+  const label = formatResetTime(String(reset / 1000), reset - 30 * 60 * 1000)
+  expect(label).toMatch(/2026/)
+  expect(label).toContain('(in 30m)')
+  expect(label).not.toContain('UTC')
 })
