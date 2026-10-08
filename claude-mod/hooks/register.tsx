@@ -287,6 +287,12 @@ export const register: Register = (on, options) => {
       return {}
     }
     try {
+      if ((args[0] === 'model' || args[0] === 'effort') && args.length === 2) {
+        const field = args[0]
+        const result = await api<{ message: string }>($, 'PUT', `/admin/${field}`, { [field]: args[1] === 'clear' ? null : args[1] })
+        await refresh($, true)
+        return { text: result.message }
+      }
       const { exitCode, stdout, stderr } = await $.process.run(['local-proxy', ...args], { timeoutMs: 60_000 })
       const out = [stdout.trimEnd(), stderr.trimEnd()].filter(Boolean).join('\n')
       return { text: exitCode === 0 ? out || '(no output)' : `${out}\n(exit ${exitCode})` }

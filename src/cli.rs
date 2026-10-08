@@ -2364,6 +2364,7 @@ mod tests {
 
     #[test]
     fn runtime_paths_live_under_config_dir() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         assert!(pid_file().to_string_lossy().contains("local-proxy"));
         assert!(log_file().to_string_lossy().contains("local-proxy"));
     }
