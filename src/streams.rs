@@ -73,6 +73,7 @@ impl StreamCapture {
                 energy,
                 cost: cost.or_else(|| usage.as_cost()),
                 session_id: self.session_id.clone(),
+                cache_hit: usage.cache_hit(),
             },
         );
     }
@@ -269,6 +270,41 @@ pub fn translate(
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn stream_capture_persists_reported_cache_hits_and_misses() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", dir.path());
+        for cache_read in [None, Some(0), Some(5)] {
+            StreamCapture::new(
+                "/v1/messages",
+                "anthropic",
+                "work",
+                "claude-test",
+                200,
+                Instant::now(),
+                "sess-stream",
+            )
+            .record(
+                TokenUsage {
+                    cache_read,
+                    ..TokenUsage::default()
+                },
+                None,
+                None,
+            );
+        }
+        let summary = stats::summary(stats::StatsFilter {
+            window: stats::TimeWindow { since: None },
+            scope: stats::StatsScope::Session("sess-stream"),
+        })
+        .unwrap()
+        .unwrap();
+        assert_eq!(summary.cache.hit_requests, 1);
+        assert_eq!(summary.cache.reported_requests, 2);
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
+    }
 
     #[allow(clippy::needless_pass_by_value)]
     fn frame(data: Value) -> SseFrame {

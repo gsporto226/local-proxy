@@ -1512,10 +1512,13 @@ pub fn stats(config_path: PathBuf, since: String, json: bool) -> miette::Result<
     }
     // `window_seconds` returning `None` is only reachable for `all`, which the
     // clap value parser guarantees is the sentinel for "no time filter".
-    let window = stats_window(&since);
-    let summary = crate::stats::summary(window).map_err(CliError::from)?;
-    let by_provider = crate::stats::by_provider(window).map_err(CliError::from)?;
-    let recent = crate::stats::recent(window, 10).map_err(CliError::from)?;
+    let filter = crate::stats::StatsFilter {
+        window: stats_window(&since),
+        scope: crate::stats::StatsScope::All,
+    };
+    let summary = crate::stats::summary(filter).map_err(CliError::from)?;
+    let by_provider = crate::stats::by_provider(filter).map_err(CliError::from)?;
+    let recent = crate::stats::recent(filter, 10).map_err(CliError::from)?;
 
     let Some(summary) = summary else {
         println!("nenhuma estatística registrada ainda (a primeira requisição proxy cria o banco)");
@@ -1538,20 +1541,37 @@ pub fn stats(config_path: PathBuf, since: String, json: bool) -> miette::Result<
 /// Returns [`CliError::Stats`] if the stats database cannot be read.
 #[allow(clippy::result_large_err)]
 pub fn stats_json(since: &str) -> Result<Option<serde_json::Value>, CliError> {
-    let window = stats_window(since);
-    let Some(summary) = crate::stats::summary(window).map_err(CliError::from)? else {
+    stats_json_scoped(since, crate::stats::StatsScope::All)
+}
+
+/// Return JSON statistics for one time window and request scope.
+///
+/// # Errors
+///
+/// Returns [`CliError::Stats`] if the stats database cannot be read.
+#[allow(clippy::result_large_err)]
+pub fn stats_json_scoped(
+    since: &str,
+    scope: crate::stats::StatsScope<'_>,
+) -> Result<Option<serde_json::Value>, CliError> {
+    let filter = crate::stats::StatsFilter {
+        window: stats_window(since),
+        scope,
+    };
+    let Some(summary) = crate::stats::summary(filter).map_err(CliError::from)? else {
         return Ok(None);
     };
-    let by_provider = crate::stats::by_provider(window)
+    let by_provider = crate::stats::by_provider(filter)
         .map_err(CliError::from)?
         .unwrap_or_default();
-    let by_account = crate::stats::by_account(window)
+    let by_account = crate::stats::by_account(filter)
         .map_err(CliError::from)?
         .unwrap_or_default();
-    let recent = crate::stats::recent(window, 10)
+    let recent = crate::stats::recent(filter, 10)
         .map_err(CliError::from)?
         .unwrap_or_default();
     Ok(Some(render_stats_json(
+        scope,
         &summary,
         &by_provider,
         &by_account,
@@ -1639,6 +1659,7 @@ fn render_stats_text(
 /// Render the stats report as JSON.
 #[allow(clippy::format_push_string, clippy::cast_precision_loss)]
 fn render_stats_json(
+    scope: crate::stats::StatsScope<'_>,
     summary: &crate::stats::RowSummary,
     by_provider: &[crate::stats::ProviderStats],
     by_account: &[crate::stats::AccountStats],
@@ -1652,6 +1673,7 @@ fn render_stats_json(
         "errors": summary.errors,
         "energy_kwh": summary.energy_kwh_um as f64 / 1_000_000.0,
         "cost_usd": summary.cost_usd_um as f64 / 1_000_000.0,
+        "cache": cache_stats_json(summary.cache, summary.requests),
     });
     let providers_json: Vec<serde_json::Value> = by_provider
         .iter()
@@ -1664,6 +1686,7 @@ fn render_stats_json(
                 "total_latency_ms": p.latency_ms,
                 "energy_kwh": p.energy_kwh_um as f64 / 1_000_000.0,
                 "cost_usd": p.cost_usd_um as f64 / 1_000_000.0,
+                "cache": cache_stats_json(p.cache, p.requests),
             })
         })
         .collect();
@@ -1679,6 +1702,7 @@ fn render_stats_json(
                 "total_latency_ms": a.latency_ms,
                 "energy_kwh": a.energy_kwh_um as f64 / 1_000_000.0,
                 "cost_usd": a.cost_usd_um as f64 / 1_000_000.0,
+                "cache": cache_stats_json(a.cache, a.requests),
             })
         })
         .collect();
@@ -1708,10 +1732,34 @@ fn render_stats_json(
         })
         .collect();
     serde_json::json!({
+        "scope": stats_scope_json(scope),
         "summary": summary_json,
         "providers": providers_json,
         "accounts": accounts_json,
         "recent": recent_json,
+    })
+}
+
+fn stats_scope_json(scope: crate::stats::StatsScope<'_>) -> serde_json::Value {
+    match scope {
+        crate::stats::StatsScope::All => serde_json::json!({ "kind": "all" }),
+        crate::stats::StatsScope::Session(session_id) => {
+            serde_json::json!({ "kind": "session", "session_id": session_id })
+        }
+    }
+}
+
+#[allow(clippy::cast_precision_loss)]
+fn cache_stats_json(cache: crate::stats::CacheStats, requests: u64) -> serde_json::Value {
+    let rate_percent = (cache.reported_requests > 0)
+        .then(|| cache.hit_requests as f64 / cache.reported_requests as f64 * 100.0);
+    let coverage_percent =
+        (requests > 0).then(|| cache.reported_requests as f64 / requests as f64 * 100.0);
+    serde_json::json!({
+        "hit_requests": cache.hit_requests,
+        "reported_requests": cache.reported_requests,
+        "rate_percent": rate_percent,
+        "coverage_percent": coverage_percent,
     })
 }
 
@@ -2403,6 +2451,7 @@ mod tests {
 
     #[test]
     fn runtime_paths_live_under_config_dir() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         assert!(pid_file().to_string_lossy().contains("local-proxy"));
         assert!(log_file().to_string_lossy().contains("local-proxy"));
     }
@@ -2642,5 +2691,28 @@ mod tests {
         assert_eq!(resolve_repo(None), "env/repo");
         assert_eq!(resolve_repo(Some("flag/repo".to_string())), "flag/repo");
         std::env::remove_var(UPDATE_ENV_REPO);
+    }
+
+    #[test]
+    fn cache_stats_json_reports_hit_rate_and_telemetry_coverage() {
+        let reported = cache_stats_json(
+            crate::stats::CacheStats {
+                hit_requests: 3,
+                reported_requests: 4,
+            },
+            8,
+        );
+        assert_eq!(reported["hit_requests"], 3);
+        assert_eq!(reported["reported_requests"], 4);
+        assert_eq!(reported["rate_percent"], 75.0);
+        assert_eq!(reported["coverage_percent"], 50.0);
+
+        let unavailable = cache_stats_json(crate::stats::CacheStats::default(), 2);
+        assert!(unavailable["rate_percent"].is_null());
+        assert_eq!(unavailable["coverage_percent"], 0.0);
+
+        let no_requests = cache_stats_json(crate::stats::CacheStats::default(), 0);
+        assert!(no_requests["rate_percent"].is_null());
+        assert!(no_requests["coverage_percent"].is_null());
     }
 }

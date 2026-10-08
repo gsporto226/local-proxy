@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
-import type { AccountUsageResult, ProxyAccount, ProxyPending, ProxyRateLimits, ProxyStats, ProxyStatus } from '../types'
+import type { AccountUsageResult, ProxyAccount, ProxyCacheStats, ProxyPending, ProxyRateLimits, ProxyStats, ProxyStatsWindow, ProxyStatus } from '../types'
 
 type $ = EngineInterface
 
@@ -22,21 +22,55 @@ export function meter(pct: number, cols: number) {
 export const plain = (s: string) => s.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
 
 const compact = (n: number) => new Intl.NumberFormat('en', { notation: 'compact' }).format(n)
-const resetTime = (raw: string | null) => {
+export function fuzzyMatch(query: string, text: string) {
+  const needle = query.toLowerCase().replace(/\s/g, '')
+  if (!needle) return true
+  let matched = 0
+  for (const char of text.toLowerCase().replace(/\s/g, '')) {
+    if (char === needle[matched]) matched += 1
+    if (matched === needle.length) return true
+  }
+  return false
+}
+
+export function formatResetTime(raw: string | null, now = Date.now()) {
   if (!raw) return undefined
   const timestamp = /^\d+$/.test(raw) ? Number(raw) * 1000 : Date.parse(raw)
-  return Number.isFinite(timestamp) ? new Date(timestamp).toLocaleTimeString([], { hour: 'numeric', minute: '2-digit' }) : undefined
+  if (!Number.isFinite(timestamp)) return undefined
+  const dateTime = new Date(timestamp).toLocaleString([], {
+    year: 'numeric', month: 'short', day: 'numeric', hour: 'numeric', minute: '2-digit',
+  })
+  const minutes = Math.ceil(Math.abs(timestamp - now) / 60_000)
+  const days = Math.floor(minutes / 1440)
+  const hours = Math.floor((minutes % 1440) / 60)
+  const remainingMinutes = minutes % 60
+  const duration = [days ? `${days}d` : '', hours ? `${hours}h` : '', remainingMinutes ? `${remainingMinutes}m` : '']
+    .filter(Boolean)
+    .join(' ') || '<1m'
+  const relative = timestamp >= now ? `in ${duration}` : `${duration} ago`
+  return `${dateTime} (${relative})`
 }
-const WINDOWS = ['day', 'week', 'month', 'all']
+
+export function providerOrder(accounts: readonly ProxyAccount[], pins: Readonly<Record<string, string>>) {
+  const defaultProviders = new Set(accounts.filter(account => account.is_default).map(account => account.provider))
+  const pinnedProviders = new Set(Object.keys(pins).filter(provider =>
+    accounts.some(account => account.provider === provider && account.alias === pins[provider]),
+  ))
+  const rank = (provider: string) => pinnedProviders.has(provider) ? 0 : defaultProviders.has(provider) ? 1 : 2
+  return [...new Set(accounts.map(account => account.provider))].sort((left, right) =>
+    rank(left) - rank(right) || left.localeCompare(right),
+  )
+}
+const WINDOWS: ProxyStatsWindow[] = ['session', 'day', 'week', 'month', 'all']
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 export const SEGMENTS = ['model', 'effort', 'account', 'context', 'rate5h', 'rateWeek']
 
-const tab = atom({ plugin: 'local-proxy', key: 'tab' } as const, 'Status')
+const tab = atom({ plugin: 'local-proxy', key: 'tab' } as const, 'Accounts')
 const status = atom({ plugin: 'local-proxy', key: 'status' } as const, null)
 const accounts = atom({ plugin: 'local-proxy', key: 'accounts' } as const, [])
 const models = atom({ plugin: 'local-proxy', key: 'models' } as const, [])
 const pins = atom({ plugin: 'local-proxy', key: 'pins' } as const, {})
-const win = atom({ plugin: 'local-proxy', key: 'window' } as const, 'day')
+const win = atom({ plugin: 'local-proxy', key: 'window' } as const, 'session')
 const stats = atom({ plugin: 'local-proxy', key: 'stats' } as const, null)
 const usage = atom({ plugin: 'local-proxy', key: 'usage' } as const, [])
 const rate = atom({ plugin: 'local-proxy', key: 'rate' } as const, null)
@@ -44,6 +78,7 @@ const logs = atom({ plugin: 'local-proxy', key: 'logs' } as const, [])
 const confirm = atom({ plugin: 'local-proxy', key: 'confirm' } as const, null)
 const error = atom({ plugin: 'local-proxy', key: 'error' } as const, null)
 const line = atom({ plugin: 'local-proxy', key: 'line' } as const, '')
+const accountFilter = atom({ plugin: 'local-proxy', key: 'accountFilter' } as const, '')
 
 // The proxy this session talks to: Claude's own base URL, when it is a loopback
 // address (where `launch`/`serve` put it). Undefined means no proxy connection.
@@ -96,10 +131,14 @@ function changed(key: string, value: unknown) {
 async function refresh($: $, full = false) {
   try {
     const sid = await $.session.id()
+    const selectedWindow = await read($, win)
+    const statsPath = selectedWindow === 'session'
+      ? `/admin/stats?since=session&session_id=${encodeURIComponent(sid)}`
+      : `/admin/stats?since=${selectedWindow}`
     const [st, rl, s, sess, acc, mod, accountUsage] = await Promise.all([
       api<ProxyStatus>($, 'GET', '/admin/status'),
       api<ProxyRateLimits>($, 'GET', '/admin/rate-limits'),
-      api<ProxyStats>($, 'GET', `/admin/stats?since=${await read($, win)}`),
+      api<ProxyStats>($, 'GET', statsPath),
       api<{ account: Record<string, string> | null }>($, 'GET', `/admin/session/${sid}`),
       full ? api<ProxyAccount[]>($, 'GET', '/admin/accounts') : undefined,
       full ? api<string[]>($, 'GET', '/admin/models') : undefined,
@@ -131,8 +170,9 @@ function refreshSoon($: $) {
 }
 
 let segments: readonly string[] = SEGMENTS
-// Terminal height, from the band's last drawing: the pane asks for 80% of it.
+// Terminal dimensions from the band's last drawing; the pane requests 90%.
 let screenRows = 40
+let screenColumns = 120
 // Set once the pane has held the keyboard; losing it after that closes the pane.
 let hadFocus = false
 let interactive = false
@@ -283,7 +323,14 @@ export const register: Register = (on, options) => {
       await refresh($, true)
       // Focused, so digits and Enter go to the panel, not the prompt; Esc closes it.
       hadFocus = false
-      await $.ui.open({ id: PANE, title: 'local-proxy', focus: true, closeOnEscape: true, rows: Math.floor(screenRows * 0.8) })
+      await $.ui.open({
+        id: PANE,
+        title: 'local-proxy',
+        focus: true,
+        closeOnEscape: true,
+        rows: Math.floor(screenRows * 0.9),
+        columns: Math.floor(screenColumns * 0.9),
+      })
       return {}
     }
     try {
@@ -297,7 +344,10 @@ export const register: Register = (on, options) => {
 
   // The status row, in the band above the prompt.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
-    if (e.viewport) screenRows = e.viewport.rows
+    if (e.viewport) {
+      screenRows = e.viewport.rows
+      screenColumns = e.viewport.columns
+    }
     if (!origin || e.props.hasSurvey) return next(e)
     const text = await read($, line)
     if (!text) return next(e)
@@ -313,22 +363,26 @@ export const register: Register = (on, options) => {
       hadFocus = false
       void $.ui.close({ id: PANE }).catch(() => {})
     }
-    // Mobile has no Select; the engine draws an omitted element as a fragment.
-    const { Box, Text, Button, Select } = $.ui.resolve(e) as Elements['terminal']
+    const { Box, Text, Button, Input } = $.ui.resolve(e) as Elements['terminal']
     const [current, st, err, pending] = await Promise.all([read($, tab), read($, status), read($, error), read($, confirm)])
     const rows = Math.max(3, e.props.scroll.bodyRows - 6)
 
-    // Mirrors Claude Code's own /status dialog: title, inverse active tab, dim siblings.
+    // Match Claude Code's compact tab strip and highlighted active tab.
     const header = (
-      <Box flexDirection="row" gap={2}>
+      <Box flexDirection="row" gap={1}>
         <Text bold color="claude">local-proxy</Text>
-        {TABS.map((t, i) =>
-          t === current ? (
-            <Text key={`tab-${t}`} inverse bold>{` ${t} `}</Text>
-          ) : (
-            <Button key={`tab-${t}`} label={t} plain dimColor hotkey={String(i + 1)} onPress={() => update($, tab, () => t)} />
-          ),
-        )}
+        {TABS.map(t => (
+          <Box key={`tab-bg-${t}`} paddingX={1} backgroundColor={t === current ? 'claude' : undefined}>
+            <Button
+              key={`tab-${t}`}
+              label={t}
+              plain
+              dimColor={t !== current}
+              autoFocus={t === current ? true : undefined}
+              onPress={() => update($, tab, () => t)}
+            />
+          </Box>
+        ))}
       </Box>
     )
     const kv = (k: string, v: unknown) => (
@@ -353,6 +407,14 @@ export const register: Register = (on, options) => {
         )}
       </Box>
     )
+    const cacheRateText = (cache: ProxyCacheStats | undefined, requests: number) => {
+      if (!cache) return 'cache data unavailable · update local-proxy'
+      const coverage = cache.coverage_percent == null ? 'n/a' : `${Math.round(cache.coverage_percent)}%`
+      if (cache.rate_percent == null) {
+        return `cache n/a · ${cache.reported_requests}/${requests} reported · ${coverage} coverage`
+      }
+      return `cache ${Math.round(cache.rate_percent)}% · ${cache.hit_requests}/${cache.reported_requests} hits · ${coverage} coverage`
+    }
 
     let body
     if (pending) {
@@ -410,78 +472,107 @@ export const register: Register = (on, options) => {
         </Box>
       )
     } else if (current === 'Accounts') {
-      const [acc, pinned, sid, quota] = await Promise.all([
+      const [acc, pinned, sid, quota, proxyStats, filter, selectedWindow] = await Promise.all([
         read($, accounts),
         read($, pins),
         $.session.id(),
         read($, usage),
+        read($, stats),
+        read($, accountFilter),
+        read($, win),
       ])
+      const sessionScopeMatches = selectedWindow !== 'session'
+        || proxyStats == null
+        || (proxyStats.scope?.kind === 'session' && proxyStats.scope.session_id === sid)
+      const visible = acc.filter(a => fuzzyMatch(filter, `${a.provider}/${a.alias}`))
+      const providers = providerOrder(acc, pinned).filter(provider => visible.some(a => a.provider === provider))
+      const focusFilter = () => $.ui.focus({ requestId: PANE, key: 'account-filter' })
       body = (
         <Box flexDirection="column">
-          <Text dimColor>Pins apply to this session only.</Text>
-          <Button key="usage-refresh" label="Refresh quotas" plain onPress={() => refresh($, true)} />
+          <Box flexDirection="row" gap={1}>
+            <Input
+              key="account-filter"
+              label="Search"
+              placeholder="Filter providers or accounts"
+              value={filter}
+              onInput={value => update($, accountFilter, () => value)}
+              onSubmit={value => update($, accountFilter, () => value)}
+            />
+            <Button key="filter-focus" label="Filter" hotkey="f" plain onPress={focusFilter} />
+            <Button key="usage-refresh" label="Refresh quotas" plain onPress={() => refresh($, true)} />
+          </Box>
+          <Text dimColor>Use for this session changes only the current Claude Code session.</Text>
           {acc.length === 0 && <Text dimColor>No accounts. Run `local-proxy connect` in a terminal.</Text>}
-          {acc.map(a => {
-            const isPinned = pinned[a.provider] === a.alias
-            const id = `${a.provider}/${a.alias}`
-            const accountUsage = quota.find(entry =>
-              entry.kind === 'available'
-                ? entry.usage.provider === a.provider && entry.usage.alias === a.alias
-                : entry.provider === a.provider && entry.alias === a.alias,
-            )
-            return (
-              <Box key={`acc-${id}`} flexDirection="column">
-                <Box flexDirection="row" gap={1}>
-                  <Text>
-                    {isPinned ? '◆' : a.is_default ? '★' : ' '} {id}
-                    {a.is_default ? <Text dimColor> default</Text> : ''}
-                  </Text>
-                  <Button
-                    key={`pin-${id}`}
-                    label={isPinned ? 'Unpin' : 'Pin'}
-                    plain
-                    autoFocus
-                    onPress={() =>
-                      isPinned
-                        ? act($, 'DELETE', `/admin/session/${sid}/account/${encodeURIComponent(a.provider)}`)
-                        : act($, 'PUT', `/admin/session/${sid}/account`, { provider: a.provider, alias: a.alias })
-                    }
-                  />
-                </Box>
-                {accountUsage?.kind === 'available' ? (
-                  <Box flexDirection="column">
-                    {accountUsage.usage.five_hour && (
-                      <Box flexDirection="column">
-                        {bar('Current session (5h)', accountUsage.usage.five_hour.utilization)}
-                        {resetTime(accountUsage.usage.five_hour.resets_at) && (
-                          <Text dimColor>5h resets {resetTime(accountUsage.usage.five_hour.resets_at)}</Text>
-                        )}
-                      </Box>
-                    )}
-                    {accountUsage.usage.seven_day && (
-                      <Box flexDirection="column">
-                        {bar('Current week (7d)', accountUsage.usage.seven_day.utilization)}
-                        {resetTime(accountUsage.usage.seven_day.resets_at) && (
-                          <Text dimColor>7d resets {resetTime(accountUsage.usage.seven_day.resets_at)}</Text>
-                        )}
-                      </Box>
-                    )}
-                    {accountUsage.usage.monthly && bar('Monthly extra usage', accountUsage.usage.monthly.utilization)}
-                    <Text dimColor>Updated {new Date(accountUsage.usage.fetched_at * 1000).toLocaleTimeString()}</Text>
-                    {accountUsage.stale && <Text dimColor>{accountUsage.error ?? 'Using cached quota'}</Text>}
+          {acc.length > 0 && visible.length === 0 && <Text dimColor>No matching accounts.</Text>}
+          {providers.map(provider => (
+            <Box key={`provider-${provider}`} flexDirection="column">
+              <Text bold color="claude">{provider}</Text>
+              {visible.filter(a => a.provider === provider).map(a => {
+                const isPinned = pinned[a.provider] === a.alias
+                const id = `${a.provider}/${a.alias}`
+                const accountUsage = quota.find(entry =>
+                  entry.kind === 'available'
+                    ? entry.usage.provider === a.provider && entry.usage.alias === a.alias
+                    : entry.provider === a.provider && entry.alias === a.alias,
+                )
+                const accountStats = proxyStats?.accounts.find(s => s.provider === a.provider && s.alias === a.alias)
+                const quotaLine = (label: string, utilization: number, resetsAt: string | null) => {
+                  const reset = formatResetTime(resetsAt)
+                  return (
+                    <Text key={`${id}-${label}`} dimColor>
+                      {label} {Math.round(utilization)}% used{reset ? ` · resets ${reset}` : ''}
+                    </Text>
+                  )
+                }
+                return (
+                  <Box key={`acc-${id}`} flexDirection="column">
+                    <Box flexDirection="row" gap={1}>
+                      <Text>
+                        {isPinned ? '◆' : a.is_default ? '★' : ' '} {a.alias}
+                        {isPinned ? <Text dimColor> this session</Text> : a.is_default ? <Text dimColor> default</Text> : ''}
+                      </Text>
+                      <Button
+                        key={`pin-${id}`}
+                        label={isPinned ? 'Unpin session' : 'Use for this session'}
+                        plain
+                        onPress={() =>
+                          isPinned
+                            ? act($, 'DELETE', `/admin/session/${sid}/account/${encodeURIComponent(a.provider)}`)
+                            : act($, 'PUT', `/admin/session/${sid}/account`, { provider: a.provider, alias: a.alias })
+                        }
+                      />
+                    </Box>
+                    <Box flexDirection="column">
+                      {accountUsage?.kind === 'available' ? (
+                        <Box flexDirection="column">
+                        {accountUsage.usage.five_hour && quotaLine('5h', accountUsage.usage.five_hour.utilization, accountUsage.usage.five_hour.resets_at)}
+                        {accountUsage.usage.seven_day && quotaLine('7d', accountUsage.usage.seven_day.utilization, accountUsage.usage.seven_day.resets_at)}
+                        <Text dimColor>Updated {new Date(accountUsage.usage.fetched_at * 1000).toLocaleTimeString()}</Text>
+                        {accountUsage.stale && <Text dimColor>{accountUsage.error ?? 'Using cached quota'}</Text>}
+                        </Box>
+                      ) : accountUsage?.kind === 'unavailable' ? (
+                        <Text dimColor>{accountUsage.error}</Text>
+                      ) : (
+                        <Text dimColor>Quota not available for this provider</Text>
+                      )}
+                      {!sessionScopeMatches
+                        ? <Text dimColor>Update local-proxy to see this session's cache rate.</Text>
+                        : accountStats
+                        ? <Text dimColor>{cacheRateText(accountStats.cache, accountStats.requests)}</Text>
+                        : <Text dimColor>cache —</Text>}
+                    </Box>
                   </Box>
-                ) : accountUsage?.kind === 'unavailable' ? (
-                  <Text dimColor>{accountUsage.error}</Text>
-                ) : (
-                  <Text dimColor>Quota not available for this provider</Text>
-                )}
-              </Box>
-            )
-          })}
+                )
+              })}
+            </Box>
+          ))}
         </Box>
       )
     } else if (current === 'Usage') {
-      const [s, w, rl] = await Promise.all([read($, stats), read($, win), read($, rate)])
+      const [s, w, rl, sid] = await Promise.all([read($, stats), read($, win), read($, rate), $.session.id()])
+      const sessionScopeMatches = w !== 'session'
+        || s == null
+        || (s.scope?.kind === 'session' && s.scope.session_id === sid)
       const row = (r: { requests: number; input_tokens: number; output_tokens: number; cost_usd: number }) =>
         `${r.requests} req · ${compact(r.input_tokens)} in · ${compact(r.output_tokens)} out · $${r.cost_usd.toFixed(2)}`
       body = (
@@ -494,7 +585,7 @@ export const register: Register = (on, options) => {
               {WINDOWS.map((v, i) => (
                 <Button
                   key={`window-${v}`}
-                  label={v}
+                  label={v === 'session' ? 'Session' : v}
                   plain
                   dimColor={w !== v}
                   autoFocus={w === v ? true : undefined}
@@ -507,8 +598,17 @@ export const register: Register = (on, options) => {
             </Box>
           </Box>
           <Box flexDirection="column">
-            {s ? kv('Total', row(s.summary)) : <Text dimColor>No stats.</Text>}
-            {s?.providers.map(p => kv(p.provider ?? '?', row(p)))}
+            {s && sessionScopeMatches ? (
+              <Box flexDirection="column">
+                {kv('Total', row(s.summary))}
+                {kv('Cache hit rate', cacheRateText(s.summary.cache, s.summary.requests))}
+              </Box>
+            ) : s ? <Text dimColor>Update local-proxy to see stats for this session.</Text> : <Text dimColor>No stats.</Text>}
+            {sessionScopeMatches && s?.providers.map(p => kv(p.provider ?? '?', row(p)))}
+            {sessionScopeMatches && s?.accounts.map(a => kv(
+              `${a.provider}/${a.alias}`,
+              `${row(a)} · ${cacheRateText(a.cache, a.requests)}`,
+            ))}
           </Box>
         </Box>
       )
@@ -576,7 +676,7 @@ export const register: Register = (on, options) => {
         {body}
         {err && st && <Text color="error">{err}</Text>}
         <Text dimColor>
-          {e.props.isFocused ? '1–5 tabs · tab/shift+tab move · enter select · esc close' : 'ctrl+x tab to focus · esc or your next prompt closes'}
+          {e.props.isFocused ? 'tab/shift+tab navigate · up/down controls · enter select · f filter · esc close' : 'ctrl+x tab to focus · esc or your next prompt closes'}
         </Text>
       </Box>
     )
