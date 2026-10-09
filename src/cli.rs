@@ -1479,6 +1479,143 @@ pub fn account(config_path: PathBuf, args: Vec<String>) -> miette::Result<()> {
     Ok(())
 }
 
+/// Compare one request sent directly and after the proxy's request preparation.
+///
+/// The fixture must use the selected provider's native request format and
+/// contain `{{compare_tag}}` in a cacheable prompt prefix. The command sends
+/// `2 * runs` live requests and never stores the fixture or results in stats.
+///
+/// # Errors
+///
+/// Returns an error for invalid inputs, routing/account failures, or upstream
+/// request failures.
+#[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+pub async fn compare(
+    config_path: PathBuf,
+    model: String,
+    format: String,
+    request_path: PathBuf,
+    account: Option<String>,
+    effort: Option<String>,
+    runs: u32,
+    confirm_live: bool,
+    anthropic_beta: Option<String>,
+) -> miette::Result<()> {
+    let fixture_text = std::fs::read_to_string(request_path).map_err(CliError::from)?;
+    let fixture: serde_json::Value = serde_json::from_str(&fixture_text)
+        .map_err(|error| miette::miette!("invalid request fixture JSON: {error}"))?;
+    if !fixture.is_object() {
+        return Err(miette::miette!("request fixture must be a JSON object"));
+    }
+    crate::compare::validate_live_request(&fixture, runs, confirm_live)
+        .map_err(|error| miette::miette!("request comparison failed: {error}"))?;
+
+    let client_format = match format.as_str() {
+        "anthropic" => crate::ir::Format::Anthropic,
+        "openai" => crate::ir::Format::Openai,
+        "responses" => crate::ir::Format::Responses,
+        _ => return Err(miette::miette!("unsupported request format")),
+    };
+    let overlay = if config_path.exists() {
+        Config::load(&config_path)?
+    } else {
+        Config::default()
+    };
+    let config = crate::catalog::effective_config(crate::catalog::load()?, overlay);
+    let router = crate::router::Router::new(Arc::new(config.clone()))
+        .map_err(|error| miette::miette!("failed to build model router: {error}"))?;
+    let resolved = router
+        .resolve_model(&model, &|_| false)
+        .map_err(|error| miette::miette!("failed to resolve model: {error}"))?;
+    if crate::ir::Format::from(resolved.provider.format) != client_format {
+        return Err(miette::miette!(
+            "--format must match the selected provider's native request format"
+        ));
+    }
+
+    let clients = handlers::build_clients(&config)
+        .map_err(|error| miette::miette!("failed to build upstream clients: {error}"))?;
+    let accounts = clients
+        .get(&resolved.provider.name)
+        .ok_or_else(|| miette::miette!("no clients for provider {}", resolved.provider.name))?;
+    let alias = account
+        .or_else(|| {
+            config
+                .defaults
+                .active_accounts
+                .get(&resolved.provider.name)
+                .cloned()
+        })
+        .or_else(|| {
+            (accounts.len() == 1)
+                .then(|| accounts.keys().next().cloned())
+                .flatten()
+        })
+        .ok_or_else(|| {
+            miette::miette!(
+                "provider {} has multiple accounts; pass --account",
+                resolved.provider.name
+            )
+        })?;
+    let client = accounts.get(&alias).ok_or_else(|| {
+        miette::miette!("account {alias} not found for {}", resolved.provider.name)
+    })?;
+    if !client.has_key() {
+        return Err(miette::miette!(
+            "account {alias} has no credentials for {}",
+            resolved.provider.name
+        ));
+    }
+
+    let run_id = uuid::Uuid::new_v4();
+    let direct_tag = format!("local-proxy-compare-{run_id}-direct");
+    let proxy_tag = format!("local-proxy-compare-{run_id}-proxy");
+    let session_id = format!("local-proxy-compare-{run_id}");
+    let calls = runs.saturating_mul(2);
+    eprintln!(
+        "sending {calls} live requests to {}/{} with account {alias}",
+        resolved.provider.name, resolved.upstream_model
+    );
+    let active_effort = effort
+        .as_deref()
+        .or(config.defaults.active_effort.as_deref());
+    let reasoning_effort = effort.as_deref().or(resolved.reasoning_effort.as_deref());
+    let client_headers = anthropic_beta
+        .map(|beta| {
+            reqwest::header::HeaderValue::from_str(&beta)
+                .map(|value| {
+                    reqwest::header::HeaderMap::from_iter([(
+                        reqwest::header::HeaderName::from_static("anthropic-beta"),
+                        value,
+                    )])
+                })
+                .map_err(|error| miette::miette!("invalid --anthropic-beta: {error}"))
+        })
+        .transpose()?;
+    let report = crate::compare::run_comparison(
+        client,
+        client_format,
+        &resolved.provider,
+        &resolved.upstream_model,
+        &fixture,
+        active_effort,
+        reasoning_effort,
+        &session_id,
+        runs,
+        &direct_tag,
+        &proxy_tag,
+        client_headers.as_ref(),
+    )
+    .await
+    .map_err(|error| miette::miette!("request comparison failed: {error}"))?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&report)
+            .map_err(|error| miette::miette!("failed to render comparison report: {error}"))?
+    );
+    Ok(())
+}
+
 /// The recognized `--since` windows for `local-proxy stats`, in seconds.
 fn window_seconds(kind: &str) -> Option<i64> {
     match kind {

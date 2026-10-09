@@ -12,6 +12,9 @@ pub const LOG_TARGET: &str = "local_proxy";
 /// Command-line interface implementation.
 pub mod cli;
 
+/// Explicit request comparison against a configured upstream provider.
+pub mod compare;
+
 /// Loopback-only admin API (`/admin/*`) and its event stream.
 pub mod admin;
 

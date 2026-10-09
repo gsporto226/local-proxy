@@ -434,16 +434,6 @@ fn extract_session_id(headers: &HeaderMap) -> String {
         .to_string()
 }
 
-/// Extract the inbound `User-Agent`, forwarded upstream so Anthropic sees the
-/// real Claude Code version instead of the catalog's fallback.
-#[must_use]
-fn extract_user_agent(headers: &HeaderMap) -> Option<String> {
-    headers
-        .get(header::USER_AGENT)
-        .and_then(|v| v.to_str().ok())
-        .map(str::to_string)
-}
-
 fn extract_account_alias(headers: &HeaderMap) -> Result<Option<&str>, ApiError> {
     headers
         .get("x-local-proxy-account")
@@ -523,6 +513,39 @@ fn prepare_responses_request(
         }
     }
     body["stream"] = json!(true);
+}
+
+/// Prepare a client request for its upstream provider, using the same
+/// normalization and format translation as the proxy request handler.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn prepare_upstream_body(
+    client_format: Format,
+    provider: &crate::config::Provider,
+    upstream_model: &str,
+    mut body: Value,
+    active_effort: Option<&str>,
+    reasoning_effort: Option<&str>,
+    session_id: &str,
+    streaming: bool,
+) -> Result<Value, crate::translate::TranslateError> {
+    body["model"] = json!(upstream_model);
+    if client_format == Format::Anthropic {
+        if let Some(effort) = active_effort {
+            body["output_config"]["effort"] = json!(effort);
+        }
+    }
+
+    let upstream_format = Format::from(provider.format);
+    let mut upstream_body = if upstream_format == client_format {
+        same_format_request(client_format, body)
+    } else {
+        ir::translate_request(client_format, upstream_format, body)?
+    };
+    if streaming && upstream_format == Format::Openai {
+        enable_usage(&mut upstream_body);
+    }
+    prepare_responses_request(provider, &mut upstream_body, reasoning_effort, session_id);
+    Ok(upstream_body)
 }
 
 /// Read a Responses SSE response to completion and reassemble the single
@@ -838,6 +861,8 @@ fn capture_parsed(
             cost,
             session_id: session_id.to_string(),
             cache_hit: tokens.cache_hit(),
+            cache_read_tokens: tokens.cache_read,
+            cache_write_tokens: tokens.cache_write,
         },
     );
 }
@@ -1157,7 +1182,6 @@ async fn messages_handler(
             stats::record_effort(&session_id, &effort);
         }
     }
-    let user_agent = extract_user_agent(&headers);
     match handle_chat(
         Format::Anthropic,
         "/v1/messages",
@@ -1167,7 +1191,7 @@ async fn messages_handler(
         client_key.as_deref(),
         account_alias,
         &session_id,
-        user_agent.as_deref(),
+        Some(&headers),
     )
     .await
     {
@@ -1225,10 +1249,10 @@ async fn handle_chat(
     client_key: Option<&str>,
     account_alias: Option<&str>,
     session_id: &str,
-    user_agent: Option<&str>,
+    client_headers: Option<&HeaderMap>,
 ) -> Result<Response, ApiError> {
     let started = Instant::now();
-    let mut body = parse_body(body)?;
+    let body = parse_body(body)?;
 
     if let Some(out) = maybe_exec(app, state, &body, session_id).await {
         let text = crate::exec::format_output(&out);
@@ -1252,31 +1276,24 @@ async fn handle_chat(
         streaming,
         "resolved route"
     );
-    body["model"] = json!(upstream_model);
-    if client_format == Format::Anthropic {
-        if let Some(effort) = &state.config.defaults.active_effort {
-            body["output_config"]["effort"] = json!(effort);
-        }
-    }
     let session_alias = app.session_account(session_id, &provider.name).await;
     let client = client_for(state, &provider, session_alias.as_deref(), account_alias)?;
     let upstream_format = Format::from(provider.format);
     let same = upstream_format == client_format;
-
-    let mut upstream_body = if same {
-        same_format_request(client_format, body)
-    } else {
-        ir::translate_request(client_format, upstream_format, body)?
-    };
-    if streaming && upstream_format == Format::Openai {
-        enable_usage(&mut upstream_body);
-    }
-    prepare_responses_request(
+    let upstream_body = prepare_upstream_body(
+        client_format,
         &provider,
-        &mut upstream_body,
+        &upstream_model,
+        body,
+        if client_format == Format::Anthropic {
+            state.config.defaults.active_effort.as_deref()
+        } else {
+            None
+        },
         reasoning_effort.as_deref(),
         session_id,
-    );
+        streaming,
+    )?;
 
     let resp = client
         .chat_request(
@@ -1284,7 +1301,7 @@ async fn handle_chat(
             upstream_body,
             client_key,
             session_id,
-            user_agent,
+            client_headers,
         )
         .await
         .map_err(ApiError::from)?;
@@ -1399,7 +1416,6 @@ async fn chat_completions_handler(
         Err(e) => return error_response(&e, false),
     };
     let session_id = extract_session_id(&headers);
-    let user_agent = extract_user_agent(&headers);
     match handle_chat(
         Format::Openai,
         "/v1/chat/completions",
@@ -1409,7 +1425,7 @@ async fn chat_completions_handler(
         client_key.as_deref(),
         account_alias,
         &session_id,
-        user_agent.as_deref(),
+        Some(&headers),
     )
     .await
     {
@@ -1455,7 +1471,6 @@ async fn responses_handler(
         Err(e) => return error_response(&e, false),
     };
     let session_id = extract_session_id(&headers);
-    let user_agent = extract_user_agent(&headers);
     match handle_chat(
         Format::Responses,
         "/v1/responses",
@@ -1465,7 +1480,7 @@ async fn responses_handler(
         client_key.as_deref(),
         account_alias,
         &session_id,
-        user_agent.as_deref(),
+        Some(&headers),
     )
     .await
     {
@@ -1798,6 +1813,80 @@ mod tests {
             assert_eq!(body["stream"], false);
             assert!(body.get("reasoning").is_none());
         }
+    }
+
+    #[test]
+    fn prepare_upstream_body_normalizes_anthropic_and_preserves_cache_markers() {
+        let provider = crate::config::Provider {
+            name: "claude".to_string(),
+            base_url: "http://x".to_string(),
+            format: ProviderFormat::Anthropic,
+            models: Vec::new(),
+            auto_model: None,
+            headers: std::collections::HashMap::new(),
+            session_header: None,
+            oauth: None,
+        };
+        let body = json!({
+            "model": "claude/haiku-5.5",
+            "output_config": {"effort": "low"},
+            "context_management": {"edits": []},
+            "system": [{
+                "type": "text",
+                "text": "stable prefix",
+                "cache_control": {"type": "ephemeral"}
+            }],
+            "messages": [{"role": "user", "content": "{{compare_tag}}"}]
+        });
+
+        let prepared = prepare_upstream_body(
+            crate::ir::Format::Anthropic,
+            &provider,
+            "haiku-5.5",
+            body,
+            Some("low"),
+            None,
+            "session-1",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(prepared["model"], "haiku-5.5");
+        assert_eq!(prepared["system"][0]["cache_control"]["type"], "ephemeral");
+        assert!(prepared.get("context_management").is_none());
+        assert!(prepared.get("output_config").is_none());
+    }
+
+    #[test]
+    fn prepare_upstream_body_sets_responses_stream_and_session_cache_key() {
+        let provider = crate::config::Provider {
+            name: "chatgpt".to_string(),
+            base_url: "http://x".to_string(),
+            format: ProviderFormat::OpenaiResponses,
+            models: Vec::new(),
+            auto_model: None,
+            headers: std::collections::HashMap::new(),
+            session_header: None,
+            oauth: None,
+        };
+
+        let prepared = prepare_upstream_body(
+            crate::ir::Format::Responses,
+            &provider,
+            "gpt-6-luna",
+            json!({"model": "chatgpt/gpt-6-luna", "stream": false}),
+            None,
+            Some("low"),
+            "session-1",
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(prepared["model"], "gpt-6-luna");
+        assert_eq!(prepared["stream"], true);
+        assert_eq!(prepared["prompt_cache_key"], "session-1");
+        assert_eq!(prepared["reasoning"]["effort"], "low");
+        assert_eq!(prepared["store"], false);
     }
 
     #[test]
