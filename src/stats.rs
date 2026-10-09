@@ -56,6 +56,10 @@ pub struct StatLine {
     /// Whether the upstream reported a cache hit for this request.
     /// `None` means cache-read telemetry was not reported.
     pub cache_hit: Option<bool>,
+    /// Prompt tokens read from cache, or `None` when not reported.
+    pub cache_read_tokens: Option<u64>,
+    /// Prompt tokens written to cache (Anthropic only; `0` otherwise).
+    pub cache_write_tokens: u64,
 }
 
 /// Errors opening or querying the local statistics database.
@@ -99,7 +103,9 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             energy_kwh_um INTEGER,
             cost_usd_um INTEGER,
             session_id TEXT NOT NULL DEFAULT '',
-            cache_hit INTEGER CHECK (cache_hit IN (0, 1))
+            cache_hit INTEGER CHECK (cache_hit IN (0, 1)),
+            cache_read_tokens INTEGER,
+            cache_write_tokens INTEGER
         );
         CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
         CREATE INDEX IF NOT EXISTS idx_requests_provider ON requests(provider);",
@@ -111,6 +117,8 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
         "session_id",
         "alias",
         "cache_hit",
+        "cache_read_tokens",
+        "cache_write_tokens",
     ];
     for col in cols {
         let exists: bool = conn
@@ -180,6 +188,19 @@ pub fn record(started: Instant, stat: StatLine) {
     let ts = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
         .map_or(0, |d| d.as_secs() as i64);
+    tracing::info!(
+        target: crate::LOG_TARGET,
+        provider = %stat.provider,
+        alias = %stat.alias,
+        model = %stat.model,
+        session = %stat.session_id,
+        status = stat.status,
+        input = stat.input_tokens,
+        cache_read = ?stat.cache_read_tokens,
+        cache_write = stat.cache_write_tokens,
+        latency_ms,
+        "request usage"
+    );
     let path = stats_db();
     match write_line(&path, &stat, ts, latency_ms) {
         Ok(()) => crate::admin::emit(
@@ -210,8 +231,8 @@ fn write_line(path: &Path, stat: &StatLine, ts: i64, latency_ms: u64) -> Result<
         "INSERT INTO requests
              (ts, endpoint, provider, alias, model, input_tokens, output_tokens,
               streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
-              session_id, cache_hit)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15)",
+              session_id, cache_hit, cache_read_tokens, cache_write_tokens)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
         rusqlite::params![
             ts,
             stat.endpoint,
@@ -228,6 +249,8 @@ fn write_line(path: &Path, stat: &StatLine, ts: i64, latency_ms: u64) -> Result<
             stat.cost.and_then(|c| c.request_cost_usd).map(to_um),
             stat.session_id,
             stat.cache_hit.map(i64::from),
+            stat.cache_read_tokens,
+            stat.cache_write_tokens,
         ],
     )
     .map_err(|source| StatsError::Query { source })?;
@@ -1281,6 +1304,8 @@ mod tests {
             cost: Some(c),
             session_id: String::new(),
             cache_hit: None,
+            cache_read_tokens: None,
+            cache_write_tokens: 0,
         };
         insert_line(&conn, &line);
 
@@ -1360,6 +1385,8 @@ mod tests {
             }),
             session_id: "sess-1".to_string(),
             cache_hit: None,
+            cache_read_tokens: None,
+            cache_write_tokens: 0,
         };
         insert_line(&conn, &line);
         line.cost = None;
@@ -1453,5 +1480,17 @@ mod tests {
             .collect::<Result<Vec<_>, _>>()
             .unwrap();
         assert_eq!(rows, [None, Some(0), Some(1)]);
+
+        line.cache_read_tokens = Some(120);
+        line.cache_write_tokens = 30;
+        write_line(db.path(), &line, 2, 0).unwrap();
+        let tokens: (Option<i64>, i64) = conn
+            .query_row(
+                "SELECT cache_read_tokens, cache_write_tokens FROM requests ORDER BY id DESC",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap();
+        assert_eq!(tokens, (Some(120), 30));
     }
 }

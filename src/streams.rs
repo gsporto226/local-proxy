@@ -74,6 +74,8 @@ impl StreamCapture {
                 cost: cost.or_else(|| usage.as_cost()),
                 session_id: self.session_id.clone(),
                 cache_hit: usage.cache_hit(),
+                cache_read_tokens: usage.cache_read,
+                cache_write_tokens: usage.cache_write,
             },
         );
     }

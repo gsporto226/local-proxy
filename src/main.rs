@@ -127,6 +127,34 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Compare direct and proxy-prepared request behavior (diagnostic only)
+    #[command(hide = true)]
+    Compare {
+        /// Routed model, preferably in provider/model form
+        #[arg(long, required = true)]
+        model: String,
+        /// Native request format expected by the selected provider
+        #[arg(long, value_parser = ["anthropic", "openai", "responses"], required = true)]
+        format: String,
+        /// Path to a JSON request fixture containing `{{compare_tag}}`
+        #[arg(long, required = true)]
+        request: PathBuf,
+        /// Provider account alias; defaults to the configured active account
+        #[arg(long)]
+        account: Option<String>,
+        /// Effort to add when supported by the selected format
+        #[arg(long)]
+        effort: Option<String>,
+        /// Number of requests per arm (each additional run sends two requests)
+        #[arg(long, default_value_t = 1)]
+        runs: u32,
+        /// Confirm live upstream requests using the selected account
+        #[arg(long, required = true)]
+        confirm_live: bool,
+        /// Client `anthropic-beta` header to forward on both arms
+        #[arg(long)]
+        anthropic_beta: Option<String>,
+    },
     /// Install the Claude Code mod (`claude plugin marketplace add` + `install`)
     Setup {
         /// Target tool (only `claude`)
@@ -228,6 +256,26 @@ fn main() -> miette::Result<()> {
             let since = since.unwrap_or_else(|| "day".to_string());
             cli::stats(config, since, json)
         }
+        Some(Command::Compare {
+            model,
+            format,
+            request,
+            account,
+            effort,
+            runs,
+            confirm_live,
+            anthropic_beta,
+        }) => block_on(cli::compare(
+            config,
+            model,
+            format,
+            request,
+            account,
+            effort,
+            runs,
+            confirm_live,
+            anthropic_beta,
+        )),
         Some(Command::Setup { uninstall, .. }) => cli::setup_claude(uninstall),
         Some(Command::Update {
             repo,
@@ -236,5 +284,23 @@ fn main() -> miette::Result<()> {
             no_verify,
         }) => block_on(cli::update(repo, check, force, no_verify)),
         Some(Command::CleanupOld { path }) => cli::cleanup_old_file(&path),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::CommandFactory;
+
+    #[test]
+    fn compare_command_is_hidden_from_main_help_but_has_its_own_help() {
+        let main_help = Cli::command().render_long_help().to_string();
+        assert!(!main_help.contains("compare"));
+
+        let error = Cli::try_parse_from(["local-proxy", "compare", "--help"]).unwrap_err();
+        let compare_help = error.to_string();
+        assert!(compare_help.contains("--model"));
+        assert!(compare_help.contains("--request"));
+        assert!(compare_help.contains("--confirm-live"));
     }
 }

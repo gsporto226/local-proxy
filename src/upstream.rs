@@ -484,30 +484,52 @@ impl ProviderClient {
         })
     }
 
-    /// POST `body` to `path` (defaulting to this provider's endpoint) with the
-    /// correct auth headers. Returns the raw response for the caller to read.
-    ///
-    /// OAuth-authenticated providers send `Authorization: Bearer`, never
-    /// `x-api-key`, apply their `oauth.headers`, and get the configured
-    /// identity block prepended to `system` (an Anthropic requirement).
-    ///
-    /// `client_user_agent` is the inbound request's `User-Agent`. When it
-    /// identifies Claude Code it replaces the provider's configured one, so
-    /// the version Anthropic sees always tracks the real client.
+    /// POST `body` with this provider's configured credentials and headers.
     ///
     /// # Errors
     ///
-    /// Returns [`UpstreamError::MissingApiKey`] if no credential is available,
-    /// [`UpstreamError::InvalidHeader`] if a header cannot be built, or
-    /// [`UpstreamError::Request`] if the HTTP request fails.
-    #[allow(clippy::too_many_lines)]
+    /// Returns [`UpstreamError`] if credentials, headers, or HTTP transport
+    /// setup fails.
     pub async fn chat_request(
+        &self,
+        path: &str,
+        body: Value,
+        client_key: Option<&str>,
+        session_id: &str,
+        client_headers: Option<&HeaderMap>,
+    ) -> Result<reqwest::Response, UpstreamError> {
+        self.chat_request_inner(path, body, client_key, session_id, client_headers, true)
+            .await
+    }
+
+    /// Send a request for diagnostics without persisting account-rate headers.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`UpstreamError`] if authentication, headers, or HTTP transport
+    /// setup fails.
+    pub(crate) async fn comparison_request(
+        &self,
+        path: &str,
+        body: Value,
+        session_id: &str,
+        client_headers: Option<&HeaderMap>,
+    ) -> Result<reqwest::Response, UpstreamError> {
+        self.chat_request_inner(path, body, None, session_id, client_headers, false)
+            .await
+    }
+
+    /// POST a body using the provider's configured credentials and HTTP
+    /// headers. Optionally record quota headers into the ordinary stats DB.
+    #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
+    async fn chat_request_inner(
         &self,
         path: &str,
         mut body: Value,
         client_key: Option<&str>,
         session_id: &str,
-        client_user_agent: Option<&str>,
+        client_headers: Option<&HeaderMap>,
+        record_rate_limits: bool,
     ) -> Result<reqwest::Response, UpstreamError> {
         let is_oauth = matches!(self.auth, Some(AuthEntry::OAuth(_)));
         let oauth_access = if is_oauth {
@@ -606,17 +628,34 @@ impl ProviderClient {
         }
         // Anthropic gates models on the Claude Code client version it reads from
         // `User-Agent`; forward the real client's instead of a stale catalog one.
-        if let Some(ua) = client_user_agent.filter(|u| u.starts_with("claude-cli/")) {
+        let client_header = |name| {
+            client_headers
+                .and_then(|h| h.get(name))
+                .and_then(|v| v.to_str().ok())
+        };
+        if let Some(ua) =
+            client_header(USER_AGENT.as_str()).filter(|u| u.starts_with("claude-cli/"))
+        {
             if let Ok(value) = HeaderValue::from_str(ua) {
                 headers.insert(USER_AGENT, value);
+            }
+        }
+        // Prompt-cache betas (e.g. `extended-cache-ttl` for `ttl: "1h"` blocks)
+        // live in the client's `anthropic-beta`; merge them into ours.
+        if self.format == ProviderFormat::Anthropic {
+            if let Some(merged) = merge_betas(
+                headers.get("anthropic-beta").and_then(|v| v.to_str().ok()),
+                client_header("anthropic-beta"),
+            ) {
+                headers.insert("anthropic-beta", Self::header_value(&merged)?);
             }
         }
 
         tracing::debug!(
             target: crate::LOG_TARGET,
             provider = %self.name,
-            body = %body,
-            "upstream request body"
+            body_bytes = body.to_string().len(),
+            "sending upstream request body"
         );
 
         let resp = self
@@ -640,9 +679,11 @@ impl ProviderClient {
         let claude = pct("anthropic-ratelimit-unified-5h-utilization")
             .zip(pct("anthropic-ratelimit-unified-7d-utilization"))
             .map(|(h5, week)| (h5 * 100.0, week * 100.0));
-        if let Some((h5, week)) = codex.or(claude) {
-            crate::stats::record_rate_limits(h5, week);
-            crate::stats::record_account_rate_limits(&self.name, &self.alias, h5, week);
+        if record_rate_limits {
+            if let Some((h5, week)) = codex.or(claude) {
+                crate::stats::record_rate_limits(h5, week);
+                crate::stats::record_account_rate_limits(&self.name, &self.alias, h5, week);
+            }
         }
         Ok(resp)
     }
@@ -652,6 +693,19 @@ impl ProviderClient {
 /// prompt as the next block. Anthropic rejects OAuth-authenticated requests on
 /// all models except Haiku when the request does not lead with this exact
 /// block, so it is prepended verbatim and never merged with other text.
+/// Union of two comma-separated `anthropic-beta` lists, ours first, deduplicated.
+fn merge_betas(ours: Option<&str>, client: Option<&str>) -> Option<String> {
+    let client = client?;
+    let mut out: Vec<&str> = Vec::new();
+    for beta in ours.unwrap_or("").split(',').chain(client.split(',')) {
+        let beta = beta.trim();
+        if !beta.is_empty() && !out.contains(&beta) {
+            out.push(beta);
+        }
+    }
+    Some(out.join(","))
+}
+
 fn inject_identity(body: &mut Value, identity: &str) {
     let block = json!({"type": "text", "text": identity});
     match body.get_mut("system") {
@@ -1140,7 +1194,16 @@ mod tests {
                 json!({}),
                 None,
                 "",
-                Some("claude-cli/9.9.9 (external, cli)"),
+                Some(&HeaderMap::from_iter([
+                    (
+                        USER_AGENT,
+                        HeaderValue::from_static("claude-cli/9.9.9 (external, cli)"),
+                    ),
+                    (
+                        reqwest::header::HeaderName::from_static("anthropic-beta"),
+                        HeaderValue::from_static("extended-cache-ttl-2025-04-11,oauth-2025-04-20"),
+                    ),
+                ])),
             )
             .await
             .unwrap();
@@ -1149,13 +1212,26 @@ mod tests {
             received.get("user-agent").and_then(|v| v.to_str().ok()),
             Some("claude-cli/9.9.9 (external, cli)")
         );
+        assert_eq!(
+            received.get("anthropic-beta").and_then(|v| v.to_str().ok()),
+            Some("extended-cache-ttl-2025-04-11,oauth-2025-04-20")
+        );
 
         // Anything that is not Claude Code keeps the catalog's value.
         let (base2, rx2) = header_capture_server().await;
         p.base_url = base2;
         let client = ProviderClient::new(&p, false, Some(api_key("key"))).unwrap();
         client
-            .chat_request("/v1/messages", json!({}), None, "", Some("curl/8.5.0"))
+            .chat_request(
+                "/v1/messages",
+                json!({}),
+                None,
+                "",
+                Some(&HeaderMap::from_iter([(
+                    USER_AGENT,
+                    HeaderValue::from_static("curl/8.5.0"),
+                )])),
+            )
             .await
             .unwrap();
         let received = rx2.await.unwrap();
