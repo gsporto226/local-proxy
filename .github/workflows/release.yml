@@ -3,6 +3,10 @@ name: Release
 on:
   push:
     tags: ["v*"]
+    # Caches are scoped per ref: a tag run can only restore caches saved by
+    # itself or by the default branch. Building on main keeps a warm release
+    # cache that every tag restores, so a tag recompiles only local-proxy.
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -27,10 +31,11 @@ jobs:
       - name: toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # Prefix restore instead of rust-cache: rust-cache keys on the Cargo.lock
-      # hash, and the release version bump rewrites the lock, so every tag built
-      # from scratch (~9min of vendored OpenSSL/SQLCipher on Windows). Cargo is
-      # safe with a stale target dir - it recompiles only what actually changed.
+      # Prefix restore instead of rust-cache: every release bump rewrites
+      # Cargo.lock, so an exact key never matches. The prefix match only finds
+      # caches saved on main (see the `branches` trigger above): a tag run
+      # cannot read another tag's cache. Cargo is safe with a stale target dir -
+      # it recompiles only what changed, not vendored OpenSSL/SQLCipher.
       - name: cargo cache
         uses: actions/cache@v4
         with:
@@ -52,6 +57,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: stage artifact
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
           mkdir -p dist
@@ -60,6 +66,7 @@ jobs:
           sha256sum "${{ matrix.bin }}" > "${{ matrix.bin }}.sha256"
 
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           name: local-proxy-${{ matrix.target }}
           path: dist/*
@@ -67,6 +74,7 @@ jobs:
   release:
     name: publish GitHub Release
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
