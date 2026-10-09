@@ -31,10 +31,11 @@ jobs:
       - name: toolchain
         uses: dtolnay/rust-toolchain@stable
 
-      # Prefix restore instead of rust-cache: rust-cache keys on the Cargo.lock
-      # hash, and the release version bump rewrites the lock, so every tag built
-      # from scratch (~9min of vendored OpenSSL/SQLCipher on Windows). Cargo is
-      # safe with a stale target dir - it recompiles only what actually changed.
+      # Prefix restore instead of rust-cache: every release bump rewrites
+      # Cargo.lock, so an exact key never matches. The prefix match only finds
+      # caches saved on main (see the `branches` trigger above): a tag run
+      # cannot read another tag's cache. Cargo is safe with a stale target dir -
+      # it recompiles only what changed, not vendored OpenSSL/SQLCipher.
       - name: cargo cache
         uses: actions/cache@v4
         with:
