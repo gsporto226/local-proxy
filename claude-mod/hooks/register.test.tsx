@@ -61,12 +61,18 @@ function mockProxy(on: On, opts: { sse?: string[]; baseUrl?: string; routes?: Re
   const commands: string[] = []
   const opened: string[] = []
   const openArgs: unknown[] = []
-  const routes = opts.routes ?? ROUTES
+  const routes = { ...(opts.routes ?? ROUTES) }
   mock.clock(on)
   mock.env(on, opts.baseUrl === undefined ? { ANTHROPIC_BASE_URL: BASE } : opts.baseUrl ? { ANTHROPIC_BASE_URL: opts.baseUrl } : {})
   on('http.fetch', ($, e) => {
     const key = `${e.init?.method ?? 'GET'} ${e.url.replace(BASE, '')}`
     calls.push(e.init?.body ? `${key} ${e.init.body}` : key)
+    if (e.init?.method === 'PUT' && (key === 'PUT /admin/model' || key === 'PUT /admin/effort')) {
+      const field = key.endsWith('model') ? 'model' : 'effort'
+      const current = routes['GET /admin/status'] as Record<string, unknown>
+      routes['GET /admin/status'] = { ...current, [field]: JSON.parse(e.init.body as string)[field] }
+      return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify({ message: `${field} updated` }) } }
+    }
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(routes[key] ?? {}) } }
   })
   on('session.id', () => ({ value: 'sess-1' }))
@@ -129,6 +135,35 @@ test('/proxy <args> runs the CLI and returns its output', async ($, on) => {
   const { text } = await $.command.run(run('--version'))
   expect(argv).toEqual(['local-proxy', '--version'])
   expect(text).toBe('local-proxy 0.25.2')
+})
+
+test('/proxy model updates the running proxy and redraws status and panel', async ($, on) => {
+  const { calls } = mockProxy(on)
+  await start($)
+  await $.command.run(run(''))
+  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  const pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await pane.press({ key: 'tab-Status' })
+  expect(await band.find({ text: /openai\/gpt-x/ })).toBeDefined()
+  const { text } = await $.command.run(run('model chatgpt/gpt-6-sol'))
+  expect(text).toBe('model updated')
+  expect(calls).toContain('PUT /admin/model {"model":"chatgpt/gpt-6-sol"}')
+  expect(await band.find({ text: /chatgpt\/gpt-6-sol/ })).toBeDefined()
+  expect(await pane.find({ text: 'chatgpt/gpt-6-sol' })).toBeDefined()
+})
+
+test('/proxy effort and model clear update the running proxy', async ($, on) => {
+  const { calls } = mockProxy(on)
+  await start($)
+  await $.command.run(run(''))
+  await $.command.run(run('effort medium'))
+  await $.command.run(run('model clear'))
+  expect(calls).toContain('PUT /admin/effort {"effort":"medium"}')
+  expect(calls).toContain('PUT /admin/model {"model":null}')
+  const pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await pane.press({ key: 'tab-Status' })
+  expect(await pane.find({ text: 'medium' })).toBeDefined()
+  expect(await pane.find({ text: '(default)' })).toBeDefined()
 })
 
 test('/proxy opens a focused pane; every tab renders on terminal and desktop', async ($, on) => {
