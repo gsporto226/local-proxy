@@ -3,6 +3,10 @@ name: Release
 on:
   push:
     tags: ["v*"]
+    # Caches are scoped per ref: a tag run can only restore caches saved by
+    # itself or by the default branch. Building on main keeps a warm release
+    # cache that every tag restores, so a tag recompiles only local-proxy.
+    branches: [main]
 
 env:
   CARGO_TERM_COLOR: always
@@ -52,6 +56,7 @@ jobs:
         run: cargo build --release --locked
 
       - name: stage artifact
+        if: startsWith(github.ref, 'refs/tags/')
         shell: bash
         run: |
           mkdir -p dist
@@ -60,6 +65,7 @@ jobs:
           sha256sum "${{ matrix.bin }}" > "${{ matrix.bin }}.sha256"
 
       - uses: actions/upload-artifact@v4
+        if: startsWith(github.ref, 'refs/tags/')
         with:
           name: local-proxy-${{ matrix.target }}
           path: dist/*
@@ -67,6 +73,7 @@ jobs:
   release:
     name: publish GitHub Release
     needs: build
+    if: startsWith(github.ref, 'refs/tags/')
     runs-on: ubuntu-latest
     permissions:
       contents: write
