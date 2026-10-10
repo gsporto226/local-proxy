@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { formatResetTime, fuzzyMatch, meter, plain, providerOrder } from './register'
+import { formatResetTime, fuzzyMatch, meter, plain, providerOrder, tailFit } from './register'
 
 const BASE = 'http://127.0.0.1:9999'
 const ROUTES: Record<string, unknown> = {
@@ -385,4 +385,9 @@ test('quota reset time includes a local date-time and relative countdown', async
   expect(label).toMatch(/2026/)
   expect(label).toContain('(in 30m)')
   expect(label).not.toContain('UTC')
+})
+
+test('log tail wraps long lines and keeps the newest that fit', () => {
+  expect(tailFit(['a', 'b'.repeat(25), 'c'], 4, 10)).toEqual(['b'.repeat(25), 'c'])
+  expect(tailFit(['x'.repeat(100)], 2, 10)).toEqual(['x'.repeat(100)])
 })

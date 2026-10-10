@@ -261,6 +261,17 @@ async function act($: $, method: string, path: string, body?: unknown) {
 
 const ask = ($: $, p: ProxyPending) => update($, confirm, () => p)
 
+/** The newest lines that fit in `rows` once each wraps at `columns`. */
+export function tailFit(lines: readonly string[], rows: number, columns: number): string[] {
+  const out: string[] = []
+  for (let i = lines.length - 1, used = 0; i >= 0; i--) {
+    used += Math.max(1, Math.ceil(lines[i].length / Math.max(1, columns)))
+    if (used > rows && out.length) break
+    out.unshift(lines[i])
+  }
+  return out
+}
+
 /** Uses Claude Code's question dialog for a menu with any number of choices. */
 async function choose($: $, question: string, choices: readonly string[]): Promise<string | undefined> {
   if (choices.length <= 2) {
@@ -631,7 +642,7 @@ export const register: Register = (on, options) => {
       body = (
         <Box flexDirection="column">
           {l.length === 0 && <Text dimColor>No log lines.</Text>}
-          {l.slice(-rows).map(line => <Text wrap="truncate-end">{line}</Text>)}
+          {tailFit(l, rows, e.props.scroll.bodyColumns).map(line => <Text>{line}</Text>)}
         </Box>
       )
     } else {
