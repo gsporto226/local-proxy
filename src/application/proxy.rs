@@ -268,7 +268,7 @@ fn active_model_or_default(state: &RuntimeState) -> String {
 #[allow(clippy::too_many_lines)]
 pub async fn handle_chat(app: &AppState, req: ChatRequest<'_>) -> Result<ChatReply, ApiError> {
     let started = Instant::now();
-    let state = app.snapshot().await;
+    let state = app.session_state(req.session_id).await;
     let ChatRequest {
         format: client_format,
         endpoint,

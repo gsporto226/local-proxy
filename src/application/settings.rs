@@ -12,7 +12,7 @@ use thiserror::Error;
 
 use crate::application::runtime::{self, RuntimeError};
 use crate::domain::account::{AuthEntry, OAuthTokens};
-use crate::domain::config::{qualified_id, Config, ConfigError, OAuthProvider};
+use crate::domain::config::{qualified_id, ConfigError, OAuthProvider};
 use crate::ports::{CredentialError, Ports};
 
 /// Errors from the settings use cases.
@@ -58,15 +58,6 @@ fn invalid(message: impl Into<String>) -> SettingsError {
     }
 }
 
-/// The effective config (catalog merged with the overlay at `config_path`).
-///
-/// # Errors
-///
-/// Returns [`SettingsError::Config`] if the overlay or catalog is invalid.
-pub fn effective_config(ports: &Ports, config_path: &Path) -> Result<Config, SettingsError> {
-    Ok(runtime::effective_config(ports, config_path)?)
-}
-
 /// Models available from providers with a usable credential, in provider
 /// config order with duplicates removed.
 ///
@@ -74,7 +65,7 @@ pub fn effective_config(ports: &Ports, config_path: &Path) -> Result<Config, Set
 ///
 /// Returns a [`SettingsError`] if the config or account store cannot be read.
 pub fn connected_models(ports: &Ports, config_path: &Path) -> Result<Vec<String>, SettingsError> {
-    let mut config = effective_config(ports, config_path)?;
+    let mut config = runtime::effective_config(ports, config_path)?;
     let auth = ports.credentials.read_all()?;
     ports.upstream.discover_models(&mut config, &auth);
     let mut models = Vec::new();
@@ -135,7 +126,7 @@ pub fn provider_accounts(
     ports: &Ports,
     config_path: &Path,
 ) -> Result<Vec<ProviderInfo>, SettingsError> {
-    let config = effective_config(ports, config_path)?;
+    let config = runtime::effective_config(ports, config_path)?;
     let auth = ports.credentials.read_all()?;
     Ok(config
         .providers
@@ -245,7 +236,7 @@ pub fn effort_result(
     level: Option<&str>,
 ) -> Result<String, SettingsError> {
     let Some(level) = level else {
-        return Ok(effective_config(ports, config_path)?
+        return Ok(runtime::effective_config(ports, config_path)?
             .defaults
             .active_effort
             .unwrap_or_else(|| "none (o cliente decide)".to_string()));
@@ -307,7 +298,7 @@ pub fn model_result(
             Ok(format!("modelo ativo: {selected}"))
         }
         None => {
-            let config = effective_config(ports, config_path)?;
+            let config = runtime::effective_config(ports, config_path)?;
             if let Some(m) = config.defaults.active_model {
                 return Ok(m);
             }
@@ -342,7 +333,7 @@ pub fn account_result(
             Ok(format!("conta ativa do provider '{provider}' limpa"))
         }
         [command] if command == "clear" => {
-            let config = effective_config(ports, config_path)?;
+            let config = runtime::effective_config(ports, config_path)?;
             if config.defaults.active_accounts.is_empty() {
                 return Ok("nenhuma conta ativa para limpar".to_string());
             }
@@ -403,7 +394,7 @@ fn check_connect_target(
     if account.trim().is_empty() {
         return Err(invalid("account alias must not be empty"));
     }
-    effective_config(ports, config_path)?
+    runtime::effective_config(ports, config_path)?
         .providers
         .into_iter()
         .find(|p| p.name == provider)

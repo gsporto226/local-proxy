@@ -10,7 +10,7 @@ use thiserror::Error;
 use tokio::sync::RwLock;
 
 use crate::application::usage::UsageRecorder;
-use crate::domain::config::{Config, ConfigError};
+use crate::domain::config::{Config, ConfigError, Defaults};
 use crate::domain::router::{Router, RouterError};
 use crate::ports::{AccountMap, CredentialError, Ports, UpstreamError};
 
@@ -27,6 +27,9 @@ pub struct RuntimeState {
     /// proxy's `active_model` instead. Used by `local-proxy launch claude` so the
     /// launched tool's own model selection never overrides the user's choice.
     pub enforce_active_model: bool,
+    /// The `--model` this instance was launched with: kept as its default
+    /// model across hot-reloads instead of the persisted one.
+    pub model_override: Option<String>,
     /// The config file this instance was started with (used by `$proxy model`
     /// to persist the selection).
     pub config_path: PathBuf,
@@ -104,6 +107,7 @@ pub fn build_runtime_state(
         router,
         accounts,
         enforce_active_model: false,
+        model_override: None,
         config_path: config_path.to_path_buf(),
     })
 }
@@ -156,16 +160,36 @@ pub fn build_accounts(ports: &Ports, config: &Config) -> Result<AccountMap, Runt
     Ok(map)
 }
 
-/// Carry this instance's in-memory state across a hot-reload: the active model
-/// (a model write must never leak to other proxies via the shared file) and
-/// the `--enforce-active-model` launch flag, which is not config at all.
+/// Carry this instance's launch flags across a hot-reload: `--model` (which
+/// outranks the persisted model) and `--enforce-active-model`. Everything
+/// else follows the file, so new sessions start from the last saved settings;
+/// existing sessions keep their own frozen defaults (see
+/// [`AppState::session_state`]).
 fn carry_instance_state(old: &RuntimeState, new: &mut RuntimeState) {
-    let mut cfg = (*new.config).clone();
-    cfg.defaults
-        .active_model
-        .clone_from(&old.config.defaults.active_model);
-    new.config = Arc::new(cfg);
+    if let Some(model) = &old.model_override {
+        let mut cfg = (*new.config).clone();
+        cfg.defaults.active_model = Some(model.clone());
+        new.config = Arc::new(cfg);
+    }
+    new.model_override.clone_from(&old.model_override);
     new.enforce_active_model = old.enforce_active_model;
+}
+
+/// One session's own settings: its defaults, frozen from the instance's when
+/// the session was first seen, and its `$proxy account` pins.
+#[derive(Clone)]
+struct Session {
+    defaults: Defaults,
+    pins: HashMap<String, String>,
+}
+
+impl Session {
+    fn new(defaults: &Defaults) -> Self {
+        Self {
+            defaults: defaults.clone(),
+            pins: HashMap::new(),
+        }
+    }
 }
 
 /// Shared application state: the runtime state behind a lock, the session
@@ -173,11 +197,11 @@ fn carry_instance_state(old: &RuntimeState, new: &mut RuntimeState) {
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<RwLock<RuntimeState>>,
-    /// Per-session account pins (`session id -> provider -> alias`), set by
-    /// `$proxy account` inside a session. In-memory only: a restart drops the
-    /// pins and every session falls back to the persisted last-selected
-    /// default.
-    sessions: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
+    /// Per-session settings, keyed by session id. In-memory only: a restart
+    /// drops them and every session starts from the persisted defaults.
+    // ponytail: never evicted, one small entry per session id; add an LRU cap
+    // if a long-lived `serve` sees unbounded session ids.
+    sessions: Arc<RwLock<HashMap<String, Session>>>,
     ports: Ports,
     recorder: UsageRecorder,
     port: Arc<OnceLock<u16>>,
@@ -230,14 +254,11 @@ impl AppState {
 
     /// The account pinned to `session_id` for `provider`, if any.
     pub async fn session_account(&self, session_id: &str, provider: &str) -> Option<String> {
-        if session_id.is_empty() {
-            return None;
-        }
         self.sessions
             .read()
             .await
             .get(session_id)
-            .and_then(|accounts| accounts.get(provider))
+            .and_then(|session| session.pins.get(provider))
             .cloned()
     }
 
@@ -247,40 +268,32 @@ impl AppState {
             .read()
             .await
             .get(session_id)
-            .cloned()
+            .map(|session| session.pins.clone())
             .unwrap_or_default()
     }
 
     /// Pin `alias` as the account of `session_id` for `provider`. A request
     /// without a session id cannot pin anything (there is no session).
     pub async fn set_session_account(&self, session_id: &str, provider: &str, alias: &str) {
-        if session_id.is_empty() {
-            return;
-        }
-        self.sessions
-            .write()
-            .await
-            .entry(session_id.to_string())
-            .or_default()
-            .insert(provider.to_string(), alias.to_string());
+        self.with_session(session_id, |session| {
+            session.pins.insert(provider.to_string(), alias.to_string());
+        })
+        .await;
     }
 
-    /// Drop the session's account pins: one provider, or all of them.
+    /// Drop the session's account pins and selected defaults: one provider,
+    /// or all of them.
     pub async fn clear_session_accounts(&self, session_id: &str, provider: Option<&str>) {
-        if session_id.is_empty() {
-            return;
-        }
-        let mut sessions = self.sessions.write().await;
-        match provider {
-            Some(provider) => {
-                if let Some(accounts) = sessions.get_mut(session_id) {
-                    accounts.remove(provider);
-                }
+        self.with_session(session_id, |session| {
+            if let Some(provider) = provider {
+                session.pins.remove(provider);
+                session.defaults.active_accounts.remove(provider);
+            } else {
+                session.pins.clear();
+                session.defaults.active_accounts.clear();
             }
-            None => {
-                sessions.remove(session_id);
-            }
-        }
+        })
+        .await;
     }
 
     /// Snapshot the current runtime state (cheap Arc clones).
@@ -288,22 +301,57 @@ impl AppState {
         self.inner.read().await.clone()
     }
 
-    /// Set the in-memory `active_model` for this instance without touching any
-    /// other running proxy. Persistence is handled separately by the caller.
-    pub async fn set_active_model(&self, model: Option<String>) {
-        self.update_defaults(|d| d.active_model = model).await;
+    /// The runtime state as `session_id` sees it: this instance's state with
+    /// the session's own defaults (model, effort, accounts). The first call
+    /// for a session freezes the instance's current defaults for it, so later
+    /// global changes only reach new sessions. Without a session id this is
+    /// [`Self::snapshot`].
+    pub async fn session_state(&self, session_id: &str) -> RuntimeState {
+        let mut state = self.snapshot().await;
+        if session_id.is_empty() {
+            return state;
+        }
+        let defaults = self
+            .sessions
+            .write()
+            .await
+            .entry(session_id.to_string())
+            .or_insert_with(|| Session::new(&state.config.defaults))
+            .defaults
+            .clone();
+        let mut config = (*state.config).clone();
+        config.defaults = defaults;
+        state.config = Arc::new(config);
+        state
     }
 
-    /// Set the in-memory `active_effort` for this instance.
-    pub async fn set_active_effort(&self, effort: Option<String>) {
-        self.update_defaults(|d| d.active_effort = effort).await;
+    /// Change the defaults of `session_id` only, or this instance's defaults
+    /// (seen by requests without a session) when the id is empty. Never
+    /// touches other sessions or other running proxies; persistence is
+    /// handled separately by the caller.
+    pub async fn update_defaults(&self, session_id: &str, change: impl FnOnce(&mut Defaults)) {
+        if session_id.is_empty() {
+            let mut guard = self.inner.write().await;
+            let mut config = (*guard.config).clone();
+            change(&mut config.defaults);
+            guard.config = Arc::new(config);
+        } else {
+            self.with_session(session_id, |session| change(&mut session.defaults))
+                .await;
+        }
     }
 
-    async fn update_defaults(&self, change: impl FnOnce(&mut crate::domain::config::Defaults)) {
-        let mut guard = self.inner.write().await;
-        let mut config = (*guard.config).clone();
-        change(&mut config.defaults);
-        guard.config = Arc::new(config);
+    /// Run `f` on the session, freezing the instance defaults for it first if
+    /// it is new. A no-op without a session id.
+    async fn with_session(&self, session_id: &str, f: impl FnOnce(&mut Session)) {
+        if session_id.is_empty() {
+            return;
+        }
+        let defaults = self.snapshot().await.config.defaults.clone();
+        let mut sessions = self.sessions.write().await;
+        f(sessions
+            .entry(session_id.to_string())
+            .or_insert_with(|| Session::new(&defaults)));
     }
 
     /// Rebuild the runtime state from the config file and credential store,
@@ -335,31 +383,62 @@ mod tests {
     use crate::application::testing::empty_state;
 
     #[test]
-    fn hot_reload_keeps_enforce_and_active_model() {
-        let make = |model: Option<&str>, enforce: bool| {
+    fn hot_reload_keeps_launch_flags_and_follows_the_file() {
+        let make = |model: Option<&str>, effort: Option<&str>| {
             let mut cfg = Config::default();
             cfg.defaults.active_model = model.map(str::to_string);
-            RuntimeState {
-                enforce_active_model: enforce,
-                ..empty_state(cfg)
-            }
+            cfg.defaults.active_effort = effort.map(str::to_string);
+            empty_state(cfg)
         };
-        let old = make(Some("kimi"), true);
-        let mut new = make(None, false);
+        // Without `--model` the reloaded file wins.
+        let old = make(Some("old"), Some("low"));
+        let mut new = make(Some("saved"), Some("high"));
+        carry_instance_state(&old, &mut new);
+        assert_eq!(new.config.defaults.active_model.as_deref(), Some("saved"));
+        assert_eq!(new.config.defaults.active_effort.as_deref(), Some("high"));
+
+        // `--model` and `--enforce-active-model` survive the reload.
+        let old = RuntimeState {
+            enforce_active_model: true,
+            model_override: Some("kimi".to_string()),
+            ..make(Some("kimi"), None)
+        };
+        let mut new = make(Some("saved"), None);
         carry_instance_state(&old, &mut new);
         assert!(new.enforce_active_model);
         assert_eq!(new.config.defaults.active_model.as_deref(), Some("kimi"));
     }
 
     #[tokio::test]
-    async fn set_active_model_is_per_instance() {
-        let app = AppState::new(empty_state(Config::default()), crate::bootstrap::ports());
-        assert_eq!(app.snapshot().await.config.defaults.active_model, None);
-        app.set_active_model(Some("gpt-4o".to_string())).await;
+    async fn sessions_freeze_defaults_and_change_independently() {
+        let mut cfg = Config::default();
+        cfg.defaults.active_model = Some("global".to_string());
+        let app = AppState::new(empty_state(cfg), crate::bootstrap::ports());
+        let model = |state: RuntimeState| state.config.defaults.active_model.clone();
+
+        // `a` is seen first and freezes the global default.
         assert_eq!(
-            app.snapshot().await.config.defaults.active_model.as_deref(),
-            Some("gpt-4o")
+            model(app.session_state("a").await).as_deref(),
+            Some("global")
         );
+        // A session's own change touches only that session.
+        app.update_defaults("b", |d| d.active_model = Some("mine".to_string()))
+            .await;
+        assert_eq!(model(app.session_state("b").await).as_deref(), Some("mine"));
+        assert_eq!(
+            model(app.session_state("a").await).as_deref(),
+            Some("global")
+        );
+        assert_eq!(model(app.snapshot().await).as_deref(), Some("global"));
+
+        // A new global default (hot-reload) reaches new sessions only.
+        app.update_defaults("", |d| d.active_model = Some("new".to_string()))
+            .await;
+        assert_eq!(
+            model(app.session_state("a").await).as_deref(),
+            Some("global")
+        );
+        assert_eq!(model(app.session_state("c").await).as_deref(), Some("new"));
     }
 
     #[test]

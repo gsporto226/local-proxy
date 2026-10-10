@@ -844,7 +844,6 @@ describe("e2e: multiple accounts per provider", () => {
 
   test("$proxy account pins the account for the session and updates the default", async () => {
     const sessionA = { "x-claude-code-session-id": "sess-A" };
-    const sessionB = { "x-claude-code-session-id": "sess-B" };
     const chat = { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
 
     // Session A switches through the proxy itself.
@@ -862,12 +861,14 @@ describe("e2e: multiple accounts per provider", () => {
     expect(pinned.status).toBe(200);
     expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
 
-    // Move the persisted default from the CLI; session B (no pin) follows it.
+    // Move the persisted default from the CLI; new sessions start from it.
     const cli = await runCli(["--config", cfgPath, "account", "mock_responses/personal"], env);
     expect(cli.exit).toBe(0);
     let authB = "";
     for (let i = 0; i < 30; i++) {
-      const r = await postJson(proxy.base, "/v1/messages", chat, sessionB);
+      // A fresh session each try: one seen before the hot-reload keeps its
+      // frozen default.
+      const r = await postJson(proxy.base, "/v1/messages", chat, { "x-claude-code-session-id": `sess-B${i}` });
       if (r.status === 200) {
         authB = mock.lastResponsesHeaders().authorization ?? "";
         if (authB === "Bearer key-personal") break;
@@ -881,7 +882,7 @@ describe("e2e: multiple accounts per provider", () => {
     expect(stillA.status).toBe(200);
     expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
 
-    // Clearing drops the pin: session A falls back to the persisted default.
+    // Clearing drops the session's selection: two accounts, no pick -> 400.
     const clear = await postJson(
       proxy.base,
       "/v1/messages",
@@ -889,9 +890,8 @@ describe("e2e: multiple accounts per provider", () => {
       sessionA,
     );
     expect(clear.status).toBe(200);
-    const fallback = await postJson(proxy.base, "/v1/messages", chat, sessionA);
-    expect(fallback.status).toBe(200);
-    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-personal");
+    const cleared = await postJson(proxy.base, "/v1/messages", chat, sessionA);
+    expect(cleared.status).toBe(400);
   });
 });
 

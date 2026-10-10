@@ -29,8 +29,8 @@ pub async fn maybe_exec(
     let cmd = exec::split_command(&text, &config.token)?;
     let args = exec::parse_args(cmd);
     Some(match args.first().map(String::as_str) {
-        Some("model") => handle_model(app, state, &args).await,
-        Some("effort") => handle_effort(app, state, &args).await,
+        Some("model") => handle_model(app, state, session_id, &args).await,
+        Some("effort") => handle_effort(app, state, session_id, &args).await,
         Some("account") => handle_account(app, state, session_id, &args).await,
         Some("logs") => handle_logs(app, &args),
         _ => {
@@ -94,18 +94,21 @@ pub async fn config_json(app: &AppState) -> Value {
     json!({ "model": defaults.active_model, "effort": defaults.active_effort })
 }
 
-/// Persist the reasoning effort (`level` or `clear`) and apply it to this
-/// instance right away (others follow via hot-reload). Shared by
-/// `$proxy effort` and `PUT /admin/effort`.
+/// Persist the reasoning effort (`level` or `clear`) and apply it to `session_id`.
+///
+/// The persisted value is the default for new sessions; running sessions keep
+/// theirs. An empty `session_id` applies it to this instance's session-less
+/// requests. Shared by `$proxy effort` and `PUT /admin/effort`.
 ///
 /// # Errors
 ///
 /// Returns the message of an invalid level or a failed write.
-pub async fn apply_effort(app: &AppState, level: &str) -> Result<String, String> {
+pub async fn apply_effort(app: &AppState, session_id: &str, level: &str) -> Result<String, String> {
     let config_path = app.snapshot().await.config_path;
     let msg = settings::effort_result(app.ports(), &config_path, Some(level))
         .map_err(|e| e.to_string())?;
-    app.set_active_effort((level != "clear").then(|| level.to_string()))
+    let effort = (level != "clear").then(|| level.to_string());
+    app.update_defaults(session_id, |d| d.active_effort = effort)
         .await;
     emit_config(app).await;
     Ok(msg)
@@ -113,21 +116,24 @@ pub async fn apply_effort(app: &AppState, level: &str) -> Result<String, String>
 
 /// Validate and persist the active model (`clear` unsets it).
 ///
-/// Also updates this instance's in-memory `active_model` (per-instance, no
-/// broadcast to other running proxies). Shared by `$proxy model` and
+/// Also applies it to `session_id` right away (or to this instance's
+/// session-less requests when empty); running sessions keep theirs and new
+/// sessions start from the persisted value. Shared by `$proxy model` and
 /// `PUT /admin/model`.
 ///
 /// # Errors
 ///
 /// Returns the message of an unavailable model or a failed write.
-pub async fn apply_model(app: &AppState, model: &str) -> Result<String, String> {
+pub async fn apply_model(app: &AppState, session_id: &str, model: &str) -> Result<String, String> {
     let config_path = app.snapshot().await.config_path;
     let msg = settings::model_result(app.ports(), &config_path, Some(model))
         .map_err(|e| e.to_string())?;
     if model == "clear" {
-        app.set_active_model(None).await;
+        app.update_defaults(session_id, |d| d.active_model = None)
+            .await;
     } else if msg.starts_with("modelo ativo:") {
-        app.set_active_model(Some(model.to_string())).await;
+        app.update_defaults(session_id, |d| d.active_model = Some(model.to_string()))
+            .await;
     }
     emit_config(app).await;
     Ok(msg)
@@ -160,24 +166,39 @@ pub async fn disconnect(app: &AppState, provider: &str, alias: &str) -> Result<S
     Ok(msg)
 }
 
-/// `$proxy effort [level|clear]`.
-async fn handle_effort(app: &AppState, state: &RuntimeState, args: &[String]) -> ExecOutput {
+/// `$proxy effort [level|clear]`: report this session's effort, or set/clear
+/// it via [`apply_effort`].
+async fn handle_effort(
+    app: &AppState,
+    state: &RuntimeState,
+    session_id: &str,
+    args: &[String],
+) -> ExecOutput {
     exec_output(match args.get(1) {
-        Some(level) => apply_effort(app, level).await,
-        None => settings::effort_result(app.ports(), &state.config_path, None)
-            .map_err(|e| e.to_string()),
+        Some(level) => apply_effort(app, session_id, level).await,
+        None => Ok(state
+            .config
+            .defaults
+            .active_effort
+            .clone()
+            .unwrap_or_else(|| "none (o cliente decide)".to_string())),
     })
 }
 
-/// `$proxy model [model|clear]`: report this instance's in-memory model, or
-/// set/clear it via [`apply_model`].
-async fn handle_model(app: &AppState, state: &RuntimeState, args: &[String]) -> ExecOutput {
+/// `$proxy model [model|clear]`: report this session's model, or set/clear it
+/// via [`apply_model`].
+async fn handle_model(
+    app: &AppState,
+    state: &RuntimeState,
+    session_id: &str,
+    args: &[String],
+) -> ExecOutput {
     exec_output(match args.get(1) {
         None => Ok(state.config.defaults.active_model.as_deref().map_or_else(
             || "nenhum modelo ativo".to_string(),
             |m| format!("modelo ativo: {m}"),
         )),
-        Some(model) => apply_model(app, model).await,
+        Some(model) => apply_model(app, session_id, model).await,
     })
 }
 

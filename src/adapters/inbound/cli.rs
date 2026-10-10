@@ -242,12 +242,13 @@ pub fn spawn_launch_proxy(args: &[String]) -> io::Result<std::process::Child> {
 ///
 /// If `config_path` is the global default and it does not exist yet, a default
 /// config is written there and a message is printed so the user can edit it.
-/// Explicit flag/env/cwd paths are never auto-created; their load errors are
-/// surfaced as-is.
+/// Explicit flag/env/cwd paths are never auto-created. The result is the
+/// effective config (catalog merged with the overlay), the same view the
+/// server runs on.
 ///
 /// # Errors
 ///
-/// Returns a [`CliError::Config`] if the config cannot be created or loaded.
+/// Returns a [`CliError`] if the config cannot be created or loaded.
 #[allow(clippy::result_large_err)]
 fn load_config(ports: &Ports, config_path: &Path) -> Result<Config, CliError> {
     if config_path == paths::global_config_path() && !config_path.exists() {
@@ -257,7 +258,7 @@ fn load_config(ports: &Ports, config_path: &Path) -> Result<Config, CliError> {
             config_path.display()
         );
     }
-    Ok(ports.config.load(config_path)?)
+    Ok(runtime::effective_config(ports, config_path)?)
 }
 
 // ---------------------------------------------------------------------------
@@ -339,8 +340,9 @@ pub async fn serve(
     // user's selection.
     if let Some(m) = model_override.filter(|m| !m.is_empty()) {
         let mut cfg = (*state.config).clone();
-        cfg.defaults.active_model = Some(m);
+        cfg.defaults.active_model = Some(m.clone());
         state.config = Arc::new(cfg);
+        state.model_override = Some(m);
     }
     if enforce_active_model {
         state.enforce_active_model = true;
