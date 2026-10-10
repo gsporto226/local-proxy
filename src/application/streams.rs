@@ -311,7 +311,8 @@ impl Stream for ScannedStream {
 }
 
 /// Forward a same-format SSE body verbatim, recording its usage when it ends.
-#[must_use]
+// Return type is already must_use; older clippy still asks for the attribute.
+#[allow(clippy::must_use_candidate)]
 pub fn scan_passthrough(body: ByteStream, capture: Option<StreamCapture>) -> ByteStream {
     Box::pin(ScannedStream {
         inner: body,

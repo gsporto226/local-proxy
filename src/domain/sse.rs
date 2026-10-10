@@ -15,7 +15,8 @@ pub struct StreamError(pub String);
 pub type ByteStream = Pin<Box<dyn Stream<Item = Result<Bytes, StreamError>> + Send>>;
 
 /// A body made of one in-memory chunk.
-#[must_use]
+// Return type is already must_use; older clippy still asks for the attribute.
+#[allow(clippy::must_use_candidate)]
 pub fn once(body: impl Into<Bytes>) -> ByteStream {
     let chunk: Bytes = body.into();
     Box::pin(futures_util::stream::once(async move { Ok(chunk) }))
