@@ -6,7 +6,9 @@ use std::path::PathBuf;
 use clap::{Parser, Subcommand};
 use tokio::runtime::Runtime;
 
-use local_proxy::cli;
+use local_proxy::adapters::inbound::cli;
+use local_proxy::adapters::outbound::paths;
+use local_proxy::application::commands::DEFAULT_LOG_LINES;
 
 #[derive(Debug, Parser)]
 #[command(
@@ -73,7 +75,7 @@ enum Command {
     /// Show the tail of the proxy log file
     Logs {
         /// Number of lines to print
-        #[arg(short = 'n', long, default_value_t = cli::DEFAULT_LOG_LINES)]
+        #[arg(short = 'n', long, default_value_t = DEFAULT_LOG_LINES)]
         lines: usize,
     },
     /// List models available from connected providers
@@ -198,10 +200,11 @@ fn main() -> miette::Result<()> {
         |_| Box::new(miette::GraphicalReportHandler::new()),
     ))?;
     let cli = Cli::parse();
-    let config = cli::resolve_config_path(cli.config);
+    let config = paths::resolve_config_path(cli.config);
+    let ports = local_proxy::bootstrap::ports();
     match cli.command {
         None => block_on(cli::serve(
-            config, None, None, false, false, false, None, false,
+            ports, config, None, None, false, false, false, None, false,
         )),
         Some(Command::Serve {
             host,
@@ -212,6 +215,7 @@ fn main() -> miette::Result<()> {
             ephemeral,
             enforce_active_model,
         }) => block_on(cli::serve(
+            ports,
             config,
             host,
             port,
@@ -228,6 +232,7 @@ fn main() -> miette::Result<()> {
             dry_run,
             args,
         }) => cli::launch(
+            &ports,
             config,
             tool.as_deref().unwrap_or("claude"),
             model.as_deref(),
@@ -235,26 +240,25 @@ fn main() -> miette::Result<()> {
             dry_run,
             args,
         ),
-        Some(Command::Status) => cli::status(config),
-        Some(Command::Stop) => cli::stop(config),
-        Some(Command::Logs { lines }) => cli::logs(config, lines),
-        Some(Command::Models) => cli::models(config),
-        Some(Command::Model { model }) => cli::model(config, model),
-        Some(Command::Effort { level }) => cli::effort(config, level),
+        Some(Command::Status) => cli::status(&ports, config),
+        Some(Command::Stop) => cli::stop(&ports, config),
+        Some(Command::Logs { lines }) => cli::logs(&ports, lines),
+        Some(Command::Models) => cli::models(&ports, &config),
+        Some(Command::Model { model }) => cli::model(&ports, &config, model.as_deref()),
+        Some(Command::Effort { level }) => cli::effort(&ports, &config, level.as_deref()),
         Some(Command::Connect {
             provider,
             account,
             key,
             oauth,
-        }) => cli::connect(config, provider, account, key, oauth),
+        }) => cli::connect(&ports, &config, &provider, &account, key, oauth),
         Some(Command::Disconnect { provider, account }) => {
-            cli::disconnect(config, provider, account)
+            cli::disconnect(&ports, &provider, &account)
         }
-        Some(Command::Account { args }) => cli::account(config, args),
-        Some(Command::Providers) => cli::providers(config),
+        Some(Command::Account { args }) => cli::account(&ports, &config, &args),
+        Some(Command::Providers) => cli::providers(&ports, &config),
         Some(Command::Stats { since, json }) => {
-            let since = since.unwrap_or_else(|| "day".to_string());
-            cli::stats(config, since, json)
+            cli::stats(&ports, since.as_deref().unwrap_or("day"), json)
         }
         Some(Command::Compare {
             model,
@@ -266,7 +270,8 @@ fn main() -> miette::Result<()> {
             confirm_live,
             anthropic_beta,
         }) => block_on(cli::compare(
-            config,
+            &ports,
+            &config,
             model,
             format,
             request,
