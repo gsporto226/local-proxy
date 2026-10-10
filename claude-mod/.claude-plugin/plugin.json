@@ -1,6 +1,6 @@
 {
   "name": "local-proxy",
-  "version": "0.4.1",
+  "version": "0.4.2",
   "author": { "name": "Gabriel Porto" },
   "description": "local-proxy inside Claude Code: /proxy <args> runs the CLI, /proxy opens the panel, plus a status line",
   "types": "./types/index.d.ts",

@@ -320,18 +320,22 @@ export const register: Register = (on, options) => {
     // ponytail: whitespace split, no quoting; port exec::parse_args if quoted args show up
     const args = e.args.trim().split(/\s+/).filter(Boolean)
     if (args.length === 0) {
-      await refresh($, true)
-      // Focused, so digits and Enter go to the panel, not the prompt; Esc closes it.
-      hadFocus = false
-      await $.ui.open({
-        id: PANE,
-        title: 'local-proxy',
-        focus: true,
-        closeOnEscape: true,
-        rows: Math.floor(screenRows * 0.9),
-        columns: Math.floor(screenColumns * 0.9),
-      })
-      return {}
+      try {
+        await refresh($, true)
+        // Focused, so digits and Enter go to the panel, not the prompt; Esc closes it.
+        hadFocus = false
+        await $.ui.open({
+          id: PANE,
+          title: 'local-proxy',
+          focus: true,
+          closeOnEscape: true,
+          rows: Math.floor(screenRows * 0.9),
+          columns: Math.floor(screenColumns * 0.9),
+        })
+        return { text: '' }
+      } catch (err) {
+        return { text: `local-proxy panel failed to open: ${String(err)}` }
+      }
     }
     try {
       if ((args[0] === 'model' || args[0] === 'effort') && args.length === 2) {
