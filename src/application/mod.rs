@@ -102,6 +102,7 @@ pub(crate) mod testing {
             config,
             accounts: Arc::new(accounts),
             enforce_active_model: false,
+            model_override: None,
             config_path: PathBuf::new(),
         }
     }

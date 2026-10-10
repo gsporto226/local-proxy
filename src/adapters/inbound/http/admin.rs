@@ -217,7 +217,7 @@ struct ModelBody {
 
 async fn set_model(State(app): State<AppState>, Json(body): Json<ModelBody>) -> ApiResult {
     let model = body.model.as_deref().unwrap_or("clear");
-    apply_model(&app, model)
+    apply_model(&app, "", model)
         .await
         .map(message)
         .map_err(bad_request)
@@ -230,7 +230,7 @@ struct EffortBody {
 
 async fn set_effort(State(app): State<AppState>, Json(body): Json<EffortBody>) -> ApiResult {
     let level = body.effort.as_deref().unwrap_or("clear");
-    apply_effort(&app, level)
+    apply_effort(&app, "", level)
         .await
         .map(message)
         .map_err(bad_request)
@@ -291,6 +291,7 @@ mod tests {
                 router: Arc::new(ModelRouter::new(config).unwrap()),
                 accounts: Arc::new(accounts),
                 enforce_active_model: false,
+                model_override: None,
                 config_path,
             },
             ports,
