@@ -14,7 +14,7 @@
 
 use std::time::Duration;
 
-use local_proxy::auth;
+use local_proxy::domain::account::AuthEntry;
 
 /// The Codex model manifest endpoint (the one the Codex CLI itself uses).
 /// Distinct from `chatgpt.com/backend-api/models`, which is the *chat* web UI
@@ -33,10 +33,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let account_alias = std::env::args()
         .nth(1)
         .unwrap_or_else(|| "default".to_string());
-    let tokens = auth::read_auth()?
-        .get(provider)
-        .and_then(|accounts| accounts.get(&account_alias))
-        .and_then(auth::AuthEntry::oauth)
+    let tokens = local_proxy::bootstrap::ports()
+        .credentials
+        .get(provider, &account_alias)?
+        .as_ref()
+        .and_then(AuthEntry::oauth)
         .cloned()
         .ok_or("no chatgpt oauth account; connect with --account <alias> or pass an alias")?;
     let (token, account) = (tokens.access, tokens.account_id);

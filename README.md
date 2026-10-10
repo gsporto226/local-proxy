@@ -239,7 +239,7 @@ providers:
       identity: "You are Claude Code, Anthropic's official CLI for Claude."
 ```
 
-To run a second subscription account, define another provider with the same `oauth` block under a different name (a same-named provider in your config replaces the catalog entry entirely). A provider with a new interaction style (device code, say) needs one new `flow` variant plus its function in `src/oauth.rs`; everything downstream already treats OAuth uniformly. Two flows exist today: `paste` (above) and `callback`, which opens the browser and catches the redirect on a local listener bound to `redirect_uri` (used by `chatgpt`). The recipe also takes `token_encoding: form` for token endpoints that want a form body instead of JSON, and `account_id_claim` / `account_id_header` to lift an account id out of the `id_token` and send it on every request.
+To run a second subscription account, define another provider with the same `oauth` block under a different name (a same-named provider in your config replaces the catalog entry entirely). A provider with a new interaction style (device code, say) needs one new `flow` variant plus its function in `src/adapters/outbound/oauth.rs`; everything downstream already treats OAuth uniformly. Two flows exist today: `paste` (above) and `callback`, which opens the browser and catches the redirect on a local listener bound to `redirect_uri` (used by `chatgpt`). The recipe also takes `token_encoding: form` for token endpoints that want a form body instead of JSON, and `account_id_claim` / `account_id_header` to lift an account id out of the `id_token` and send it on every request.
 
 ### ChatGPT Plus/Pro
 
@@ -493,25 +493,42 @@ The CI workflow in `.github/workflows/ci.yml` runs fmt, clippy with `-D warnings
 
 ## Project structure
 
+The code is laid out as a hexagon (ports and adapters). Dependencies point
+inward only, and `tests/architecture.rs` enforces it.
+
 ```
 src/
-├── main.rs        CLI and boot (errors with miette)
-├── config.rs      Config, Provider, Route (headers, oauth, reasoning_effort), Defaults, overlay
-├── catalog.rs     embedded catalog and catalog to config merge
-├── auth.rs        encrypted account store (SQLCipher), OS vault key, legacy migration
-├── oauth.rs       generic OAuth 2.0 + PKCE engine (login flows, exchange, refresh)
-├── cli.rs         serve, launch, status, stop, models, model, connect, disconnect, providers, stats, setup, update
-├── router.rs      resolve_model to (provider, upstream_model, reasoning_effort)
-├── upstream.rs    HTTP calls, key resolution, per-provider headers
-├── ir/           format-neutral IR: one decoder + encoder per format (anthropic, openai, responses)
-├── translate.rs   token usage, cost, and Anthropic passthrough hygiene
-├── sse.rs         SSE frame parser
-├── streams.rs     SSE driver: upstream decoder -> IR events -> client encoder
-├── exec.rs        $proxy executor, token detection, arg parsing, timeout
-├── error.rs       ApiError and per-format error shape
-├── stats.rs       local statistics (SQLite stats.db) and stats command
-└── handlers.rs    axum endpoints, hot-reload state, /v1/models, count_tokens, $proxy
-e2e/               Bun test suite (mock and live)
+├── main.rs           CLI parsing; builds the ports and calls the CLI adapter
+├── bootstrap.rs      composition root: picks one adapter per port
+├── domain/           the model and rules, no I/O
+│   ├── config.rs     Config, Provider, Route, Defaults and parsing
+│   ├── catalog.rs    embedded catalog and catalog-to-config merge
+│   ├── router.rs     resolve_model to (provider, upstream_model, reasoning_effort)
+│   ├── ir/           format-neutral IR: one decoder + encoder per format
+│   ├── translate.rs  token usage, cost, and Anthropic passthrough hygiene
+│   ├── request.rs    preparing a client request for its upstream
+│   ├── sse.rs        byte streams and the SSE frame parser
+│   ├── exec.rs       $proxy token detection, arg parsing, synthesized replies
+│   ├── account.rs    stored credentials (API key or OAuth tokens)
+│   ├── oauth.rs      PKCE, authorize URL, pasted-code parsing
+│   ├── stats.rs      usage rows and aggregates
+│   └── error.rs      ApiError and per-format error shapes
+├── ports/            traits the application needs: config, credentials, usage,
+│                     events, upstream, commands, logs, oauth
+├── application/      use cases, written against ports and domain only
+│   ├── proxy.rs      serve a chat request: route, pick the account, translate
+│   ├── streams.rs    streaming translation and same-format passthrough
+│   ├── runtime.rs    hot-reloadable state, session pins, reload
+│   ├── commands.rs   $proxy model/effort/account/logs
+│   ├── settings.rs   active model/effort/account, connected providers
+│   ├── usage.rs      best-effort usage recording
+│   ├── stats_report.rs, account_usage.rs, compare.rs
+└── adapters/
+    ├── inbound/      cli.rs, http/ (endpoints + /admin), watcher.rs (hot-reload)
+    └── outbound/     upstream.rs (HTTP), credential_store.rs (SQLCipher + vault),
+                      usage_store.rs (SQLite), config_file.rs, oauth.rs, events.rs,
+                      process.rs, log_file.rs, paths.rs
+e2e/                  Bun test suite (mock and live)
 ```
 
 ## Troubleshooting

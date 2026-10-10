@@ -83,12 +83,14 @@ temporário enquanto roda:
 ```rust
 let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
 std::env::set_var("LOCAL_PROXY_CONFIG_DIR", &dir);
-// ... auth::read_auth / set_key_for / build_runtime_state / etc ...
+// ... ports.credentials / build_runtime_state / settings::* / etc ...
 std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
 ```
 
-O lock serializa todos os testes que mexem no env (config.rs, upstream.rs,
-handlers.rs, cli.rs). Como defesa extra, `auth::with_db` falha
+O lock serializa todos os testes que mexem no env (adapters e application).
+As credenciais passam pelo port `CredentialStore`; testes de lógica pura podem
+usar fakes (`application::testing`) em vez do store real. Como defesa extra,
+`with_db` em `adapters/outbound/credential_store.rs` falha
 em `cfg(test)` sem `LOCAL_PROXY_CONFIG_DIR`: um teste esquecido falha alto em
 vez de migrar o store real — foi assim que o `auth.json` do usuário foi
 migrado por engano em 06/10/2026 (teste
