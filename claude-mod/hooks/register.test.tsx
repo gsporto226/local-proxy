@@ -305,6 +305,14 @@ test('status row shows all segments by default', async ($, on) => {
   expect(await ui.find({ text: 'openai/gpt-x · high · openai/work · 42% ctx · 12% 5h · 40% wk' })).toBeDefined()
 })
 
+test('an empty-string segments option falls back to all segments', { options: { segments: '' } }, async ($, on) => {
+  mockProxy(on)
+  await start($)
+  await $.command.run(run(''))
+  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
+  expect(await ui.find({ text: 'openai/gpt-x · high · openai/work · 42% ctx · 12% 5h · 40% wk' })).toBeDefined()
+})
+
 test('status row prefers the session pin and follows the segments option', { options: { segments: ['account', 'model'] } }, async ($, on) => {
   mockProxy(on, { routes: { ...ROUTES, 'GET /admin/session/sess-1': { account: { openai: 'home' }, effort: null, stats: null } } })
   await start($)

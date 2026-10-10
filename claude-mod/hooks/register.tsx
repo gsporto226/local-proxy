@@ -279,7 +279,11 @@ async function choose($: $, question: string, choices: readonly string[]): Promi
 }
 
 export const register: Register = (on, options) => {
-  segments = (options.segments as readonly string[] | undefined) ?? SEGMENTS
+  // The settings UI may store the option as a string ("" when cleared, or "a,b").
+  const raw = options.segments
+  const list = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(',') : []
+  const picked = list.map(s => String(s).trim()).filter(Boolean)
+  segments = picked.length ? picked : SEGMENTS
 
   on('session.start', async ($, e, next) => {
     // Without a proxy connection the mod stays inert: no command, no row, no polling.
