@@ -375,7 +375,7 @@ The `claude-mod/` folder is a Claude Code plugin (mod), and this repository is i
 
 - `/proxy <args>`: runs the `local-proxy` CLI inside the session (for example `/proxy model kimi-k2.6`).
 - `/proxy` with no arguments: opens a panel with status, per-account upstream quotas, accounts, models, stats and logs, fed by the `/admin` API.
-- A status line with model, context, rate limits and cost. Pick the segments in the plugin's `segments` option.
+- Status line data, published for a status line mod with `$.statusline.publish({ id: "local-proxy", values })` (`model`, `effort`, `account`, `contextPercent`, `rate5h`, `rateWeek`; see `claude-mod/types/index.d.ts`). The mod draws no row itself: it publishes the values under `id: "local-proxy"` and a status line mod renders them.
 
 Install it from a terminal session of Claude Code:
 

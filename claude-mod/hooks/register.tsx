@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
-import type { AccountUsageResult, ProxyAccount, ProxyCacheStats, ProxyPending, ProxyRateLimits, ProxyStats, ProxyStatsWindow, ProxyStatus } from '../types'
+import type { AccountUsageResult, ProxyAccount, ProxyCacheStats, ProxyPending, ProxyRateLimits, ProxyStats, ProxyStatsWindow, ProxyStatus, ProxyStatusline } from '../types'
 
 type $ = EngineInterface
 
@@ -63,7 +63,6 @@ export function providerOrder(accounts: readonly ProxyAccount[], pins: Readonly<
 }
 const WINDOWS: ProxyStatsWindow[] = ['session', 'day', 'week', 'month', 'all']
 const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
-export const SEGMENTS = ['model', 'effort', 'account', 'context', 'rate5h', 'rateWeek']
 
 const tab = atom({ plugin: 'local-proxy', key: 'tab' } as const, 'Accounts')
 const status = atom({ plugin: 'local-proxy', key: 'status' } as const, null)
@@ -77,7 +76,6 @@ const rate = atom({ plugin: 'local-proxy', key: 'rate' } as const, null)
 const logs = atom({ plugin: 'local-proxy', key: 'logs' } as const, [])
 const confirm = atom({ plugin: 'local-proxy', key: 'confirm' } as const, null)
 const error = atom({ plugin: 'local-proxy', key: 'error' } as const, null)
-const line = atom({ plugin: 'local-proxy', key: 'line' } as const, '')
 const accountFilter = atom({ plugin: 'local-proxy', key: 'accountFilter' } as const, '')
 
 // The proxy this session talks to: Claude's own base URL, when it is a loopback
@@ -169,7 +167,6 @@ function refreshSoon($: $) {
   return pending
 }
 
-let segments: readonly string[] = SEGMENTS
 // Terminal dimensions from the band's last drawing; the pane requests 90%.
 let screenRows = 40
 let screenColumns = 120
@@ -177,7 +174,7 @@ let screenColumns = 120
 let hadFocus = false
 let interactive = false
 
-// Drawn as an AbovePrompt row: `$.ui.status` gets a `⚠ <plugin>:` prefix from the engine.
+// Published under id 'local-proxy' via `$.statusline.publish` for a status line mod to render.
 async function statusLine($: $) {
   const [u, st, rl, acc, pinned] = await Promise.all([
     $.session.usage(),
@@ -186,21 +183,22 @@ async function statusLine($: $) {
     read($, accounts),
     read($, pins),
   ])
-  const usageRate = (kind: string) => u.rateLimits.find(r => r.kind === kind)?.percentUsed
-  const pct = (n: number | null | undefined) => (n == null ? undefined : `${Math.round(n)}%`)
-  const model = st?.model ?? (await $.session.model())
+  const usageRate = (kind: string) => u.rateLimits.find(r => r.kind === kind)?.percentUsed ?? null
+  const model = st?.model ?? (await $.session.model()) ?? null
   const provider = model?.split('/')[0]
   const alias = provider && (pinned[provider] ?? acc.find(a => a.provider === provider && a.is_default)?.alias)
-  const parts: Record<string, string | undefined> = {
+  const value: ProxyStatusline = {
     model,
-    effort: st?.effort ?? undefined,
-    account: alias ? `${provider}/${alias}` : undefined,
-    context: pct(u.context.percent) && `${pct(u.context.percent)} ctx`,
-    rate5h: pct(rl?.h5 ?? usageRate('five_hour')) && `${pct(rl?.h5 ?? usageRate('five_hour'))} 5h`,
-    rateWeek: pct(rl?.week ?? usageRate('seven_day')) && `${pct(rl?.week ?? usageRate('seven_day'))} wk`,
+    effort: st?.effort ?? null,
+    account: provider && alias ? { provider, alias } : null,
+    contextPercent: u.context.percent ?? null,
+    rate5h: rl?.h5 ?? usageRate('five_hour'),
+    rateWeek: rl?.week ?? usageRate('seven_day'),
   }
-  const text = segments.map(s => parts[s]).filter(Boolean).join(' · ')
-  if (changed('line', text)) await update($, line, () => text)
+  if (changed('statusline', value)) {
+    try { await $.statusline.publish({ id: 'local-proxy', values: value }) }
+    catch { /* the statusline mod is optional */ }
+  }
 }
 
 // ponytail: the runtime has no streaming HTTP; SSE rides a `curl -sN` child via $.process.spawn.
@@ -290,11 +288,10 @@ async function choose($: $, question: string, choices: readonly string[]): Promi
 }
 
 export const register: Register = (on, options) => {
-  // The settings UI may store the option as a string ("" when cleared, or "a,b").
-  const raw = options.segments
-  const list = Array.isArray(raw) ? raw : typeof raw === 'string' ? raw.split(',') : []
-  const picked = list.map(s => String(s).trim()).filter(Boolean)
-  segments = picked.length ? picked : SEGMENTS
+  // $.statusline is the statusline mod's noun and optional at load: declaring
+  // it is a contract for the call, not a claim to provide it. This step adds
+  // nothing, so the fold stays free for the statusline mod to add $.statusline.
+  on('engine.create', async ($, e, next) => next(e))
 
   on('session.start', async ($, e, next) => {
     // Without a proxy connection the mod stays inert: no command, no row, no polling.
@@ -367,17 +364,12 @@ export const register: Register = (on, options) => {
     }
   })
 
-  // The status row, in the band above the prompt.
   on('ui.render', { component: 'AbovePrompt' }, async ($, e, next) => {
     if (e.viewport) {
       screenRows = e.viewport.rows
       screenColumns = e.viewport.columns
     }
-    if (!origin || e.props.hasSurvey) return next(e)
-    const text = await read($, line)
-    if (!text) return next(e)
-    const { Text } = $.ui.resolve(e)
-    return <Text dimColor>{text}</Text>
+    return next(e)
   })
 
   // The panel: a pane opened focused by `/proxy`, closed by Esc or the next prompt.

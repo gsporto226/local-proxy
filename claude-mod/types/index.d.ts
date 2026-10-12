@@ -47,10 +47,28 @@ export type AccountUsage = {
 export type AccountUsageResult =
   | { kind: 'available'; usage: AccountUsage; stale: boolean; error: string | null }
   | { kind: 'unavailable'; provider: string; alias: string; error: string }
+/** What a status line mod renders; the values are published under `id: 'local-proxy'` via `$.statusline.publish`. */
+export type ProxyStatusline = {
+  model: string | null
+  effort: string | null
+  /** the session pin, else the provider's default account */
+  account: { provider: string; alias: string } | null
+  contextPercent: number | null
+  rate5h: number | null
+  rateWeek: number | null
+}
 /** An admin call waiting on the person's confirmation. */
 export type ProxyPending = { label: string; method: string; path: string; body?: unknown }
 
+/** The noun a status line mod adds to `$` in engine.create. */
+export type Statusline = {
+  publish: (args: { id: string; values: Record<string, unknown> }) => void
+}
+
 declare module 'claude-code' {
+  interface EngineInterface {
+    statusline: Statusline
+  }
   interface PluginState {
     'local-proxy': {
       tab: string
@@ -67,8 +85,6 @@ declare module 'claude-code' {
       logs: string[]
       confirm: ProxyPending | null
       error: string | null
-      /** the status row drawn above the prompt */
-      line: string
     }
   }
 }

@@ -124,6 +124,18 @@ const BAND = {
   props: { hasSurvey: false, isWorking: false, maxRows: 30, bodyColumns: 100, scroll: { offset: 0, bodyRows: 30 }, view: {} },
 } as const
 
+// The statusline mod is optional at run time; the tests that watch the publish
+// call load a stub that provides `$.statusline`, the noun its engine.create adds.
+const STATUSLINE = {
+  name: 'statusline',
+  register(on: On) {
+    on('engine.create', async ($: any, e: any, next: any) => {
+      const built = await next(e)
+      return { ...built, statusline: { publish: () => {} } }
+    })
+  },
+}
+
 test('/proxy <args> runs the CLI and returns its output', async ($, on) => {
   mockProxy(on)
   let argv: readonly string[] = []
@@ -137,18 +149,18 @@ test('/proxy <args> runs the CLI and returns its output', async ($, on) => {
   expect(text).toBe('local-proxy 0.25.2')
 })
 
-test('/proxy model updates the running proxy and redraws status and panel', async ($, on) => {
+test('/proxy model updates the running proxy, the exported status and the panel', { plugins: [STATUSLINE] }, async ($, on) => {
   const { calls } = mockProxy(on)
+  const out = exported(on)
   await start($)
   await $.command.run(run(''))
-  const band = await $.ui.mount({ ...BAND, surface: 'terminal' })
   const pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await pane.press({ key: 'tab-Status' })
-  expect(await band.find({ text: /openai\/gpt-x/ })).toBeDefined()
+  expect(out.value?.values?.model).toBe('openai/gpt-x')
   const { text } = await $.command.run(run('model chatgpt/gpt-6-sol'))
   expect(text).toBe('model updated')
   expect(calls).toContain('PUT /admin/model {"model":"chatgpt/gpt-6-sol"}')
-  expect(await band.find({ text: /chatgpt\/gpt-6-sol/ })).toBeDefined()
+  expect(out.value?.values?.model).toBe('chatgpt/gpt-6-sol')
   expect(await pane.find({ text: 'chatgpt/gpt-6-sol' })).toBeDefined()
 })
 
@@ -297,28 +309,36 @@ test('disconnect waits for confirmation', async ($, on) => {
   expect(calls).toContain('DELETE /admin/accounts/openai/home')
 })
 
-test('status row shows all segments by default', async ($, on) => {
+// What a status line mod would render: the last `$.statusline.publish` call.
+function exported(on: On) {
+  const box: { value?: any } = {}
+  on('statusline.publish' as never, ($: any, e: any) => {
+    box.value = { id: e.id, values: e.values }
+    return { value: undefined }
+  })
+  return box
+}
+
+test('publishes status line data for a status line mod', { plugins: [STATUSLINE] }, async ($, on) => {
   mockProxy(on)
+  const out = exported(on)
   await start($)
   await $.command.run(run(''))
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ text: 'openai/gpt-x · high · openai/work · 42% ctx · 12% 5h · 40% wk' })).toBeDefined()
+  expect(out.value).toEqual({
+    id: 'local-proxy',
+    values: {
+      model: 'openai/gpt-x', effort: 'high', account: { provider: 'openai', alias: 'work' },
+      contextPercent: 42, rate5h: 12, rateWeek: 40,
+    },
+  })
 })
 
-test('an empty-string segments option falls back to all segments', { options: { segments: '' } }, async ($, on) => {
-  mockProxy(on)
-  await start($)
-  await $.command.run(run(''))
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ text: 'openai/gpt-x · high · openai/work · 42% ctx · 12% 5h · 40% wk' })).toBeDefined()
-})
-
-test('status row prefers the session pin and follows the segments option', { options: { segments: ['account', 'model'] } }, async ($, on) => {
+test('exported account prefers the session pin', { plugins: [STATUSLINE] }, async ($, on) => {
   mockProxy(on, { routes: { ...ROUTES, 'GET /admin/session/sess-1': { account: { openai: 'home' }, effort: null, stats: null } } })
+  const out = exported(on)
   await start($)
   await $.command.run(run(''))
-  const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-  expect(await ui.find({ text: 'openai/home · openai/gpt-x' })).toBeDefined()
+  expect(out.value?.values?.account).toEqual({ provider: 'openai', alias: 'home' })
 })
 
 for (const [why, opts] of [
@@ -326,12 +346,12 @@ for (const [why, opts] of [
   ['a remote base URL', { baseUrl: 'https://api.anthropic.com' }],
   ['a local gateway that is not local-proxy', { routes: {} }],
 ] as const) {
-  test(`the mod stays inert with ${why}`, async ($, on) => {
+  test(`the mod stays inert with ${why}`, { plugins: [STATUSLINE] }, async ($, on) => {
     const { commands, calls } = mockProxy(on, opts)
+    const out = exported(on)
     await start($)
     expect(commands).toEqual([])
-    const ui = await $.ui.mount({ ...BAND, surface: 'terminal' })
-    expect(await ui.find({ text: /ctx|running/ })).toBeUndefined()
+    expect(out.value).toBeUndefined()
     expect(calls.filter(c => !c.endsWith('/admin/status'))).toEqual([])
   })
 }
