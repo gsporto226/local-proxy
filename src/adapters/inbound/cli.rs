@@ -359,6 +359,7 @@ pub async fn serve(
     let mut watched = vec![paths::config_dir()];
     watched.extend(config_path.parent().map(Path::to_path_buf));
     watcher::spawn(&config_path, watched, &app_state).map_err(CliError::from)?;
+    app_state.start_account_tracking();
     let app = http::app(app_state);
 
     let listener = tokio::net::TcpListener::bind(&addr)
@@ -1017,7 +1018,7 @@ pub fn providers(ports: &Ports, config_path: &Path) -> miette::Result<()> {
 ///
 /// Returns an error if the target is malformed or the config cannot be written.
 pub fn account(ports: &Ports, config_path: &Path, args: &[String]) -> miette::Result<()> {
-    let out = settings::account_result(ports, config_path, args).map_err(CliError::from)?;
+    let out = settings::account_result(ports, config_path, "", args).map_err(CliError::from)?;
     println!("{out}");
     Ok(())
 }

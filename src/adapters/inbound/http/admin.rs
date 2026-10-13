@@ -178,7 +178,7 @@ async fn session(State(app): State<AppState>, Path(id): Path<String>) -> ApiResu
     let usage = &app.ports().usage;
     let stats = usage.session(&id).map_err(internal)?.unwrap_or_default();
     Ok(Json(json!({
-        "account": app.session_accounts(&id).await,
+        "account": app.session_accounts(&id).map_err(internal)?,
         "effort": usage.session_effort(&id),
         "stats": stats,
     })))
@@ -188,26 +188,33 @@ async fn session(State(app): State<AppState>, Path(id): Path<String>) -> ApiResu
 struct AccountBody {
     provider: String,
     alias: Option<String>,
-    #[serde(default)]
-    clear: bool,
 }
 
+/// Point one session at another account; the provider's selection (seen by
+/// new sessions) is left alone.
 async fn pin_account(
     State(app): State<AppState>,
     Path(id): Path<String>,
     Json(body): Json<AccountBody>,
 ) -> ApiResult {
     let alias = body.alias.ok_or_else(|| bad_request("alias is required"))?;
-    app.set_session_account(&id, &body.provider, &alias).await;
-    Ok(Json(json!(app.session_accounts(&id).await)))
+    app.ports()
+        .credentials
+        .pin_session(&id, &body.provider, &alias, false)
+        .map_err(bad_request)?;
+    Ok(Json(json!(app.session_accounts(&id).map_err(internal)?)))
 }
 
+/// Drop the session's snapshot; its next request takes the selection again.
 async fn unpin_account(
     State(app): State<AppState>,
     Path((id, provider)): Path<(String, String)>,
-) -> Json<Value> {
-    app.clear_session_accounts(&id, Some(&provider)).await;
-    Json(json!(app.session_accounts(&id).await))
+) -> ApiResult {
+    app.ports()
+        .credentials
+        .unpin_session(&id, &provider)
+        .map_err(internal)?;
+    Ok(Json(json!(app.session_accounts(&id).map_err(internal)?)))
 }
 
 #[derive(Deserialize)]
@@ -237,11 +244,9 @@ async fn set_effort(State(app): State<AppState>, Json(body): Json<EffortBody>) -
 }
 
 async fn set_account(State(app): State<AppState>, Json(body): Json<AccountBody>) -> ApiResult {
-    let args = match (body.clear, body.alias) {
-        (true, _) => vec!["clear".to_string(), body.provider],
-        (false, Some(alias)) => vec![format!("{}/{alias}", body.provider)],
-        (false, None) => return Err(bad_request("alias or clear is required")),
-    };
+    // A provider with accounts always has a selection: there is no clear.
+    let alias = body.alias.ok_or_else(|| bad_request("alias is required"))?;
+    let args = vec![format!("{}/{alias}", body.provider)];
     commands::apply_account(&app, &args)
         .await
         .map(message)
@@ -542,7 +547,16 @@ mod tests {
 
     #[test]
     fn session_pin_round_trips() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", dir.path());
         let state = app_state(std::path::PathBuf::new());
+        let api = |key: &str| crate::domain::account::AuthEntry::Api {
+            key: key.to_string(),
+        };
+        let credentials = &state.ports().credentials;
+        credentials.insert("mock", "personal", &api("k1")).unwrap();
+        credentials.insert("mock", "work", &api("k2")).unwrap();
         let app = http_app(state.clone());
         block_on(async {
             let body = r#"{"provider":"mock","alias":"work"}"#;
@@ -556,11 +570,17 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(res.status(), StatusCode::OK);
-            assert_eq!(
-                state.session_account("s1", "mock").await.as_deref(),
-                Some("work")
-            );
         });
+        assert_eq!(
+            state.request_account("s1", "mock").unwrap().as_deref(),
+            Some("work")
+        );
+        // The pin is per session: the selection stays on the first account.
+        assert_eq!(
+            state.request_account("", "mock").unwrap().as_deref(),
+            Some("personal")
+        );
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
     }
 
     #[test]

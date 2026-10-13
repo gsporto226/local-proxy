@@ -1,5 +1,6 @@
 //! Hot-reload: a file watcher that drives [`AppState::reload`] when the config
-//! or the credential store changes.
+//! file changes. Credential store changes are picked up per request instead
+//! ([`AppState::snapshot`] polls its revision).
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -18,14 +19,13 @@ pub struct WatchError {
 }
 
 /// Whether `path` is one of the files whose change triggers a hot-reload:
-/// the active config file or the credential store.
+/// the active config file.
 fn is_reload_path(path: &Path, config_file: &std::ffi::OsStr) -> bool {
-    path.file_name()
-        .is_some_and(|name| name == config_file || name == "auth.json" || name == "accounts.db")
+    path.file_name().is_some_and(|name| name == config_file)
 }
 
-/// Watch `dirs` (non-recursively) and reload `app` when `config_path` or the
-/// credential store inside them changes.
+/// Watch `dirs` (non-recursively) and reload `app` when `config_path`
+/// inside them changes.
 ///
 /// # Errors
 ///
@@ -84,8 +84,8 @@ pub fn spawn(config_path: &Path, dirs: Vec<PathBuf>, app: &AppState) -> Result<(
         let _debouncer = debouncer;
         while brx.recv().await.is_some() {
             match app.reload().await {
-                // Everything else (providers, routes, auth) reloads from the file.
-                Ok(()) => tracing::info!("config/auth change applied (hot-reload)"),
+                // Everything else (providers, routes) reloads from the file.
+                Ok(()) => tracing::info!("config change applied (hot-reload)"),
                 Err(e) => tracing::warn!("hot-reload rebuild failed: {e}"),
             }
         }
@@ -98,11 +98,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn watcher_reacts_only_to_config_and_auth() {
+    fn watcher_reacts_only_to_the_config_file() {
         let config = std::ffi::OsStr::new("config.yaml");
         assert!(is_reload_path(Path::new("C:/cfg/config.yaml"), config));
-        assert!(is_reload_path(Path::new("C:/cfg/auth.json"), config));
-        assert!(is_reload_path(Path::new("C:/cfg/accounts.db"), config));
+        assert!(!is_reload_path(Path::new("C:/cfg/auth.json"), config));
+        assert!(!is_reload_path(Path::new("C:/cfg/accounts.db"), config));
         assert!(!is_reload_path(Path::new("C:/cfg/other.yaml"), config));
         assert!(!is_reload_path(Path::new("C:/cfg/local-proxy.log"), config));
         assert!(!is_reload_path(Path::new("C:/cfg/stats.db"), config));

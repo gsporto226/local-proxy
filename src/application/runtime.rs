@@ -97,6 +97,13 @@ pub fn build_runtime_state(
     config_path: &Path,
 ) -> Result<RuntimeState, RuntimeError> {
     let mut config = effective_config(ports, config_path)?;
+    if !config.defaults.active_accounts.is_empty() {
+        tracing::warn!(
+            "`defaults.active_accounts` in the config is no longer used (the selection \
+             lives in the account store); it only seeds providers without one"
+        );
+    }
+    selections(ports, &config)?;
     let auth = ports.credentials.read_all().map_err(RuntimeError::Auth)?;
     ports.upstream.discover_models(&mut config, &auth);
     let config = Arc::new(config);
@@ -110,6 +117,22 @@ pub fn build_runtime_state(
         model_override: None,
         config_path: config_path.to_path_buf(),
     })
+}
+
+/// The selected alias of every provider with stored accounts, first giving
+/// the ones without a selection one (seeded from the legacy config
+/// `defaults.active_accounts`).
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::Auth`] if the credential store is unavailable.
+#[allow(clippy::result_large_err)]
+pub fn selections(ports: &Ports, config: &Config) -> Result<HashMap<String, String>, RuntimeError> {
+    ports
+        .credentials
+        .seed_selections(&config.defaults.active_accounts)
+        .and_then(|()| ports.credentials.selections())
+        .map_err(RuntimeError::Auth)
 }
 
 /// Build an upstream account for every stored credential of every provider; a
@@ -175,39 +198,38 @@ fn carry_instance_state(old: &RuntimeState, new: &mut RuntimeState) {
     new.enforce_active_model = old.enforce_active_model;
 }
 
-/// One session's own settings: its defaults, frozen from the instance's when
-/// the session was first seen, and its `$proxy account` pins.
-#[derive(Clone)]
-struct Session {
-    defaults: Defaults,
-    pins: HashMap<String, String>,
-}
-
-impl Session {
-    fn new(defaults: &Defaults) -> Self {
-        Self {
-            defaults: defaults.clone(),
-            pins: HashMap::new(),
-        }
-    }
-}
-
 /// Shared application state: the runtime state behind a lock, the session
-/// account pins, and the ports every use case runs through.
+/// defaults, and the ports every use case runs through.
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<RwLock<RuntimeState>>,
-    /// Per-session settings, keyed by session id. In-memory only: a restart
-    /// drops them and every session starts from the persisted defaults.
+    /// Per-session model/effort defaults, frozen from the instance's when a
+    /// session is first seen, keyed by session id. In-memory only: a restart
+    /// drops them. (Session accounts live in the credential store.)
     // ponytail: never evicted, one small entry per session id; add an LRU cap
     // if a long-lived `serve` sees unbounded session ids.
-    sessions: Arc<RwLock<HashMap<String, Session>>>,
+    sessions: Arc<RwLock<HashMap<String, Defaults>>>,
     ports: Ports,
     recorder: UsageRecorder,
     port: Arc<OnceLock<u16>>,
     // ponytail: one global lock avoids duplicate refreshes; use per-account
     // locks if unrelated endpoint latency becomes a bottleneck.
     usage_refresh: Arc<tokio::sync::Mutex<()>>,
+    /// The credential store's `(data_version, revision)` the accounts were
+    /// built from; `None` until [`AppState::track_accounts`] (a live server)
+    /// turns tracking on.
+    accounts_version: Arc<std::sync::Mutex<Option<(i64, i64)>>>,
+}
+
+/// The providers that have at least one account with credentials.
+fn connected_providers(accounts: &AccountMap) -> Vec<&str> {
+    let mut names: Vec<&str> = accounts
+        .iter()
+        .filter(|(_, by_alias)| by_alias.values().any(|a| a.has_credentials()))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 impl AppState {
@@ -221,7 +243,95 @@ impl AppState {
             ports,
             port: Arc::new(OnceLock::new()),
             usage_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            accounts_version: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn seen_version(&self) -> Option<(i64, i64)> {
+        *self
+            .accounts_version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_seen_version(&self, version: Option<(i64, i64)>) {
+        *self
+            .accounts_version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = version;
+    }
+
+    /// Start following the credential store: the current accounts count as
+    /// built from its current `(data_version, revision)`. Other processes'
+    /// account changes are then picked up by [`Self::snapshot`].
+    fn track_accounts(&self) {
+        match self.ports.credentials.revision() {
+            Ok(version) => self.set_seen_version(Some(version)),
+            Err(e) => tracing::warn!("account store change tracking disabled: {e}"),
+        }
+    }
+
+    /// Rebuild the accounts when another process added or removed one.
+    /// `data_version` is the cheap poll; it also moves for token refreshes,
+    /// selections and session snapshots written elsewhere, which leave the
+    /// account revision alone and need no rebuild. A provider that gained or
+    /// lost its only usable account changes the model catalog too, so that
+    /// case rebuilds the whole state (with model discovery).
+    #[allow(clippy::result_large_err)]
+    async fn reload_accounts_if_changed(&self) {
+        let Some(seen) = self.seen_version() else {
+            return;
+        };
+        let Ok(now) = self.ports.credentials.revision() else {
+            return;
+        };
+        if now.0 == seen.0 {
+            return;
+        }
+        if now.1 == seen.1 {
+            self.set_seen_version(Some(now));
+            return;
+        }
+        let mut guard = self.inner.write().await;
+        // Another request may have rebuilt while this one waited.
+        if self.seen_version().is_some_and(|v| v.1 == now.1) {
+            return;
+        }
+        let ports = self.ports.clone();
+        let config = guard.config.clone();
+        let accounts = tokio::task::spawn_blocking(move || build_accounts(&ports, &config))
+            .await
+            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+        let accounts = match accounts {
+            Ok(accounts) => accounts,
+            Err(e) => {
+                tracing::warn!("account reload failed: {e}");
+                return;
+            }
+        };
+        if connected_providers(&accounts) == connected_providers(&guard.accounts) {
+            guard.accounts = Arc::new(accounts);
+        } else {
+            let ports = self.ports.clone();
+            let config_path = guard.config_path.clone();
+            let rebuilt =
+                tokio::task::spawn_blocking(move || build_runtime_state(&ports, &config_path))
+                    .await
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+            match rebuilt {
+                Ok(mut new_state) => {
+                    carry_instance_state(&guard, &mut new_state);
+                    *guard = new_state;
+                }
+                Err(e) => {
+                    tracing::warn!("account reload failed: {e}");
+                    return;
+                }
+            }
+        }
+        self.set_seen_version(Some(now));
+        drop(guard);
+        tracing::info!("account change applied (revision {} -> {})", seen.1, now.1);
     }
 
     /// The ports this instance runs through.
@@ -252,52 +362,50 @@ impl AppState {
         self.usage_refresh.lock().await
     }
 
-    /// The account pinned to `session_id` for `provider`, if any.
-    pub async fn session_account(&self, session_id: &str, provider: &str) -> Option<String> {
-        self.sessions
-            .read()
-            .await
-            .get(session_id)
-            .and_then(|session| session.pins.get(provider))
-            .cloned()
+    /// Start following the credential store and forget session account
+    /// snapshots idle for 30 days (sessions never announce their end).
+    pub fn start_account_tracking(&self) {
+        let cutoff = crate::domain::oauth::now_ms() - 30 * 86_400_000;
+        if let Err(e) = self.ports.credentials.prune_sessions(cutoff) {
+            tracing::warn!("failed to prune session account snapshots: {e}");
+        }
+        self.track_accounts();
     }
 
-    /// All account pins of `session_id` (`provider -> alias`).
-    pub async fn session_accounts(&self, session_id: &str) -> HashMap<String, String> {
-        self.sessions
-            .read()
-            .await
-            .get(session_id)
-            .map(|session| session.pins.clone())
-            .unwrap_or_default()
+    /// The account a header-less request of `session_id` uses for
+    /// `provider`: the session's snapshot (taken from the selection on its
+    /// first request), or the live selection without a session id.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CredentialError`] if the store cannot be read.
+    pub fn request_account(
+        &self,
+        session_id: &str,
+        provider: &str,
+    ) -> Result<Option<String>, CredentialError> {
+        if session_id.is_empty() {
+            return Ok(self.ports.credentials.selections()?.remove(provider));
+        }
+        self.ports.credentials.session_account(session_id, provider)
     }
 
-    /// Pin `alias` as the account of `session_id` for `provider`. A request
-    /// without a session id cannot pin anything (there is no session).
-    pub async fn set_session_account(&self, session_id: &str, provider: &str, alias: &str) {
-        self.with_session(session_id, |session| {
-            session.pins.insert(provider.to_string(), alias.to_string());
-        })
-        .await;
+    /// The account snapshots of `session_id` (`provider -> alias`).
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CredentialError`] if the store cannot be read.
+    pub fn session_accounts(
+        &self,
+        session_id: &str,
+    ) -> Result<HashMap<String, String>, CredentialError> {
+        self.ports.credentials.session_accounts(session_id)
     }
 
-    /// Drop the session's account pins and selected defaults: one provider,
-    /// or all of them.
-    pub async fn clear_session_accounts(&self, session_id: &str, provider: Option<&str>) {
-        self.with_session(session_id, |session| {
-            if let Some(provider) = provider {
-                session.pins.remove(provider);
-                session.defaults.active_accounts.remove(provider);
-            } else {
-                session.pins.clear();
-                session.defaults.active_accounts.clear();
-            }
-        })
-        .await;
-    }
-
-    /// Snapshot the current runtime state (cheap Arc clones).
+    /// Snapshot the current runtime state (cheap Arc clones), first picking up
+    /// account changes another process committed to the store.
     pub async fn snapshot(&self) -> RuntimeState {
+        self.reload_accounts_if_changed().await;
         self.inner.read().await.clone()
     }
 
@@ -316,8 +424,7 @@ impl AppState {
             .write()
             .await
             .entry(session_id.to_string())
-            .or_insert_with(|| Session::new(&state.config.defaults))
-            .defaults
+            .or_insert_with(|| state.config.defaults.clone())
             .clone();
         let mut config = (*state.config).clone();
         config.defaults = defaults;
@@ -336,14 +443,13 @@ impl AppState {
             change(&mut config.defaults);
             guard.config = Arc::new(config);
         } else {
-            self.with_session(session_id, |session| change(&mut session.defaults))
-                .await;
+            self.with_session(session_id, change).await;
         }
     }
 
     /// Run `f` on the session, freezing the instance defaults for it first if
     /// it is new. A no-op without a session id.
-    async fn with_session(&self, session_id: &str, f: impl FnOnce(&mut Session)) {
+    async fn with_session(&self, session_id: &str, f: impl FnOnce(&mut Defaults)) {
         if session_id.is_empty() {
             return;
         }
@@ -351,7 +457,7 @@ impl AppState {
         let mut sessions = self.sessions.write().await;
         f(sessions
             .entry(session_id.to_string())
-            .or_insert_with(|| Session::new(&defaults)));
+            .or_insert_with(|| defaults));
     }
 
     /// Rebuild the runtime state from the config file and credential store,

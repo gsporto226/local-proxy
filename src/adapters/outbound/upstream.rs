@@ -478,22 +478,42 @@ impl ProviderClient {
                 .filter(|a| !a.is_empty());
         };
         let mut guard = state.lock().await;
-        if guard.tokens.expires <= now_ms() + REFRESH_LEEWAY_MS {
+        let expiring = |t: &OAuthTokens| t.expires <= now_ms() + REFRESH_LEEWAY_MS;
+        if expiring(&guard.tokens) {
+            // Other processes (CLI, other proxies) share this account. If one
+            // already rotated the refresh token, adopt its tokens instead of
+            // spending ours. The store lock is not held across the network
+            // call; `swap_oauth` compares-and-swaps after it instead.
+            if let Ok(Some(AuthEntry::OAuth(stored))) =
+                self.credentials.get(&self.name, &self.alias)
+            {
+                if stored.refresh != guard.tokens.refresh {
+                    guard.tokens = stored;
+                }
+            }
+        }
+        if expiring(&guard.tokens) {
             tracing::info!(target: crate::LOG_TARGET, provider = %self.name, "refreshing oauth token");
             match self.oauth.refresh(&guard.config, &guard.tokens).await {
                 Ok(fresh) => {
-                    if let Err(e) = self
-                        .credentials
-                        .update_oauth(&self.name, &self.alias, &fresh)
-                    {
-                        tracing::warn!(
-                            target: crate::LOG_TARGET,
-                            provider = %self.name,
-                            error = %e,
-                            "failed to persist refreshed oauth token"
-                        );
-                    }
-                    guard.tokens = fresh;
+                    let used = guard.tokens.refresh.clone();
+                    guard.tokens =
+                        match self
+                            .credentials
+                            .swap_oauth(&self.name, &self.alias, &used, &fresh)
+                        {
+                            Ok(None) => fresh,
+                            Ok(Some(stored)) => stored,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: crate::LOG_TARGET,
+                                    provider = %self.name,
+                                    error = %e,
+                                    "failed to persist refreshed oauth token"
+                                );
+                                fresh
+                            }
+                        };
                 }
                 Err(e) => {
                     tracing::warn!(

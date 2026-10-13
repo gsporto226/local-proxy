@@ -83,6 +83,20 @@ pub fn is_valid_alias(alias: &str) -> bool {
             .all(|b| b.is_ascii_alphanumeric() || matches!(b, b'.' | b'_' | b'-'))
 }
 
+/// The alias a provider without a selection gets: the legacy config choice if
+/// it is still stored, then the only account, then `default`, then the first
+/// by name.
+#[must_use]
+pub fn pick_selection(aliases: &[String], legacy: Option<&str>) -> Option<String> {
+    if let Some(legacy) = legacy.filter(|l| aliases.iter().any(|a| a == l)) {
+        return Some(legacy.to_string());
+    }
+    if aliases.len() > 1 && aliases.iter().any(|a| a == "default") {
+        return Some("default".to_string());
+    }
+    aliases.iter().min().cloned()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -95,6 +109,21 @@ mod tests {
         for name in ["default", "work-2", "a.b_c"] {
             assert!(is_valid_alias(name), "{name:?}");
         }
+    }
+
+    #[test]
+    fn selection_seed_prefers_legacy_then_only_then_default_then_name() {
+        let v = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let pick = |names: &[&str], legacy| pick_selection(&v(names), legacy);
+        assert_eq!(pick(&["b", "a"], Some("b")).as_deref(), Some("b"));
+        assert_eq!(pick(&["b", "a"], Some("gone")).as_deref(), Some("a"));
+        assert_eq!(pick(&["work"], None).as_deref(), Some("work"));
+        assert_eq!(
+            pick(&["z", "default", "a"], None).as_deref(),
+            Some("default")
+        );
+        assert_eq!(pick(&["z", "a"], None).as_deref(), Some("a"));
+        assert_eq!(pick(&[], None), None);
     }
 
     #[test]
