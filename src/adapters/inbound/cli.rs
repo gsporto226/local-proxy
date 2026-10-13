@@ -359,6 +359,7 @@ pub async fn serve(
     let mut watched = vec![paths::config_dir()];
     watched.extend(config_path.parent().map(Path::to_path_buf));
     watcher::spawn(&config_path, watched, &app_state).map_err(CliError::from)?;
+    app_state.track_accounts();
     let app = http::app(app_state);
 
     let listener = tokio::net::TcpListener::bind(&addr)

@@ -10,7 +10,7 @@ use std::fmt::Write as _;
 use std::io;
 use std::path::{Path, PathBuf};
 
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, TransactionBehavior};
 use sha2::{Digest, Sha256};
 use thiserror::Error;
 
@@ -175,6 +175,9 @@ fn open_db(path: &Path) -> Result<Connection, AuthError> {
     })?;
     let key = db_key(path)?;
     let conn = Connection::open(path).map_err(AuthError::Database)?;
+    // The CLI and every running proxy share the file; wait out their writes.
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(AuthError::Database)?;
     // Encryption is the security boundary; owner-only permissions are defense
     // in depth where the OS supports them.
     #[cfg(unix)]
@@ -192,7 +195,7 @@ fn open_db(path: &Path) -> Result<Connection, AuthError> {
         return Err(AuthError::Database(rusqlite::Error::InvalidQuery));
     }
     conn.execute_batch(
-        "PRAGMA journal_mode = DELETE;
+        "PRAGMA journal_mode = WAL;
          CREATE TABLE IF NOT EXISTS accounts (
            provider TEXT NOT NULL,
            alias TEXT NOT NULL,
@@ -230,6 +233,7 @@ fn migrate(conn: &mut Connection, path: &Path) -> Result<(), AuthError> {
             )
             .map_err(AuthError::Database)?;
     }
+    bump_revision(&transaction)?;
     transaction.commit().map_err(AuthError::Database)?;
     for provider in previous.keys() {
         let serialized: String = conn
@@ -275,7 +279,13 @@ fn validate_alias(alias: &str) -> Result<(), AuthError> {
     }
 }
 
-fn with_db<T>(f: impl FnOnce(&Connection) -> Result<T, AuthError>) -> Result<T, AuthError> {
+/// The process-wide connection, opened once (the key derivation is costly)
+/// and keyed by its path.
+// ponytail: one global lock around one connection, fine for a local proxy; a
+// connection pool if contention ever shows up.
+static DB: std::sync::Mutex<Option<(PathBuf, Connection)>> = std::sync::Mutex::new(None);
+
+fn with_db<T>(f: impl FnOnce(&mut Connection) -> Result<T, AuthError>) -> Result<T, AuthError> {
     // A unit test that forgot to point `LOCAL_PROXY_CONFIG_DIR` at an isolated
     // dir must fail loudly instead of migrating and touching the real store.
     #[cfg(test)]
@@ -284,9 +294,47 @@ fn with_db<T>(f: impl FnOnce(&Connection) -> Result<T, AuthError>) -> Result<T, 
         "unit tests must set LOCAL_PROXY_CONFIG_DIR to an isolated directory; \
          refusing to touch the real credential store"
     );
-    let mut conn = open_db(&paths::accounts_db())?;
-    migrate(&mut conn, &paths::legacy_auth_file())?;
-    f(&conn)
+    let path = paths::accounts_db();
+    // A poisoned lock only means a panic mid-call; SQLite rolled back.
+    let mut shared = DB.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Tests repoint `LOCAL_PROXY_CONFIG_DIR`, so the connection follows the path.
+    if shared.as_ref().is_none_or(|(open, _)| *open != path) {
+        *shared = None;
+        *shared = Some((path.clone(), open_db(&path)?));
+    }
+    let (_, conn) = shared.as_mut().expect("connection opened above");
+    migrate(conn, &paths::legacy_auth_file())?;
+    let result = f(conn);
+    drop(shared);
+    result
+}
+
+/// Count a change to the set of stored accounts in `user_version`. Running
+/// proxies rebuild their accounts only when it moves: `data_version` also
+/// moves for token refreshes, selections and session snapshots, which need no
+/// rebuild.
+fn bump_revision(conn: &Connection) -> Result<(), AuthError> {
+    let revision: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(AuthError::Database)?;
+    // An integer read back from SQLite, never user input.
+    conn.execute_batch(&format!(
+        "PRAGMA user_version = {}",
+        revision.wrapping_add(1)
+    ))
+    .map_err(AuthError::Database)
+}
+
+fn revision() -> Result<(i64, i64), AuthError> {
+    with_db(|conn| {
+        let version = conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(AuthError::Database)?;
+        let revision = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(AuthError::Database)?;
+        Ok((version, revision))
+    })
 }
 
 /// Read every saved account and its credential.
@@ -321,7 +369,10 @@ fn insert_account(provider: &str, alias: &str, entry: &AuthEntry) -> Result<(), 
     validate_alias(alias)?;
     let value = serde_json::to_string(entry).map_err(AuthError::Format)?;
     with_db(|conn| {
-        let inserted = conn
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO accounts(provider, alias, credential) VALUES(?1, ?2, ?3)",
                 params![provider, alias, value],
@@ -333,7 +384,8 @@ fn insert_account(provider: &str, alias: &str, entry: &AuthEntry) -> Result<(), 
                 alias: alias.to_string(),
             });
         }
-        Ok(())
+        bump_revision(&tx)?;
+        tx.commit().map_err(AuthError::Database)
     })
 }
 
@@ -367,12 +419,21 @@ fn update_oauth_for(provider: &str, alias: &str, tokens: &OAuthTokens) -> Result
 /// Returns an error if the vault or database is unavailable.
 fn remove_account(provider: &str, alias: &str) -> Result<bool, AuthError> {
     with_db(|conn| {
-        conn.execute(
-            "DELETE FROM accounts WHERE provider=?1 AND alias=?2",
-            params![provider, alias],
-        )
-        .map(|count| count != 0)
-        .map_err(AuthError::Database)
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        let removed = tx
+            .execute(
+                "DELETE FROM accounts WHERE provider=?1 AND alias=?2",
+                params![provider, alias],
+            )
+            .map_err(AuthError::Database)?;
+        if removed == 0 {
+            return Ok(false);
+        }
+        bump_revision(&tx)?;
+        tx.commit().map_err(AuthError::Database)?;
+        Ok(true)
     })
 }
 
@@ -426,6 +487,10 @@ impl CredentialStore for SqlCipherCredentialStore {
     fn remove(&self, provider: &str, alias: &str) -> Result<bool, CredentialError> {
         Ok(remove_account(provider, alias)?)
     }
+
+    fn revision(&self) -> Result<(i64, i64), CredentialError> {
+        Ok(revision()?)
+    }
 }
 
 #[cfg(test)]
@@ -442,6 +507,43 @@ mod tests {
         // Equivalent spellings of the same dir share one key.
         let dotted = dir.join(".").join("accounts.db");
         assert_eq!(vault_identity(&dotted, true).unwrap(), isolated);
+    }
+
+    #[test]
+    fn revision_moves_only_for_other_connections_account_changes() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", dir.path());
+        let store = SqlCipherCredentialStore;
+        let entry = |key: &str| AuthEntry::Api {
+            key: key.to_string(),
+        };
+
+        let start = store.revision().unwrap();
+        store.insert("p", "own", &entry("k")).unwrap();
+        let own = store.revision().unwrap();
+        assert_eq!(own.0, start.0, "own writes are not foreign changes");
+        assert_ne!(own.1, start.1, "an added account moves the revision");
+
+        // A second connection stands in for the CLI process.
+        let other = open_db(&paths::accounts_db()).unwrap();
+        other
+            .execute(
+                "UPDATE accounts SET credential=?1 WHERE alias='own'",
+                [r#"{"type":"api","key":"k2"}"#],
+            )
+            .unwrap();
+        let touched = store.revision().unwrap();
+        assert_ne!(touched.0, own.0, "a foreign commit moves data_version");
+        assert_eq!(
+            touched.1, own.1,
+            "a credential update is not an account change"
+        );
+        bump_revision(&other).unwrap();
+        drop(other);
+        assert_ne!(store.revision().unwrap().1, own.1);
+
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
     }
 
     #[test]

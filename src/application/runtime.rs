@@ -208,6 +208,21 @@ pub struct AppState {
     // ponytail: one global lock avoids duplicate refreshes; use per-account
     // locks if unrelated endpoint latency becomes a bottleneck.
     usage_refresh: Arc<tokio::sync::Mutex<()>>,
+    /// The credential store's `(data_version, revision)` the accounts were
+    /// built from; `None` until [`AppState::track_accounts`] (a live server)
+    /// turns tracking on.
+    accounts_version: Arc<std::sync::Mutex<Option<(i64, i64)>>>,
+}
+
+/// The providers that have at least one account with credentials.
+fn connected_providers(accounts: &AccountMap) -> Vec<&str> {
+    let mut names: Vec<&str> = accounts
+        .iter()
+        .filter(|(_, by_alias)| by_alias.values().any(|a| a.has_credentials()))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 impl AppState {
@@ -221,7 +236,95 @@ impl AppState {
             ports,
             port: Arc::new(OnceLock::new()),
             usage_refresh: Arc::new(tokio::sync::Mutex::new(())),
+            accounts_version: Arc::new(std::sync::Mutex::new(None)),
         }
+    }
+
+    fn seen_version(&self) -> Option<(i64, i64)> {
+        *self
+            .accounts_version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_seen_version(&self, version: Option<(i64, i64)>) {
+        *self
+            .accounts_version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = version;
+    }
+
+    /// Start following the credential store: the current accounts count as
+    /// built from its current `(data_version, revision)`. Other processes'
+    /// account changes are then picked up by [`Self::snapshot`].
+    pub fn track_accounts(&self) {
+        match self.ports.credentials.revision() {
+            Ok(version) => self.set_seen_version(Some(version)),
+            Err(e) => tracing::warn!("account store change tracking disabled: {e}"),
+        }
+    }
+
+    /// Rebuild the accounts when another process added or removed one.
+    /// `data_version` is the cheap poll; it also moves for token refreshes,
+    /// selections and session snapshots written elsewhere, which leave the
+    /// account revision alone and need no rebuild. A provider that gained or
+    /// lost its only usable account changes the model catalog too, so that
+    /// case rebuilds the whole state (with model discovery).
+    #[allow(clippy::result_large_err)]
+    async fn reload_accounts_if_changed(&self) {
+        let Some(seen) = self.seen_version() else {
+            return;
+        };
+        let Ok(now) = self.ports.credentials.revision() else {
+            return;
+        };
+        if now.0 == seen.0 {
+            return;
+        }
+        if now.1 == seen.1 {
+            self.set_seen_version(Some(now));
+            return;
+        }
+        let mut guard = self.inner.write().await;
+        // Another request may have rebuilt while this one waited.
+        if self.seen_version().is_some_and(|v| v.1 == now.1) {
+            return;
+        }
+        let ports = self.ports.clone();
+        let config = guard.config.clone();
+        let accounts = tokio::task::spawn_blocking(move || build_accounts(&ports, &config))
+            .await
+            .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+        let accounts = match accounts {
+            Ok(accounts) => accounts,
+            Err(e) => {
+                tracing::warn!("account reload failed: {e}");
+                return;
+            }
+        };
+        if connected_providers(&accounts) == connected_providers(&guard.accounts) {
+            guard.accounts = Arc::new(accounts);
+        } else {
+            let ports = self.ports.clone();
+            let config_path = guard.config_path.clone();
+            let rebuilt =
+                tokio::task::spawn_blocking(move || build_runtime_state(&ports, &config_path))
+                    .await
+                    .unwrap_or_else(|e| std::panic::resume_unwind(e.into_panic()));
+            match rebuilt {
+                Ok(mut new_state) => {
+                    carry_instance_state(&guard, &mut new_state);
+                    *guard = new_state;
+                }
+                Err(e) => {
+                    tracing::warn!("account reload failed: {e}");
+                    return;
+                }
+            }
+        }
+        self.set_seen_version(Some(now));
+        drop(guard);
+        tracing::info!("account change applied (revision {} -> {})", seen.1, now.1);
     }
 
     /// The ports this instance runs through.
@@ -296,8 +399,10 @@ impl AppState {
         .await;
     }
 
-    /// Snapshot the current runtime state (cheap Arc clones).
+    /// Snapshot the current runtime state (cheap Arc clones), first picking up
+    /// account changes another process committed to the store.
     pub async fn snapshot(&self) -> RuntimeState {
+        self.reload_accounts_if_changed().await;
         self.inner.read().await.clone()
     }
 

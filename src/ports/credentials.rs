@@ -69,4 +69,13 @@ pub trait CredentialStore: Send + Sync {
     ///
     /// Returns [`CredentialError::Backend`] if the store is unavailable.
     fn remove(&self, provider: &str, alias: &str) -> Result<bool, CredentialError>;
+
+    /// `(data_version, account revision)`: the first moves whenever another
+    /// process commits (cheap to poll), the second only when an account was
+    /// added or removed.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Backend`] if the store is unavailable.
+    fn revision(&self) -> Result<(i64, i64), CredentialError>;
 }
