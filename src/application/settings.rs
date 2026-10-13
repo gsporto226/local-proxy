@@ -209,13 +209,17 @@ pub fn set_default_account(
     ports
         .credentials
         .select(provider, alias)
-        .map_err(|e| match e {
-            CredentialError::NotFound { provider, alias } => invalid(format!(
-                "conta '{alias}' nao encontrada para o provider '{provider}'; \
-                 veja `local-proxy account`"
-            )),
-            other => SettingsError::Credentials(other),
-        })
+        .map_err(not_found_as_invalid)
+}
+
+fn not_found_as_invalid(e: CredentialError) -> SettingsError {
+    match e {
+        CredentialError::NotFound { provider, alias } => invalid(format!(
+            "conta '{alias}' nao encontrada para o provider '{provider}'; \
+             veja `local-proxy account`"
+        )),
+        other => SettingsError::Credentials(other),
+    }
 }
 
 /// Reasoning effort levels accepted by `local-proxy effort`.
@@ -335,10 +339,20 @@ pub fn parse_account_target(target: &str) -> Result<(&str, &str), SettingsError>
 pub fn account_result(
     ports: &Ports,
     config_path: &Path,
+    session_id: &str,
     args: &[String],
 ) -> Result<String, SettingsError> {
     match args {
         [] => list_accounts(ports, config_path),
+        [target] if !session_id.is_empty() => {
+            // The session's snapshot and the selection move together.
+            let (provider, alias) = parse_account_target(target)?;
+            ports
+                .credentials
+                .pin_session(session_id, provider, alias, true)
+                .map_err(not_found_as_invalid)?;
+            Ok(format!("conta ativa do provider '{provider}': {alias}"))
+        }
         [target] => {
             let (provider, alias) = parse_account_target(target)?;
             set_default_account(ports, provider, alias)?;

@@ -119,4 +119,57 @@ pub trait CredentialStore: Send + Sync {
     ///
     /// Returns [`CredentialError::NotFound`] if the account is not stored.
     fn select(&self, provider: &str, alias: &str) -> Result<(), CredentialError>;
+
+    /// The account `session_id` uses for `provider`: snapshotted from the
+    /// provider's selection on the session's first request and kept when the
+    /// selection later changes. A snapshot whose account was disconnected is
+    /// retaken from the current selection. `None` without stored accounts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Backend`] if the store is unavailable.
+    fn session_account(
+        &self,
+        session_id: &str,
+        provider: &str,
+    ) -> Result<Option<String>, CredentialError>;
+
+    /// Set the snapshot of `session_id` for `provider` to `alias`, and with
+    /// `select` also make it the provider's selection, in one transaction.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::NotFound`] if the account is not stored.
+    fn pin_session(
+        &self,
+        session_id: &str,
+        provider: &str,
+        alias: &str,
+        select: bool,
+    ) -> Result<(), CredentialError>;
+
+    /// Drop the snapshot of `session_id` for `provider`; its next request
+    /// snapshots the current selection again.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Backend`] if the store is unavailable.
+    fn unpin_session(&self, session_id: &str, provider: &str) -> Result<(), CredentialError>;
+
+    /// Every live snapshot of `session_id` (`provider -> alias`).
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Backend`] if the store is unavailable.
+    fn session_accounts(
+        &self,
+        session_id: &str,
+    ) -> Result<HashMap<String, String>, CredentialError>;
+
+    /// Delete snapshots unused since `cutoff_ms`, returning how many.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Backend`] if the store is unavailable.
+    fn prune_sessions(&self, cutoff_ms: i64) -> Result<usize, CredentialError>;
 }

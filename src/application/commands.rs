@@ -148,7 +148,7 @@ pub async fn apply_model(app: &AppState, session_id: &str, model: &str) -> Resul
 pub async fn apply_account(app: &AppState, args: &[String]) -> Result<String, String> {
     let config_path = app.snapshot().await.config_path;
     let msg =
-        settings::account_result(app.ports(), &config_path, args).map_err(|e| e.to_string())?;
+        settings::account_result(app.ports(), &config_path, "", args).map_err(|e| e.to_string())?;
     emit_config(app).await;
     Ok(msg)
 }
@@ -205,9 +205,9 @@ async fn handle_model(
 /// `$proxy account ...`: list accounts or switch this session to
 /// `provider/alias`.
 ///
-/// Selecting pins the account to the session id that made the request and
-/// persists it as the provider's selection. Without a session id the command
-/// only changes the selection.
+/// Selecting moves the snapshot of the session that made the request and the
+/// provider's selection (seen by new sessions) together. Without a session id
+/// the command only changes the selection.
 async fn handle_account(
     app: &AppState,
     state: &RuntimeState,
@@ -215,13 +215,8 @@ async fn handle_account(
     args: &[String],
 ) -> ExecOutput {
     let rest = args.get(1..).unwrap_or_default();
-    let result = settings::account_result(app.ports(), &state.config_path, rest);
+    let result = settings::account_result(app.ports(), &state.config_path, session_id, rest);
     if result.is_ok() {
-        if let [target] = rest {
-            if let Some((provider, alias)) = target.split_once('/') {
-                app.set_session_account(session_id, provider, alias).await;
-            }
-        }
         emit_config(app).await;
     }
     exec_output(result.map_err(|e| e.to_string()))
@@ -296,18 +291,21 @@ mod tests {
             .unwrap()
             .block_on(async {
                 let state = app.snapshot().await;
+                let account = |session: &str| app.request_account(session, "mock").unwrap();
+                // sess-0 snapshots the first connected account.
+                assert_eq!(account("sess-0").as_deref(), Some("work"));
 
                 let body = json!({"messages": [{"role": "user", "content": "$proxy account mock/personal"}]});
                 let out = maybe_exec(&app, &state, &body, "sess-1")
                     .await
                     .expect("is $proxy");
                 assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-                assert_eq!(
-                    app.session_account("sess-1", "mock").await.as_deref(),
-                    Some("personal")
-                );
-                // The selection is also persisted in the store.
+                assert_eq!(account("sess-1").as_deref(), Some("personal"));
+                // The selection moves too: new sessions start there, while
+                // sess-0 keeps its snapshot.
                 assert_eq!(ports.credentials.selections().unwrap()["mock"], "personal");
+                assert_eq!(account("sess-2").as_deref(), Some("personal"));
+                assert_eq!(account("sess-0").as_deref(), Some("work"));
 
                 // There is no `clear`: a provider always has a selection.
                 let body = json!({"messages": [{"role": "user", "content": "$proxy account clear mock"}]});

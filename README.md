@@ -193,13 +193,13 @@ Any single request can override the selection with the `X-Local-Proxy-Account` h
 curl -H "X-Local-Proxy-Account: personal" http://127.0.0.1:8787/v1/messages ...
 ```
 
-Inside a session (any client that sends a session id, like Claude Code), `$proxy account <provider>/<alias>` switches that session immediately — the pin is remembered for the session's lifetime and also becomes the persisted last-selected default, so new sessions start there. `$proxy account` lists:
+Each session (any client that sends a session id, like Claude Code) snapshots the provider's selected account on its first request and keeps it, even when the selection changes later; the snapshot lives in the account store, so it survives proxy restarts and is shared by every proxy instance. `$proxy account <provider>/<alias>` switches the current session and moves the selection in the same step, so new sessions start there while other running sessions keep theirs. If a session's account is disconnected, its next request snapshots the current selection again. Snapshots unused for 30 days are dropped at startup. `$proxy account` lists:
 
 ```
 $proxy account chatgpt/work
 ```
 
-Resolution order: the `X-Local-Proxy-Account` header wins for that request; then the session's account; then the provider's selected account. An unknown alias in the header, or a session account that was disconnected, is a clear 400 error — the proxy never silently picks another account.
+Resolution order: the `X-Local-Proxy-Account` header wins for that request (it never changes the session's snapshot); then the session's snapshot; then, for requests without a session id, the live selection. An unknown alias in the header is a clear 400 error — the proxy never silently picks another account.
 
 An alias identifies one stored credential; connecting an alias that already exists is rejected, so a reconnect cannot silently replace a working credential. Disconnect it first, or use another alias.
 
@@ -418,7 +418,7 @@ $proxy status                        # proxy status
 $proxy models                        # models from connected providers
 $proxy stats --since week            # usage statistics
 $proxy model deepseek-v4-flash       # select this instance's active model, persisted
-$proxy account chatgpt/work          # switch this session's account (persisted as the default)
+$proxy account chatgpt/work          # switch this session's account (and the selection for new sessions)
 $proxy connect opencode-go --account default <key>  # store the key, no interactive prompt
 ```
 

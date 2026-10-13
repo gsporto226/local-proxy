@@ -325,7 +325,6 @@ pub async fn handle_chat(app: &AppState, req: ChatRequest<'_>) -> Result<ChatRep
         .is_some_and(|accounts| accounts.values().any(|a| a.has_credentials()));
     let chosen = if req.account_alias.is_none() && has_accounts {
         app.request_account(session_id, &provider.name)
-            .await
             .map_err(|e| ApiError::internal(e.to_string()))?
     } else {
         None

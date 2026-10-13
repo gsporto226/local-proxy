@@ -16,6 +16,7 @@ use thiserror::Error;
 
 use crate::adapters::outbound::paths;
 use crate::domain::account::{is_valid_alias, pick_selection, AuthEntry, AuthMap, OAuthTokens};
+use crate::domain::oauth::now_ms;
 use crate::ports::{CredentialError, CredentialStore};
 
 /// [`CredentialStore`] over a `SQLCipher` database whose key lives in the OS
@@ -213,6 +214,13 @@ fn open_db(path: &Path) -> Result<Connection, AuthError> {
          CREATE TABLE IF NOT EXISTS selected (
            provider TEXT PRIMARY KEY,
            alias TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS session_accounts (
+           session_id TEXT NOT NULL,
+           provider TEXT NOT NULL,
+           alias TEXT NOT NULL,
+           last_used INTEGER NOT NULL,
+           PRIMARY KEY(session_id, provider)
          );",
     )
     .map_err(AuthError::Database)?;
@@ -507,15 +515,7 @@ fn selected_in(conn: &Connection, provider: &str) -> Result<Option<String>, Auth
 
 /// Make `alias` (which must be stored) the selected account of `provider`.
 fn select_in(conn: &Connection, provider: &str, alias: &str) -> Result<(), AuthError> {
-    let stored = conn
-        .query_row(
-            "SELECT 1 FROM accounts WHERE provider=?1 AND alias=?2",
-            params![provider, alias],
-            |_| Ok(()),
-        )
-        .optional()
-        .map_err(AuthError::Database)?;
-    if stored.is_none() {
+    if !account_exists(conn, provider, alias)? {
         return Err(AuthError::NotFound {
             provider: provider.to_string(),
             alias: alias.to_string(),
@@ -587,6 +587,132 @@ fn select_account(provider: &str, alias: &str) -> Result<(), AuthError> {
     })
 }
 
+fn snapshot_in(
+    conn: &Connection,
+    session_id: &str,
+    provider: &str,
+    alias: &str,
+) -> Result<(), AuthError> {
+    conn.execute(
+        "INSERT INTO session_accounts(session_id, provider, alias, last_used)
+         VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(session_id, provider)
+         DO UPDATE SET alias=excluded.alias, last_used=excluded.last_used",
+        params![session_id, provider, alias, now_ms()],
+    )
+    .map_err(AuthError::Database)?;
+    Ok(())
+}
+
+/// The account `session_id` uses for `provider`: snapshotted from the
+/// selection on the session's first request and kept when the selection
+/// later changes. A snapshot whose account was disconnected is retaken from
+/// the current selection.
+fn session_account(session_id: &str, provider: &str) -> Result<Option<String>, AuthError> {
+    with_db(|conn| {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        // The join drops snapshots of disconnected accounts.
+        let snapshot: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT s.alias, s.last_used FROM session_accounts s
+                 JOIN accounts a ON a.provider = s.provider AND a.alias = s.alias
+                 WHERE s.session_id = ?1 AND s.provider = ?2",
+                params![session_id, provider],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(AuthError::Database)?;
+        let alias = if let Some((alias, last_used)) = snapshot {
+            // Only touched to age out idle sessions; a minute is plenty.
+            if now_ms() - last_used > 60_000 {
+                snapshot_in(&tx, session_id, provider, &alias)?;
+            }
+            Some(alias)
+        } else {
+            let selected = selected_in(&tx, provider)?;
+            if let Some(alias) = &selected {
+                snapshot_in(&tx, session_id, provider, alias)?;
+            }
+            selected
+        };
+        tx.commit().map_err(AuthError::Database)?;
+        Ok(alias)
+    })
+}
+
+fn pin_session(
+    session_id: &str,
+    provider: &str,
+    alias: &str,
+    select: bool,
+) -> Result<(), AuthError> {
+    with_db(|conn| {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        if select {
+            select_in(&tx, provider, alias)?;
+        } else if !account_exists(&tx, provider, alias)? {
+            return Err(AuthError::NotFound {
+                provider: provider.to_string(),
+                alias: alias.to_string(),
+            });
+        }
+        snapshot_in(&tx, session_id, provider, alias)?;
+        tx.commit().map_err(AuthError::Database)
+    })
+}
+
+fn account_exists(conn: &Connection, provider: &str, alias: &str) -> Result<bool, AuthError> {
+    conn.query_row(
+        "SELECT 1 FROM accounts WHERE provider=?1 AND alias=?2",
+        params![provider, alias],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|found| found.is_some())
+    .map_err(AuthError::Database)
+}
+
+fn unpin_session(session_id: &str, provider: &str) -> Result<(), AuthError> {
+    with_db(|conn| {
+        conn.execute(
+            "DELETE FROM session_accounts WHERE session_id=?1 AND provider=?2",
+            params![session_id, provider],
+        )
+        .map(|_| ())
+        .map_err(AuthError::Database)
+    })
+}
+
+fn session_accounts(session_id: &str) -> Result<HashMap<String, String>, AuthError> {
+    with_db(|conn| {
+        let mut stmt = conn
+            .prepare(
+                "SELECT s.provider, s.alias FROM session_accounts s
+                 JOIN accounts a ON a.provider = s.provider AND a.alias = s.alias
+                 WHERE s.session_id = ?1",
+            )
+            .map_err(AuthError::Database)?;
+        let rows = stmt
+            .query_map([session_id], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(AuthError::Database)?;
+        rows.collect::<Result<_, _>>().map_err(AuthError::Database)
+    })
+}
+
+fn prune_sessions(cutoff_ms: i64) -> Result<usize, AuthError> {
+    with_db(|conn| {
+        conn.execute(
+            "DELETE FROM session_accounts WHERE last_used < ?1",
+            [cutoff_ms],
+        )
+        .map_err(AuthError::Database)
+    })
+}
+
 /// Retrieve one named account.
 ///
 /// # Errors
@@ -654,6 +780,39 @@ impl CredentialStore for SqlCipherCredentialStore {
     fn select(&self, provider: &str, alias: &str) -> Result<(), CredentialError> {
         Ok(select_account(provider, alias)?)
     }
+
+    fn session_account(
+        &self,
+        session_id: &str,
+        provider: &str,
+    ) -> Result<Option<String>, CredentialError> {
+        Ok(session_account(session_id, provider)?)
+    }
+
+    fn pin_session(
+        &self,
+        session_id: &str,
+        provider: &str,
+        alias: &str,
+        select: bool,
+    ) -> Result<(), CredentialError> {
+        Ok(pin_session(session_id, provider, alias, select)?)
+    }
+
+    fn unpin_session(&self, session_id: &str, provider: &str) -> Result<(), CredentialError> {
+        Ok(unpin_session(session_id, provider)?)
+    }
+
+    fn session_accounts(
+        &self,
+        session_id: &str,
+    ) -> Result<HashMap<String, String>, CredentialError> {
+        Ok(session_accounts(session_id)?)
+    }
+
+    fn prune_sessions(&self, cutoff_ms: i64) -> Result<usize, CredentialError> {
+        Ok(prune_sessions(cutoff_ms)?)
+    }
 }
 
 #[cfg(test)]
@@ -670,6 +829,35 @@ mod tests {
         // Equivalent spellings of the same dir share one key.
         let dotted = dir.join(".").join("accounts.db");
         assert_eq!(vault_identity(&dotted, true).unwrap(), isolated);
+    }
+
+    #[test]
+    fn session_snapshot_survives_selection_changes_but_not_disconnects() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", dir.path());
+        let store = SqlCipherCredentialStore;
+        let api = |key: &str| AuthEntry::Api {
+            key: key.to_string(),
+        };
+        store.insert("p", "work", &api("k1")).unwrap();
+        store.insert("p", "personal", &api("k2")).unwrap();
+        let session = |id: &str| store.session_account(id, "p").unwrap();
+
+        assert_eq!(session("a").as_deref(), Some("work"));
+        store.select("p", "personal").unwrap();
+        assert_eq!(session("a").as_deref(), Some("work"), "snapshot kept");
+        assert_eq!(session("b").as_deref(), Some("personal"));
+
+        // Disconnecting the snapshot's account retakes it from the selection.
+        store.remove("p", "work").unwrap();
+        assert_eq!(session("a").as_deref(), Some("personal"));
+
+        // Idle snapshots are pruned.
+        assert_eq!(store.prune_sessions(now_ms() + 1).unwrap(), 2);
+        assert!(store.session_accounts("a").unwrap().is_empty());
+
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
     }
 
     #[test]

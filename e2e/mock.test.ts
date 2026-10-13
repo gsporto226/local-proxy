@@ -838,45 +838,52 @@ describe("e2e: multiple accounts per provider", () => {
     expect(res.output).toContain("selecionada");
   });
 
-  test("$proxy account pins the account for the session and updates the default", async () => {
-    const sessionA = { "x-claude-code-session-id": "sess-A" };
+  test("each session keeps the account it started with", async () => {
     const chat = { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
+    const cmd = (alias: string) => ({
+      model: "claude-via-responses",
+      max_tokens: 10,
+      messages: [{ role: "user", content: `$proxy account mock_responses/${alias}` }],
+    });
+    const sid = (id: string) => ({ "x-claude-code-session-id": id });
+    const authOf = async (headers: Record<string, string>) => {
+      const r = await postJson(proxy.base, "/v1/messages", chat, headers);
+      expect(r.status).toBe(200);
+      return mock.lastResponsesHeaders().authorization;
+    };
 
-    // Session A switches through the proxy itself.
-    const cmd = await postJson(
-      proxy.base,
-      "/v1/messages",
-      { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "$proxy account mock_responses/work" }] },
-      sessionA,
-    );
-    expect(cmd.status).toBe(200);
-    expect(await readBody(cmd)).toContain("work");
+    // Session A switches to work through the proxy itself.
+    let r = await postJson(proxy.base, "/v1/messages", cmd("work"), sid("sess-A"));
+    expect(r.status).toBe(200);
+    expect(await readBody(r)).toContain("work");
+    expect(await authOf(sid("sess-A"))).toBe("Bearer key-work");
 
-    // Header-less requests from session A use the pinned account.
-    const pinned = await postJson(proxy.base, "/v1/messages", chat, sessionA);
-    expect(pinned.status).toBe(200);
-    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
+    // Session B switches to personal: the selection moves, A keeps work.
+    r = await postJson(proxy.base, "/v1/messages", cmd("personal"), sid("sess-B"));
+    expect(r.status).toBe(200);
+    expect(await authOf(sid("sess-B"))).toBe("Bearer key-personal");
+    expect(await authOf(sid("sess-A"))).toBe("Bearer key-work");
 
-    // Move the persisted default from the CLI; new sessions start from it.
-    const cli = await runCli(["--config", cfgPath, "account", "mock_responses/personal"], env);
-    expect(cli.exit).toBe(0);
-    let authB = "";
+    // A new session starts from the current selection.
+    expect(await authOf(sid("sess-C"))).toBe("Bearer key-personal");
+
+    // A header overrides A for one request without moving its snapshot.
+    expect(await authOf({ ...sid("sess-A"), "x-local-proxy-account": "personal" })).toBe("Bearer key-personal");
+    expect(await authOf(sid("sess-A"))).toBe("Bearer key-work");
+
+    // Disconnecting A's account moves A to the current selection.
+    const res = await runCli(["--config", cfgPath, "disconnect", "mock_responses", "--account", "work"], env);
+    expect(res.exit).toBe(0);
+    let auth = "";
     for (let i = 0; i < 30; i++) {
-      // A fresh session each try: one seen before the hot-reload keeps its
-      // frozen default.
-      const r = await postJson(proxy.base, "/v1/messages", chat, { "x-claude-code-session-id": `sess-B${i}` });
-      if (r.status === 200) {
-        authB = mock.lastResponsesHeaders().authorization ?? "";
-        if (authB === "Bearer key-personal") break;
+      const q = await postJson(proxy.base, "/v1/messages", chat, sid("sess-A"));
+      if (q.status === 200) {
+        auth = mock.lastResponsesHeaders().authorization ?? "";
+        if (auth === "Bearer key-personal") break;
       }
       await Bun.sleep(100);
     }
-    expect(authB).toBe("Bearer key-personal");
-
-    // Session A still uses its own pin, not the new default.
-    const stillA = await postJson(proxy.base, "/v1/messages", chat, sessionA);
-    expect(stillA.status).toBe(200);
-    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
+    expect(auth).toBe("Bearer key-personal");
   });
 });
 
