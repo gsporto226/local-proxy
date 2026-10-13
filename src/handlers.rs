@@ -57,7 +57,7 @@ pub struct AppState {
     sessions: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
     /// The account store's `data_version` the clients were built from; `None`
     /// until [`AppState::track_accounts`] (a live server) turns tracking on.
-    accounts_version: Arc<std::sync::Mutex<Option<i64>>>,
+    accounts_version: Arc<std::sync::Mutex<Option<(i64, i64)>>>,
 }
 
 impl AppState {
@@ -98,24 +98,6 @@ impl AppState {
             .insert(provider.to_string(), alias.to_string());
     }
 
-    /// Drop the session's account pins: one provider, or all of them.
-    pub async fn clear_session_accounts(&self, session_id: &str, provider: Option<&str>) {
-        if session_id.is_empty() {
-            return;
-        }
-        let mut sessions = self.sessions.write().await;
-        match provider {
-            Some(provider) => {
-                if let Some(accounts) = sessions.get_mut(session_id) {
-                    accounts.remove(provider);
-                }
-            }
-            None => {
-                sessions.remove(session_id);
-            }
-        }
-    }
-
     /// Snapshot the current runtime state (cheap Arc clones), first picking up
     /// account changes another process committed to the store.
     pub async fn snapshot(&self) -> RuntimeState {
@@ -123,14 +105,14 @@ impl AppState {
         self.inner.read().await.clone()
     }
 
-    fn seen_version(&self) -> Option<i64> {
+    fn seen_version(&self) -> Option<(i64, i64)> {
         *self
             .accounts_version
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
-    fn set_seen_version(&self, version: Option<i64>) {
+    fn set_seen_version(&self, version: Option<(i64, i64)>) {
         *self
             .accounts_version
             .lock()
@@ -138,30 +120,37 @@ impl AppState {
     }
 
     /// Start following the account store: the current clients count as
-    /// built from its current `data_version`.
+    /// built from its current `(data_version, revision)`.
     pub fn track_accounts(&self) {
-        match crate::auth::data_version() {
+        match crate::auth::revision() {
             Ok(version) => self.set_seen_version(Some(version)),
             Err(e) => tracing::warn!("account store change tracking disabled: {e}"),
         }
     }
 
-    /// Rebuild the clients when the store's `data_version` moved. A provider
-    /// that gained or lost its only usable account changes the model catalog
-    /// too, so that case rebuilds the whole state (with model discovery).
+    /// Rebuild the clients when another process added or removed an account.
+    /// `data_version` is the cheap poll; it also moves for token refreshes,
+    /// selections and session snapshots written elsewhere, which leave the
+    /// account revision alone and need no rebuild. A provider that gained or
+    /// lost its only usable account changes the model catalog too, so that
+    /// case rebuilds the whole state (with model discovery).
     async fn reload_accounts_if_changed(&self) {
         let Some(seen) = self.seen_version() else {
             return;
         };
-        let Ok(now) = crate::auth::data_version() else {
+        let Ok(now) = crate::auth::revision() else {
             return;
         };
-        if now == seen {
+        if now.0 == seen.0 {
+            return;
+        }
+        if now.1 == seen.1 {
+            self.set_seen_version(Some(now));
             return;
         }
         let mut guard = self.inner.write().await;
         // Another request may have rebuilt while this one waited.
-        if self.seen_version() == Some(now) {
+        if self.seen_version().is_some_and(|v| v.1 == now.1) {
             return;
         }
         let clients = match build_clients(&guard.config) {
@@ -187,7 +176,7 @@ impl AppState {
         }
         self.set_seen_version(Some(now));
         drop(guard);
-        tracing::info!("account change applied (data_version {seen} -> {now})");
+        tracing::info!("account change applied (revision {} -> {})", seen.1, now.1);
     }
 
     /// Set the in-memory `active_model` for this instance without touching any
@@ -387,6 +376,15 @@ pub fn build_clients(
     config: &Config,
 ) -> Result<HashMap<String, HashMap<String, ProviderClient>>, ClientBuildError> {
     let passthrough = config.server.passthrough_keys;
+    let legacy = &config.defaults.active_accounts;
+    if !legacy.is_empty() {
+        tracing::warn!(
+            target: crate::LOG_TARGET,
+            "`defaults.active_accounts` is obsolete and ignored once each provider has a \
+             selection; the selection now lives in the account store (`local-proxy account`)"
+        );
+    }
+    crate::auth::seed_selections(legacy)?;
     let auth = crate::auth::read_auth()?;
     let mut map = HashMap::new();
     let mut connected = Vec::new();
@@ -769,62 +767,68 @@ fn connected_providers(clients: &HashMap<String, HashMap<String, ProviderClient>
     names
 }
 
+/// The account a request without the header uses: the session's pin, else the
+/// provider's selection. A provider with no stored accounts has neither, and
+/// skips the store.
+async fn chosen_account(
+    app: &AppState,
+    state: &RuntimeState,
+    session_id: &str,
+    provider: &str,
+) -> Result<Option<String>, ApiError> {
+    let has_accounts = state
+        .clients
+        .get(provider)
+        .is_some_and(|accounts| accounts.values().any(ProviderClient::has_key));
+    if !has_accounts {
+        return Ok(None);
+    }
+    if let Some(alias) = app.session_account(session_id, provider).await {
+        return Ok(Some(alias));
+    }
+    crate::auth::selected_for(provider)
+        .map_err(|e| ApiError::internal(format!("account store: {e}")))
+}
+
+/// Pick the account client for a request: the `X-Local-Proxy-Account`
+/// header, else `chosen` (the session's account, or the provider's selection).
+/// Both must name a stored credential; the unauthenticated placeholder of a
+/// provider with no stored accounts is only used when neither is given.
 fn client_for(
     state: &RuntimeState,
     provider: &crate::config::Provider,
-    session_alias: Option<&str>,
-    alias: Option<&str>,
+    header: Option<&str>,
+    chosen: Option<&str>,
 ) -> Result<ProviderClient, ApiError> {
     let accounts = state.clients.get(&provider.name).ok_or_else(|| {
         ApiError::internal(format!("client not built for provider {}", provider.name))
     })?;
-    // A `$proxy account` pin outranks everything for this session.
-    if let Some(alias) = session_alias {
-        return accounts
-            .get(alias)
-            .filter(|client| client.has_key())
-            .cloned()
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "session account '{alias}' for provider '{}' is no longer stored; \
-                     select another with `$proxy account {}/<alias>`",
-                    provider.name, provider.name
-                ))
-            });
-    }
-    if let Some(alias) = alias {
-        return accounts.get(alias).cloned().ok_or_else(|| {
+    let stored = |alias: &str| accounts.get(alias).filter(|c| c.has_key()).cloned();
+    if let Some(alias) = header {
+        return stored(alias).ok_or_else(|| {
             ApiError::bad_request(format!(
                 "unknown account '{alias}' for provider '{}'",
                 provider.name
             ))
         });
     }
-    if let Some(selected) = state.config.defaults.active_accounts.get(&provider.name) {
-        // The selection must resolve to a stored credential; the unauthenticated
-        // placeholder client never satisfies it.
-        return accounts
-            .get(selected)
-            .filter(|client| client.has_key())
-            .cloned()
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "selected account '{selected}' for provider '{}' is no longer stored; \
-                     select another with `local-proxy account {}/<alias>`",
-                    provider.name, provider.name
-                ))
-            });
+    if let Some(alias) = chosen {
+        return stored(alias).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "account '{alias}' for provider '{}' is no longer stored; \
+                 select another with `$proxy account {}/<alias>`",
+                provider.name, provider.name
+            ))
+        });
     }
-    if accounts.len() > 1 {
-        return Err(ApiError::bad_request(format!(
-            "provider '{}' has multiple accounts; select one with \
-             `local-proxy account {}/<alias>` or specify X-Local-Proxy-Account",
+    match accounts.values().next() {
+        Some(client) if accounts.len() == 1 => Ok(client.clone()),
+        _ => Err(ApiError::bad_request(format!(
+            "provider '{}' has no selected account; select one with \
+             `local-proxy account {}/<alias>`",
             provider.name, provider.name
-        )));
+        ))),
     }
-    accounts.values().next().cloned().ok_or_else(|| {
-        ApiError::internal(format!("client not built for provider {}", provider.name))
-    })
 }
 
 /// Best-effort local statistics capture for a non-streaming request.
@@ -1040,13 +1044,12 @@ async fn handle_model_exec(
     }
 }
 
-/// Handle `$proxy account ...` in-process: list accounts, switch this session
-/// to `provider/alias`, or clear the selection.
+/// Handle `$proxy account ...` in-process: list accounts, or switch this
+/// session to `provider/alias`.
 ///
 /// Selecting pins the account to the session id that made the request and
-/// persists it as the last-selected default (via the CLI logic); clearing drops
-/// the session pin too. Without a session id the command only changes the
-/// persisted default.
+/// also makes it the provider's selection (via the CLI logic). Without a
+/// session id the command only changes the selection.
 async fn handle_account_exec(
     app: &AppState,
     state: &RuntimeState,
@@ -1056,19 +1059,10 @@ async fn handle_account_exec(
     let rest = args.get(1..).unwrap_or_default();
     match crate::cli::account_result(&state.config_path, rest) {
         Ok(msg) => {
-            match rest {
-                [command] if command == "clear" => {
-                    app.clear_session_accounts(session_id, None).await;
+            if let [target] = rest {
+                if let Some((provider, alias)) = target.split_once('/') {
+                    app.set_session_account(session_id, provider, alias).await;
                 }
-                [command, provider] if command == "clear" => {
-                    app.clear_session_accounts(session_id, Some(provider)).await;
-                }
-                [target] => {
-                    if let Some((provider, alias)) = target.split_once('/') {
-                        app.set_session_account(session_id, provider, alias).await;
-                    }
-                }
-                _ => {}
             }
             crate::exec::ExecOutput {
                 stdout: msg,
@@ -1285,8 +1279,8 @@ async fn handle_chat(
             body["output_config"]["effort"] = json!(effort);
         }
     }
-    let session_alias = app.session_account(session_id, &provider.name).await;
-    let client = client_for(state, &provider, session_alias.as_deref(), account_alias)?;
+    let chosen = chosen_account(app, state, session_id, &provider.name).await?;
+    let client = client_for(state, &provider, account_alias, chosen.as_deref())?;
     let upstream_format = Format::from(provider.format);
     let same = upstream_format == client_format;
 
@@ -2198,7 +2192,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_exec_account_pins_the_session_and_persists_the_default() {
+    fn maybe_exec_account_pins_the_session_and_selects_the_account() {
         let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2210,6 +2204,7 @@ mod tests {
         ));
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("LOCAL_PROXY_CONFIG_DIR", &dir);
+        crate::auth::set_key_for("mock", "personal", "key-personal").unwrap();
         crate::auth::set_key_for("mock", "work", "key-work").unwrap();
         let config_path = dir.join("config.yaml");
 
@@ -2218,7 +2213,7 @@ mod tests {
             router: Arc::new(Router::new(Arc::new(Config::default())).unwrap()),
             clients: Arc::new(HashMap::new()),
             enforce_active_model: false,
-            config_path: config_path.clone(),
+            config_path,
         });
         block_on(async {
             let state = app.snapshot().await;
@@ -2233,20 +2228,11 @@ mod tests {
                 app.session_account("sess-1", "mock").await.as_deref(),
                 Some("work")
             );
-            // The selection is also the persisted last-selected default.
-            let saved = Config::load(&config_path).unwrap();
-            assert_eq!(saved.defaults.active_accounts["mock"], "work");
-
-            // `clear` drops the session pin and the persisted default.
-            let body =
-                json!({"messages": [{"role": "user", "content": "$proxy account clear mock"}]});
-            let out = maybe_exec(&app, &state, &body, "sess-1")
-                .await
-                .expect("is $proxy");
-            assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-            assert_eq!(app.session_account("sess-1", "mock").await, None);
-            let saved = Config::load(&config_path).unwrap();
-            assert!(!saved.defaults.active_accounts.contains_key("mock"));
+            // The selection is also the store's selection for the provider.
+            assert_eq!(
+                crate::auth::selected_for("mock").unwrap().as_deref(),
+                Some("work")
+            );
         });
 
         std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
@@ -2275,7 +2261,7 @@ mod tests {
     }
 
     #[test]
-    fn account_selection_requires_alias_only_for_multiple_accounts() {
+    fn account_resolution_is_header_then_chosen() {
         let provider = crate::config::Provider {
             name: "openai".to_string(),
             base_url: "http://127.0.0.1:9".to_string(),
@@ -2301,120 +2287,41 @@ mod tests {
             providers: vec![provider.clone()],
             ..Config::default()
         });
-        let mut accounts = HashMap::from([("one".to_string(), account("one"))]);
-        let make_state = |accounts: HashMap<String, ProviderClient>| RuntimeState {
+        let state_with = |accounts: HashMap<String, ProviderClient>| RuntimeState {
             config: cfg.clone(),
             router: Arc::new(Router::new(cfg.clone()).unwrap()),
             clients: Arc::new(HashMap::from([("openai".to_string(), accounts)])),
             enforce_active_model: false,
             config_path: PathBuf::new(),
         };
-        assert!(client_for(&make_state(accounts.clone()), &provider, None, None).is_ok());
-        assert!(client_for(&make_state(accounts.clone()), &provider, None, Some("one")).is_ok());
-        let err = client_for(
-            &make_state(accounts.clone()),
-            &provider,
-            None,
-            Some("missing"),
-        )
-        .expect_err("unknown alias must fail even with one account");
-        assert_eq!(err.status, 400);
-        assert!(err.message.contains("unknown account 'missing'"));
-        accounts.insert("two".to_string(), account("two"));
-        let state = make_state(accounts);
-        let err = client_for(&state, &provider, None, None).expect_err("ambiguous account");
-        assert_eq!(err.status, 400);
-        assert!(err.message.contains("X-Local-Proxy-Account"));
-        assert!(client_for(&state, &provider, None, Some("two")).is_ok());
-    }
+        let key = |client: ProviderClient| client.effective_key(None);
+        let state = state_with(HashMap::from([
+            ("personal".to_string(), account("personal")),
+            ("work".to_string(), account("work")),
+        ]));
 
-    #[test]
-    fn account_resolution_is_session_then_header_then_selection() {
-        let provider = crate::config::Provider {
-            name: "openai".to_string(),
-            base_url: "http://127.0.0.1:9".to_string(),
-            format: ProviderFormat::Openai,
-            models: vec!["gpt-test".to_string()],
-            auto_model: None,
-            headers: HashMap::new(),
-            session_header: None,
-            oauth: None,
-        };
-        let account = |alias: &str| {
-            ProviderClient::new_for_alias(
-                &provider,
-                alias,
-                false,
-                Some(crate::auth::AuthEntry::Api {
-                    key: format!("key-{alias}"),
-                }),
-            )
-            .unwrap()
-        };
-        let state_with = |selected: &str| {
-            let cfg = Arc::new(Config {
-                providers: vec![provider.clone()],
-                defaults: crate::config::Defaults {
-                    active_accounts: HashMap::from([("openai".to_string(), selected.to_string())]),
-                    ..crate::config::Defaults::default()
-                },
-                ..Config::default()
-            });
-            RuntimeState {
-                config: cfg.clone(),
-                router: Arc::new(Router::new(cfg).unwrap()),
-                clients: Arc::new(HashMap::from([(
-                    "openai".to_string(),
-                    HashMap::from([
-                        ("personal".to_string(), account("personal")),
-                        ("work".to_string(), account("work")),
-                    ]),
-                )])),
-                enforce_active_model: false,
-                config_path: PathBuf::new(),
-            }
-        };
+        // The chosen account (session or selection) is used without a header,
+        // and the header overrides it for that request.
+        let chosen = client_for(&state, &provider, None, Some("work")).unwrap();
+        assert_eq!(key(chosen).as_deref(), Some("key-work"));
+        let header = client_for(&state, &provider, Some("personal"), Some("work")).unwrap();
+        assert_eq!(key(header).as_deref(), Some("key-personal"));
 
-        // No header: the selected account is used without error.
-        let state = state_with("work");
-        let selected = client_for(&state, &provider, None, None).unwrap();
-        assert_eq!(selected.effective_key(None).as_deref(), Some("key-work"));
-        // The header overrides the persisted selection per request.
-        let overridden = client_for(&state, &provider, None, Some("personal")).unwrap();
-        assert_eq!(
-            overridden.effective_key(None).as_deref(),
-            Some("key-personal")
-        );
-
-        // A session pin (from `$proxy account`) outranks both the persisted
-        // selection and the per-request header.
-        let pinned = client_for(&state, &provider, Some("personal"), None).unwrap();
-        assert_eq!(pinned.effective_key(None).as_deref(), Some("key-personal"));
-        let pinned_over_header =
-            client_for(&state, &provider, Some("personal"), Some("work")).unwrap();
-        assert_eq!(
-            pinned_over_header.effective_key(None).as_deref(),
-            Some("key-personal")
-        );
-
-        // A selection whose account was disconnected is a clear 400, never a
-        // silent fallback to another account.
-        let disconnected = state_with("ghost");
-        let err = client_for(&disconnected, &provider, None, None).expect_err("stale selection");
+        // Unknown or disconnected aliases are a clear 400, never a fallback.
+        let err = client_for(&state, &provider, Some("ghost"), None).expect_err("header");
+        assert!(err.message.contains("unknown account 'ghost'"));
+        let err = client_for(&state, &provider, None, Some("ghost")).expect_err("stale");
         assert_eq!(err.status, 400);
-        assert!(
-            err.message.contains("no longer stored"),
-            "got: {}",
-            err.message
-        );
-        // Same for a stale session pin.
-        let err = client_for(&state, &provider, Some("ghost"), None).expect_err("stale pin");
+        assert!(err.message.contains("no longer stored"), "{}", err.message);
+        let err = client_for(&state, &provider, None, None).expect_err("no selection");
         assert_eq!(err.status, 400);
-        assert!(
-            err.message.contains("session account"),
-            "got: {}",
-            err.message
-        );
+
+        // A provider with no stored accounts uses its passthrough placeholder,
+        // which the header can never name.
+        let placeholder = ProviderClient::new(&provider, true, None).unwrap();
+        let bare = state_with(HashMap::from([("default".to_string(), placeholder)]));
+        assert!(client_for(&bare, &provider, None, None).is_ok());
+        assert!(client_for(&bare, &provider, Some("default"), None).is_err());
     }
 
     #[test]

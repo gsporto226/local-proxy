@@ -112,8 +112,8 @@ enum Command {
     },
     /// List stored accounts or select the active one (`provider/alias`)
     Account {
-        /// `provider/alias` to select, or `clear [provider]` to unset
-        #[arg(value_name = "PROVIDER/ALIAS | clear [PROVIDER]")]
+        /// `provider/alias` to select
+        #[arg(value_name = "PROVIDER/ALIAS")]
         args: Vec<String>,
     },
     /// List effective providers (catalog ∪ config) with account aliases

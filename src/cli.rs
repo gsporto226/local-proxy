@@ -1003,7 +1003,15 @@ pub fn disconnect_provider(
     account: &str,
 ) -> Result<String, CliError> {
     let _ = config_path;
-    let removed = crate::auth::remove_account(provider, account).map_err(CliError::from)?;
+    let removed = crate::auth::remove_account(provider, account).map_err(|e| match e {
+        crate::auth::AuthError::SelectedAccount { provider, alias } => CliError::Connect {
+            message: format!(
+                "a conta '{alias}' e a ativa do provider '{provider}'; selecione outra com \
+                 `local-proxy account {provider}/<alias>` antes de remove-la"
+            ),
+        },
+        e => CliError::from(e),
+    })?;
     Ok(if removed {
         format!("conta '{account}' do provider '{provider}' removida")
     } else {
@@ -1088,35 +1096,6 @@ pub fn set_default_model(config_path: &Path, model: Option<&str>) -> Result<(), 
     ensure_config(config_path)?;
     let mut config = Config::load(config_path).map_err(CliError::from)?;
     config.defaults.active_model = model.map(str::to_string);
-    save_config(config_path, &config)
-}
-
-/// Persist or clear the active account alias for `provider` in the config
-/// overlay (`defaults.active_accounts`). `None` clears that provider's
-/// selection. Creates a default config file if none exists yet.
-///
-/// # Errors
-///
-/// Returns a [`CliError`] if the config cannot be read, serialized, or written.
-#[allow(clippy::result_large_err)]
-pub fn set_default_account(
-    config_path: &Path,
-    provider: &str,
-    alias: Option<&str>,
-) -> Result<(), CliError> {
-    ensure_config(config_path)?;
-    let mut config = Config::load(config_path).map_err(CliError::from)?;
-    match alias {
-        Some(alias) => {
-            config
-                .defaults
-                .active_accounts
-                .insert(provider.to_string(), alias.to_string());
-        }
-        None => {
-            config.defaults.active_accounts.remove(provider);
-        }
-    }
     save_config(config_path, &config)
 }
 
@@ -1280,8 +1259,8 @@ pub fn providers(config_path: PathBuf) -> miette::Result<()> {
     Ok(())
 }
 
-/// Render the stored accounts, one per line, marking the active alias of each
-/// provider.
+/// Render the stored accounts, one per line, marking the selected alias of
+/// each provider.
 ///
 /// # Errors
 ///
@@ -1289,7 +1268,9 @@ pub fn providers(config_path: PathBuf) -> miette::Result<()> {
 #[allow(clippy::result_large_err, clippy::format_push_string)]
 pub fn list_accounts(config_path: &Path) -> Result<String, CliError> {
     let config = effective_config(config_path)?;
+    crate::auth::seed_selections(&config.defaults.active_accounts).map_err(CliError::from)?;
     let auth = crate::auth::read_auth().map_err(CliError::from)?;
+    let selected = crate::auth::selections().map_err(CliError::from)?;
     let mut out = String::new();
     for provider in &config.providers {
         let Some(accounts) = auth.get(&provider.name) else {
@@ -1302,11 +1283,7 @@ pub fn list_accounts(config_path: &Path) -> Result<String, CliError> {
                 crate::auth::AuthEntry::OAuth(_) => "oauth",
                 crate::auth::AuthEntry::Api { .. } => "api",
             };
-            let active = config
-                .defaults
-                .active_accounts
-                .get(&provider.name)
-                .is_some_and(|selected| selected == alias);
+            let active = selected.get(&provider.name) == Some(alias);
             let marker = if active { " [ativa]" } else { "" };
             out.push_str(&format!("{}/{alias} ({kind}){marker}\n", provider.name));
         }
@@ -1320,64 +1297,52 @@ pub fn list_accounts(config_path: &Path) -> Result<String, CliError> {
     Ok(out.trim_end().to_string())
 }
 
-/// Compute the message for `local-proxy account`: list accounts, select one
-/// (`provider/alias`), or clear the selection (`clear [provider]`).
+/// Parse a `provider/alias` target.
+#[allow(clippy::result_large_err)]
+fn account_target(target: &str) -> Result<(&str, &str), CliError> {
+    target.split_once('/').ok_or_else(|| CliError::Connect {
+        message: format!("alvo '{target}' invalido; use provider/alias (ex.: chatgpt/work)"),
+    })
+}
+
+/// Map a missing account to the CLI's own message.
+fn account_error(e: crate::auth::AuthError) -> CliError {
+    match e {
+        crate::auth::AuthError::UnknownAccount { provider, alias } => CliError::Connect {
+            message: format!(
+                "conta '{alias}' nao encontrada para o provider '{provider}'; \
+                 veja `local-proxy account`"
+            ),
+        },
+        e => CliError::from(e),
+    }
+}
+
+/// Compute the message for `local-proxy account`: list accounts or select one
+/// (`provider/alias`). A provider with accounts always has a selection.
 ///
-/// Running proxies pick the change up via hot-reload.
+/// Running proxies read the selection from the account store per request.
 ///
 /// # Errors
 ///
 /// Returns a [`CliError`] if the target is malformed, the account does not
-/// exist, or the config cannot be written.
+/// exist, or the store cannot be written.
 #[allow(clippy::result_large_err)]
 pub fn account_result(config_path: &Path, args: &[String]) -> Result<String, CliError> {
     match args {
         [] => list_accounts(config_path),
-        [command, provider] if command == "clear" => {
-            set_default_account(config_path, provider, None)?;
-            Ok(format!("conta ativa do provider '{provider}' limpa"))
-        }
-        [command] if command == "clear" => {
-            let config = effective_config(config_path)?;
-            if config.defaults.active_accounts.is_empty() {
-                return Ok("nenhuma conta ativa para limpar".to_string());
-            }
-            ensure_config(config_path)?;
-            let mut config = Config::load(config_path).map_err(CliError::from)?;
-            config.defaults.active_accounts.clear();
-            save_config(config_path, &config)?;
-            Ok("contas ativas limpas".to_string())
-        }
         [target] => {
-            let Some((provider, alias)) = target.split_once('/') else {
-                return Err(CliError::Connect {
-                    message: format!(
-                        "alvo '{target}' invalido; use provider/alias (ex.: chatgpt/work)"
-                    ),
-                });
-            };
-            let auth = crate::auth::read_auth().map_err(CliError::from)?;
-            if !auth
-                .get(provider)
-                .is_some_and(|accounts| accounts.contains_key(alias))
-            {
-                return Err(CliError::Connect {
-                    message: format!(
-                        "conta '{alias}' nao encontrada para o provider '{provider}'; \
-                         veja `local-proxy account`"
-                    ),
-                });
-            }
-            set_default_account(config_path, provider, Some(alias))?;
+            let (provider, alias) = account_target(target)?;
+            crate::auth::select_account(provider, alias).map_err(account_error)?;
             Ok(format!("conta ativa do provider '{provider}': {alias}"))
         }
         _ => Err(CliError::Connect {
-            message: "uso: `local-proxy account [provider/alias | clear [provider]]`".to_string(),
+            message: "uso: `local-proxy account [provider/alias]`".to_string(),
         }),
     }
 }
 
-/// CLI entry for `account`: list, select, or clear the active account.
+/// CLI entry for `account`: list accounts or select the active one.
 ///
 /// # Errors
 ///
@@ -2456,33 +2421,6 @@ mod tests {
         set_default_model(&path, None).expect("clear model");
         let config = Config::load(&path).expect("reload");
         assert_eq!(config.defaults.active_model, None);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    #[test]
-    fn set_default_account_persists_and_clears() {
-        let stamp = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .expect("clock is set")
-            .as_nanos();
-        let dir = std::env::temp_dir().join(format!(
-            "local-proxy-account-select-{}-{stamp}",
-            std::process::id()
-        ));
-        std::fs::create_dir_all(&dir).expect("create test dir");
-        let path = dir.join("config.yaml");
-
-        set_default_account(&path, "chatgpt", Some("work")).expect("persist account");
-        set_default_account(&path, "opencode-go", Some("personal")).expect("persist second");
-        let config = Config::load(&path).expect("reload");
-        assert_eq!(config.defaults.active_accounts["chatgpt"], "work");
-        assert_eq!(config.defaults.active_accounts["opencode-go"], "personal");
-
-        set_default_account(&path, "chatgpt", None).expect("clear one");
-        let config = Config::load(&path).expect("reload");
-        assert!(!config.defaults.active_accounts.contains_key("chatgpt"));
-        assert_eq!(config.defaults.active_accounts["opencode-go"], "personal");
 
         let _ = std::fs::remove_dir_all(&dir);
     }

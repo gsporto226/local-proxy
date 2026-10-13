@@ -128,6 +128,22 @@ pub enum AuthError {
         /// Account alias.
         alias: String,
     },
+    /// The account to act on is not stored.
+    #[error("account '{alias}' not found for provider '{provider}'; see `local-proxy account`")]
+    UnknownAccount {
+        /// Provider name.
+        provider: String,
+        /// Account alias.
+        alias: String,
+    },
+    /// The selected account cannot be removed while others remain.
+    #[error("account '{alias}' is the selected account of provider '{provider}'; select another with `local-proxy account {provider}/<alias>` before removing it")]
+    SelectedAccount {
+        /// Provider name.
+        provider: String,
+        /// Account alias.
+        alias: String,
+    },
     /// The platform has no supported OS vault integration.
     #[error("an OS credential vault is required on this platform")]
     UnsupportedPlatform,
@@ -272,6 +288,10 @@ fn open_db(path: &Path) -> Result<Connection, AuthError> {
            alias TEXT NOT NULL,
            credential TEXT NOT NULL,
            PRIMARY KEY(provider, alias)
+         );
+         CREATE TABLE IF NOT EXISTS selected (
+           provider TEXT PRIMARY KEY,
+           alias TEXT NOT NULL
          );",
     )
     .map_err(AuthError::Database)?;
@@ -359,18 +379,6 @@ fn with_db<T>(f: impl FnOnce(&mut Connection) -> Result<T, AuthError>) -> Result
 // ponytail: one global lock, fine for a handful of rare store calls.
 static DB: std::sync::Mutex<Option<(PathBuf, Connection)>> = std::sync::Mutex::new(None);
 
-/// SQLite's `data_version`: changes only when another connection (another
-/// process) commits, never for this process's own writes.
-///
-/// # Errors
-/// Returns an error if the vault or database is unavailable.
-pub fn data_version() -> Result<i64, AuthError> {
-    with_db(|conn| {
-        conn.query_row("PRAGMA data_version", [], |row| row.get(0))
-            .map_err(AuthError::Database)
-    })
-}
-
 /// Read every saved account and its credential.
 ///
 /// # Errors
@@ -425,7 +433,10 @@ fn insert_account(provider: &str, alias: &str, entry: &AuthEntry) -> Result<(), 
     validate_alias(alias)?;
     let value = serde_json::to_string(entry).map_err(AuthError::Format)?;
     with_db(|conn| {
-        let inserted = conn
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        let inserted = tx
             .execute(
                 "INSERT OR IGNORE INTO accounts(provider, alias, credential) VALUES(?1, ?2, ?3)",
                 params![provider, alias, value],
@@ -437,8 +448,175 @@ fn insert_account(provider: &str, alias: &str, entry: &AuthEntry) -> Result<(), 
                 alias: alias.to_string(),
             });
         }
-        Ok(())
+        // A provider's first account becomes its selection.
+        tx.execute(
+            "INSERT OR IGNORE INTO selected(provider, alias) VALUES(?1, ?2)",
+            params![provider, alias],
+        )
+        .map_err(AuthError::Database)?;
+        bump_revision(&tx)?;
+        tx.commit().map_err(AuthError::Database)
     })
+}
+
+/// Count a change to the set of stored accounts in `user_version`. Running
+/// proxies rebuild their clients only when it moves: `data_version` also
+/// moves for token refreshes and selection writes, which need no rebuild.
+fn bump_revision(conn: &Connection) -> Result<(), AuthError> {
+    let revision: i64 = conn
+        .query_row("PRAGMA user_version", [], |row| row.get(0))
+        .map_err(AuthError::Database)?;
+    // An integer read back from SQLite, never user input.
+    conn.execute_batch(&format!(
+        "PRAGMA user_version = {}",
+        revision.wrapping_add(1)
+    ))
+    .map_err(AuthError::Database)
+}
+
+/// The store's `(data_version, account revision)`. `data_version` changes
+/// whenever another connection commits (cheap to poll); the revision only when
+/// an account was added or removed.
+///
+/// # Errors
+/// Returns an error if the vault or database is unavailable.
+pub fn revision() -> Result<(i64, i64), AuthError> {
+    with_db(|conn| {
+        let version = conn
+            .query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(AuthError::Database)?;
+        let revision = conn
+            .query_row("PRAGMA user_version", [], |row| row.get(0))
+            .map_err(AuthError::Database)?;
+        Ok((version, revision))
+    })
+}
+
+/// The alias a provider without a selection gets: the legacy config choice if
+/// it is still stored, then the only account, then `default`, then the first
+/// by name.
+fn pick_selection(aliases: &[String], legacy: Option<&str>) -> Option<String> {
+    if let Some(legacy) = legacy.filter(|l| aliases.iter().any(|a| a == l)) {
+        return Some(legacy.to_string());
+    }
+    if aliases.len() > 1 && aliases.iter().any(|a| a == "default") {
+        return Some("default".to_string());
+    }
+    aliases.iter().min().cloned()
+}
+
+/// Give every provider with stored accounts a selection, seeding it from the
+/// legacy `defaults.active_accounts` (`provider -> alias`) where possible.
+/// Providers that already have one are left alone.
+///
+/// # Errors
+/// Returns an error if the vault or database is unavailable.
+#[allow(clippy::implicit_hasher)]
+pub fn seed_selections(legacy: &HashMap<String, String>) -> Result<(), AuthError> {
+    with_db(|conn| {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        let mut unselected: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT provider, alias FROM accounts
+                     WHERE provider NOT IN (SELECT provider FROM selected)",
+                )
+                .map_err(AuthError::Database)?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))
+                .map_err(AuthError::Database)?;
+            for row in rows {
+                let (provider, alias) = row.map_err(AuthError::Database)?;
+                unselected.entry(provider).or_default().push(alias);
+            }
+        }
+        for (provider, aliases) in &unselected {
+            let Some(alias) = pick_selection(aliases, legacy.get(provider).map(String::as_str))
+            else {
+                continue;
+            };
+            tx.execute(
+                "INSERT INTO selected(provider, alias) VALUES(?1, ?2)",
+                params![provider, alias],
+            )
+            .map_err(AuthError::Database)?;
+            tracing::info!(target: crate::LOG_TARGET, %provider, %alias, "selected account");
+        }
+        tx.commit().map_err(AuthError::Database)
+    })
+}
+
+/// The selected alias of every provider that has stored accounts.
+///
+/// # Errors
+/// Returns an error if the vault or database is unavailable.
+pub fn selections() -> Result<HashMap<String, String>, AuthError> {
+    with_db(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT provider, alias FROM selected")
+            .map_err(AuthError::Database)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(AuthError::Database)?;
+        rows.collect::<Result<_, _>>().map_err(AuthError::Database)
+    })
+}
+
+/// The selected alias of `provider`, if it has stored accounts.
+///
+/// # Errors
+/// Returns an error if the vault or database is unavailable.
+pub fn selected_for(provider: &str) -> Result<Option<String>, AuthError> {
+    with_db(|conn| {
+        conn.query_row(
+            "SELECT alias FROM selected WHERE provider=?1",
+            [provider],
+            |row| row.get(0),
+        )
+        .optional()
+        .map_err(AuthError::Database)
+    })
+}
+
+/// Make `alias` the selected account of `provider`.
+///
+/// # Errors
+/// Returns [`AuthError::UnknownAccount`] if it is not stored, or a storage error.
+pub fn select_account(provider: &str, alias: &str) -> Result<(), AuthError> {
+    with_db(|conn| {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        select_in(&tx, provider, alias)?;
+        tx.commit().map_err(AuthError::Database)
+    })
+}
+
+fn select_in(conn: &Connection, provider: &str, alias: &str) -> Result<(), AuthError> {
+    let stored = conn
+        .query_row(
+            "SELECT 1 FROM accounts WHERE provider=?1 AND alias=?2",
+            params![provider, alias],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(AuthError::Database)?;
+    if stored.is_none() {
+        return Err(AuthError::UnknownAccount {
+            provider: provider.to_string(),
+            alias: alias.to_string(),
+        });
+    }
+    conn.execute(
+        "INSERT INTO selected(provider, alias) VALUES(?1, ?2)
+         ON CONFLICT(provider) DO UPDATE SET alias=excluded.alias",
+        params![provider, alias],
+    )
+    .map_err(AuthError::Database)?;
+    Ok(())
 }
 
 /// Store refreshed OAuth tokens unless another process refreshed first.
@@ -486,18 +664,55 @@ pub fn swap_oauth_for(
     })
 }
 
-/// Remove one provider/account pair, returning whether it existed.
+/// Remove one provider/account pair, returning whether it existed. The
+/// selected account can only go when it is the provider's last one, so a
+/// provider with accounts always has a selection.
 ///
 /// # Errors
-/// Returns an error if the vault or database is unavailable.
+/// Returns [`AuthError::SelectedAccount`] for a selected account that still
+/// has siblings, or a storage error.
 pub fn remove_account(provider: &str, alias: &str) -> Result<bool, AuthError> {
     with_db(|conn| {
-        conn.execute(
-            "DELETE FROM accounts WHERE provider=?1 AND alias=?2",
-            params![provider, alias],
-        )
-        .map(|count| count != 0)
-        .map_err(AuthError::Database)
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        let siblings: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM accounts WHERE provider=?1 AND alias<>?2",
+                params![provider, alias],
+                |row| row.get(0),
+            )
+            .map_err(AuthError::Database)?;
+        let selected: Option<String> = tx
+            .query_row(
+                "SELECT alias FROM selected WHERE provider=?1",
+                [provider],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(AuthError::Database)?;
+        if selected.as_deref() == Some(alias) && siblings > 0 {
+            return Err(AuthError::SelectedAccount {
+                provider: provider.to_string(),
+                alias: alias.to_string(),
+            });
+        }
+        let removed = tx
+            .execute(
+                "DELETE FROM accounts WHERE provider=?1 AND alias=?2",
+                params![provider, alias],
+            )
+            .map_err(AuthError::Database)?;
+        if removed == 0 {
+            return Ok(false);
+        }
+        if siblings == 0 {
+            tx.execute("DELETE FROM selected WHERE provider=?1", [provider])
+                .map_err(AuthError::Database)?;
+        }
+        bump_revision(&tx)?;
+        tx.commit().map_err(AuthError::Database)?;
+        Ok(true)
     })
 }
 
@@ -527,7 +742,7 @@ mod tests {
 
     #[test]
     fn aliases_reject_header_unsafe_values() {
-        for name in ["", "a b", "a/b", "é", "\na", "a:b"] {
+        for name in ["", "a b", "a/b", "Ã©", "\na", "a:b"] {
             assert!(validate_alias(name).is_err(), "{name:?}");
         }
         for name in ["default", "work-2", "a.b_c"] {
@@ -561,9 +776,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         std::env::set_var("LOCAL_PROXY_CONFIG_DIR", &dir);
 
-        let start = data_version().unwrap();
+        let start = revision().unwrap().0;
         set_key_for("p", "own", "k").unwrap();
-        assert_eq!(data_version().unwrap(), start, "own writes are not changes");
+        assert_eq!(revision().unwrap().0, start, "own writes are not changes");
 
         // A second connection stands in for the CLI process.
         let other = open_db(&auth_db()).unwrap();
@@ -574,7 +789,7 @@ mod tests {
             )
             .unwrap();
         drop(other);
-        assert_ne!(data_version().unwrap(), start);
+        assert_ne!(revision().unwrap().0, start);
         assert!(read_auth().unwrap()["p"].contains_key("cli"));
 
         std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
@@ -609,6 +824,57 @@ mod tests {
         assert_eq!(adopted, Some(tokens("r1")));
         let stored = account_for("p", "a").unwrap().unwrap();
         assert_eq!(stored.oauth().unwrap().refresh, "r1");
+
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn selection_seed_prefers_legacy_then_only_then_default_then_name() {
+        let v = |names: &[&str]| names.iter().map(ToString::to_string).collect::<Vec<_>>();
+        let pick = |names: &[&str], legacy| pick_selection(&v(names), legacy);
+        assert_eq!(pick(&["b", "a"], Some("b")).as_deref(), Some("b"));
+        assert_eq!(pick(&["b", "a"], Some("gone")).as_deref(), Some("a"));
+        assert_eq!(pick(&["work"], None).as_deref(), Some("work"));
+        assert_eq!(
+            pick(&["z", "default", "a"], None).as_deref(),
+            Some("default")
+        );
+        assert_eq!(pick(&["z", "a"], None).as_deref(), Some("a"));
+    }
+
+    #[test]
+    fn selected_account_is_kept_until_it_is_the_last() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "local-proxy-auth-selected-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", &dir);
+
+        // The first account is selected; a second one leaves it alone.
+        set_key_for("p", "work", "k1").unwrap();
+        set_key_for("p", "personal", "k2").unwrap();
+        assert_eq!(selected_for("p").unwrap().as_deref(), Some("work"));
+
+        assert!(matches!(
+            remove_account("p", "work"),
+            Err(AuthError::SelectedAccount { .. })
+        ));
+        assert!(matches!(
+            select_account("p", "ghost"),
+            Err(AuthError::UnknownAccount { .. })
+        ));
+        select_account("p", "personal").unwrap();
+        assert!(remove_account("p", "work").unwrap());
+        // The last account can go, and takes the selection with it.
+        assert!(remove_account("p", "personal").unwrap());
+        assert_eq!(selected_for("p").unwrap(), None);
 
         std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

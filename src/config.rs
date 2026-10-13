@@ -231,9 +231,9 @@ pub struct Defaults {
     /// (`output_config.effort`), ignoring the harness's. Set via
     /// `local-proxy effort`; persists across restarts.
     pub active_effort: Option<String>,
-    /// Active account alias per provider (`provider -> alias`), used when a
-    /// request carries no `X-Local-Proxy-Account` header. Set via
-    /// `local-proxy account <provider>/<alias>`; persists across restarts.
+    /// Obsolete per-provider account selection (`provider -> alias`). Only
+    /// read to seed the account store's selection for providers that have
+    /// none yet; `local-proxy account` writes the store, never this field.
     #[serde(skip_serializing_if = "HashMap::is_empty")]
     pub active_accounts: HashMap<String, String>,
 }

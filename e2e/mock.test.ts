@@ -719,14 +719,14 @@ describe("e2e: multiple accounts per provider", () => {
 
   afterAll(() => stopScenario({ mock, proxy }));
 
-  test("a request without an account header fails when the provider has several accounts", async () => {
+  test("a request without an account header uses the first connected account", async () => {
     const r = await postJson(proxy.base, "/v1/messages", {
       model: "claude-via-responses",
       max_tokens: 10,
       messages: [{ role: "user", content: "hi" }],
     });
-    expect(r.status).toBe(400);
-    expect(await readBody(r)).toContain("X-Local-Proxy-Account");
+    expect(r.status).toBe(200);
+    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
   });
 
   test("an unknown alias is rejected", async () => {
@@ -768,32 +768,27 @@ describe("e2e: multiple accounts per provider", () => {
     expect(res.output).toContain("work (api)");
   });
 
-  test("selecting an account makes header-less requests use it (hot reload)", async () => {
-    const res = await runCli(["--config", cfgPath, "account", "mock_responses/work"], env);
+  test("selecting an account makes header-less requests use it", async () => {
+    const res = await runCli(["--config", cfgPath, "account", "mock_responses/personal"], env);
     expect(res.exit).toBe(0);
-    expect(res.output).toContain("work");
+    expect(res.output).toContain("personal");
 
-    // The running proxy applies the selection via hot reload; poll briefly.
-    let status = 0;
-    for (let i = 0; i < 30; i++) {
-      const r = await postJson(proxy.base, "/v1/messages", {
-        model: "claude-via-responses",
-        max_tokens: 10,
-        messages: [{ role: "user", content: "hi" }],
-      });
-      status = r.status;
-      if (status === 200) break;
-      await Bun.sleep(100);
-    }
-    expect(status).toBe(200);
-    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
+    // The selection lives in the store and is read per request.
+    const r = await postJson(proxy.base, "/v1/messages", {
+      model: "claude-via-responses",
+      max_tokens: 10,
+      messages: [{ role: "user", content: "hi" }],
+    });
+    expect(r.status).toBe(200);
+    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-personal");
   });
 
   test("the account listing marks the active alias", async () => {
     const res = await runCli(["--config", cfgPath, "account"], env);
     expect(res.exit).toBe(0);
-    expect(res.output).toContain("mock_responses/work (api) [ativa]");
-    expect(res.output).toContain("mock_responses/personal (api)");
+    expect(res.output).toContain("mock_responses/personal (api) [ativa]");
+    expect(res.output).toContain("mock_responses/work (api)");
+    expect(res.output).not.toContain("work (api) [ativa]");
   });
 
   test("a header still overrides the selected account", async () => {
@@ -801,45 +796,26 @@ describe("e2e: multiple accounts per provider", () => {
       proxy.base,
       "/v1/messages",
       { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "hi" }] },
-      { "x-local-proxy-account": "personal" },
+      { "x-local-proxy-account": "work" },
     );
     expect(r.status).toBe(200);
-    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-personal");
+    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
   });
 
-  test("switching the selection and clearing it take effect", async () => {
-    let res = await runCli(["--config", cfgPath, "account", "mock_responses/personal"], env);
-    expect(res.exit).toBe(0);
-    let auth = "";
-    for (let i = 0; i < 30; i++) {
-      const r = await postJson(proxy.base, "/v1/messages", {
-        model: "claude-via-responses",
-        max_tokens: 10,
-        messages: [{ role: "user", content: "hi" }],
-      });
-      if (r.status === 200) {
-        auth = mock.lastResponsesHeaders().authorization ?? "";
-        if (auth === "Bearer key-personal") break;
-      }
-      await Bun.sleep(100);
-    }
-    expect(auth).toBe("Bearer key-personal");
+  test("the selected account cannot be disconnected while others remain", async () => {
+    const res = await runCli(
+      ["--config", cfgPath, "disconnect", "mock_responses", "--account", "personal"],
+      env,
+    );
+    expect(res.exit).not.toBe(0);
+    expect(res.output).toContain("ativa");
+    const listing = await runCli(["--config", cfgPath, "account"], env);
+    expect(listing.output).toContain("mock_responses/personal (api) [ativa]");
+  });
 
-    res = await runCli(["--config", cfgPath, "account", "clear", "mock_responses"], env);
-    expect(res.exit).toBe(0);
-    // Cleared selection: header-less requests are ambiguous again.
-    let status = 0;
-    for (let i = 0; i < 30; i++) {
-      const r = await postJson(proxy.base, "/v1/messages", {
-        model: "claude-via-responses",
-        max_tokens: 10,
-        messages: [{ role: "user", content: "hi" }],
-      });
-      status = r.status;
-      if (status === 400) break;
-      await Bun.sleep(100);
-    }
-    expect(status).toBe(400);
+  test("account clear no longer exists", async () => {
+    const res = await runCli(["--config", cfgPath, "account", "clear"], env);
+    expect(res.exit).not.toBe(0);
   });
 
   test("$proxy account pins the account for the session and updates the default", async () => {
@@ -880,18 +856,6 @@ describe("e2e: multiple accounts per provider", () => {
     const stillA = await postJson(proxy.base, "/v1/messages", chat, sessionA);
     expect(stillA.status).toBe(200);
     expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
-
-    // Clearing drops the pin: session A falls back to the persisted default.
-    const clear = await postJson(
-      proxy.base,
-      "/v1/messages",
-      { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "$proxy account clear mock_responses" }] },
-      sessionA,
-    );
-    expect(clear.status).toBe(200);
-    const fallback = await postJson(proxy.base, "/v1/messages", chat, sessionA);
-    expect(fallback.status).toBe(200);
-    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-personal");
   });
 });
 
