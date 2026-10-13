@@ -213,7 +213,14 @@ pub(super) async fn models(State(app): State<AppState>, headers: HeaderMap) -> R
     if headers.contains_key("anthropic-version") {
         let data: Vec<Value> = models
             .iter()
-            .map(|m| json!({"type": "model", "id": m}))
+            .map(|m| {
+                let id = if proxy::passes_gateway_filter(m) {
+                    m.clone()
+                } else {
+                    format!("{}{m}", proxy::GATEWAY_ID_MARKER)
+                };
+                json!({"type": "model", "id": id, "display_name": m})
+            })
             .collect();
         let first = models.first();
         let last = models.last();
