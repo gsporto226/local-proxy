@@ -161,44 +161,78 @@ pub fn validate_alias(alias: &str) -> Result<(), AuthError> {
     Ok(())
 }
 
-fn vault_entry(path: &Path) -> Result<keyring::Entry, AuthError> {
-    let absolute = if path.is_absolute() {
-        path.to_path_buf()
-    } else {
-        std::env::current_dir()
-            .map_err(|source| AuthError::Read {
-                path: path.display().to_string(),
-                source,
-            })?
-            .join(path)
+const VAULT_SERVICE: &str = "local-proxy/accounts-db";
+
+fn absolute(path: &Path) -> Result<PathBuf, AuthError> {
+    if path.is_absolute() {
+        return Ok(path.to_path_buf());
+    }
+    std::env::current_dir()
+        .map(|cwd| cwd.join(path))
+        .map_err(|source| AuthError::Read {
+            path: path.display().to_string(),
+            source,
+        })
+}
+
+fn path_hash(path: &Path) -> String {
+    format!("{:x}", Sha256::digest(path.to_string_lossy().as_bytes()))
+}
+
+/// Vault user name for the database at `path`. The real store has a fixed
+/// name, so moving the config dir keeps its key; an overridden dir
+/// (`LOCAL_PROXY_CONFIG_DIR`, used by every test) is keyed by its
+/// canonical path so isolated stores never share a key with the real one.
+fn vault_identity(path: &Path, overridden: bool) -> Result<String, AuthError> {
+    if !overridden {
+        return Ok("default".to_string());
+    }
+    let path = absolute(path)?;
+    // The parent exists (open_db creates it); the file itself may not yet.
+    let canonical = match (path.parent().map(std::fs::canonicalize), path.file_name()) {
+        (Some(Ok(dir)), Some(name)) => dir.join(name),
+        _ => path,
     };
-    let hash = Sha256::digest(absolute.to_string_lossy().as_bytes());
-    let identity = format!("{hash:x}");
-    keyring::Entry::new("local-proxy/accounts-db", &identity).map_err(AuthError::Vault)
+    Ok(path_hash(&canonical))
 }
 
 fn db_key(path: &Path) -> Result<String, AuthError> {
-    let entry = vault_entry(path)?;
+    let overridden = std::env::var_os("LOCAL_PROXY_CONFIG_DIR").is_some_and(|v| !v.is_empty());
+    let entry = keyring::Entry::new(VAULT_SERVICE, &vault_identity(path, overridden)?)
+        .map_err(AuthError::Vault)?;
     match entry.get_password() {
-        Ok(key) => Ok(key),
-        Err(keyring::Error::NoEntry) if path.exists() => Err(AuthError::MissingKey),
-        Err(keyring::Error::NoEntry) => {
-            let mut bytes = [0_u8; 32];
-            getrandom::getrandom(&mut bytes).map_err(|source| AuthError::Read {
-                path: path.display().to_string(),
-                source: io::Error::other(source.to_string()),
-            })?;
-            let key = bytes
-                .iter()
-                .fold(String::with_capacity(64), |mut key, byte| {
-                    write!(key, "{byte:02x}").expect("writing to String cannot fail");
-                    key
-                });
-            entry.set_password(&key).map_err(AuthError::Vault)?;
-            Ok(key)
-        }
-        Err(source) => Err(AuthError::Vault(source)),
+        Ok(key) => return Ok(key),
+        Err(keyring::Error::NoEntry) => {}
+        Err(source) => return Err(AuthError::Vault(source)),
     }
+    // Keys created before the fixed name were stored under the hash of the
+    // plain absolute path. Copy, never move: losing the key loses the store.
+    let legacy = keyring::Entry::new(VAULT_SERVICE, &path_hash(&absolute(path)?))
+        .map_err(AuthError::Vault)?;
+    match legacy.get_password() {
+        Ok(key) => {
+            entry.set_password(&key).map_err(AuthError::Vault)?;
+            return Ok(key);
+        }
+        Err(keyring::Error::NoEntry) => {}
+        Err(source) => return Err(AuthError::Vault(source)),
+    }
+    if path.exists() {
+        return Err(AuthError::MissingKey);
+    }
+    let mut bytes = [0_u8; 32];
+    getrandom::getrandom(&mut bytes).map_err(|source| AuthError::Read {
+        path: path.display().to_string(),
+        source: io::Error::other(source.to_string()),
+    })?;
+    let key = bytes
+        .iter()
+        .fold(String::with_capacity(64), |mut key, byte| {
+            write!(key, "{byte:02x}").expect("writing to String cannot fail");
+            key
+        });
+    entry.set_password(&key).map_err(AuthError::Vault)?;
+    Ok(key)
 }
 
 fn open_db(path: &Path) -> Result<Connection, AuthError> {
@@ -449,6 +483,18 @@ mod tests {
         for name in ["default", "work-2", "a.b_c"] {
             assert!(validate_alias(name).is_ok(), "{name:?}");
         }
+    }
+
+    #[test]
+    fn vault_identity_is_fixed_for_the_real_store_only() {
+        let dir = std::env::temp_dir();
+        let db = dir.join("accounts.db");
+        assert_eq!(vault_identity(&db, false).unwrap(), "default");
+        let isolated = vault_identity(&db, true).unwrap();
+        assert_eq!(isolated.len(), 64, "overrides are keyed by path hash");
+        // Equivalent spellings of the same dir share one key.
+        let dotted = dir.join(".").join("accounts.db");
+        assert_eq!(vault_identity(&dotted, true).unwrap(), isolated);
     }
 
     #[test]
