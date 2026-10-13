@@ -818,44 +818,56 @@ describe("e2e: multiple accounts per provider", () => {
     expect(res.exit).not.toBe(0);
   });
 
-  test("$proxy account pins the account for the session and updates the default", async () => {
-    const sessionA = { "x-claude-code-session-id": "sess-A" };
-    const sessionB = { "x-claude-code-session-id": "sess-B" };
+  test("each session snapshots its account; $proxy account moves only its own", async () => {
+    const session = (id: string) => ({ "x-claude-code-session-id": id });
     const chat = { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "hi" }] };
+    const switchTo = async (id: string, alias: string) => {
+      const r = await postJson(
+        proxy.base,
+        "/v1/messages",
+        { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: `$proxy account mock_responses/${alias}` }] },
+        session(id),
+      );
+      expect(r.status).toBe(200);
+      expect(await readBody(r)).toContain(alias);
+    };
+    const authFor = async (id: string, headers: Record<string, string> = {}) => {
+      const r = await postJson(proxy.base, "/v1/messages", chat, { ...session(id), ...headers });
+      expect(r.status).toBe(200);
+      return mock.lastResponsesHeaders().authorization;
+    };
 
-    // Session A switches through the proxy itself.
-    const cmd = await postJson(
-      proxy.base,
-      "/v1/messages",
-      { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "$proxy account mock_responses/work" }] },
-      sessionA,
+    // Session A switches to work; session B then switches to personal, which
+    // also becomes the selection. A keeps its own snapshot.
+    await switchTo("sess-A", "work");
+    expect(await authFor("sess-A")).toBe("Bearer key-work");
+    await switchTo("sess-B", "personal");
+    expect(await authFor("sess-B")).toBe("Bearer key-personal");
+    expect(await authFor("sess-A")).toBe("Bearer key-work");
+
+    // A new session starts on the current selection.
+    expect(await authFor("sess-C")).toBe("Bearer key-personal");
+
+    // The header overrides one request without touching the snapshot.
+    expect(await authFor("sess-A", { "x-local-proxy-account": "personal" })).toBe("Bearer key-personal");
+    expect(await authFor("sess-A")).toBe("Bearer key-work");
+
+    // Disconnecting A's account re-snapshots A from the selection.
+    const res = await runCli(
+      ["--config", cfgPath, "disconnect", "mock_responses", "--account", "work"],
+      env,
     );
-    expect(cmd.status).toBe(200);
-    expect(await readBody(cmd)).toContain("work");
-
-    // Header-less requests from session A use the pinned account.
-    const pinned = await postJson(proxy.base, "/v1/messages", chat, sessionA);
-    expect(pinned.status).toBe(200);
-    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
-
-    // Move the persisted default from the CLI; session B (no pin) follows it.
-    const cli = await runCli(["--config", cfgPath, "account", "mock_responses/personal"], env);
-    expect(cli.exit).toBe(0);
-    let authB = "";
+    expect(res.exit).toBe(0);
+    let auth: string | undefined = "";
     for (let i = 0; i < 30; i++) {
-      const r = await postJson(proxy.base, "/v1/messages", chat, sessionB);
+      const r = await postJson(proxy.base, "/v1/messages", chat, session("sess-A"));
       if (r.status === 200) {
-        authB = mock.lastResponsesHeaders().authorization ?? "";
-        if (authB === "Bearer key-personal") break;
+        auth = mock.lastResponsesHeaders().authorization;
+        if (auth === "Bearer key-personal") break;
       }
       await Bun.sleep(100);
     }
-    expect(authB).toBe("Bearer key-personal");
-
-    // Session A still uses its own pin, not the new default.
-    const stillA = await postJson(proxy.base, "/v1/messages", chat, sessionA);
-    expect(stillA.status).toBe(200);
-    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
+    expect(auth).toBe("Bearer key-personal");
   });
 });
 

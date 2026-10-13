@@ -1318,8 +1318,11 @@ fn account_error(e: crate::auth::AuthError) -> CliError {
     }
 }
 
-/// Compute the message for `local-proxy account`: list accounts or select one
-/// (`provider/alias`). A provider with accounts always has a selection.
+/// Compute the message for `local-proxy account`: list or select an account.
+///
+/// A target is `provider/alias`; a provider with accounts always has a
+/// selection. Selecting from inside a session (`session_id` non-empty,
+/// `$proxy account`) also moves that session's snapshot.
 ///
 /// Running proxies read the selection from the account store per request.
 ///
@@ -1328,12 +1331,17 @@ fn account_error(e: crate::auth::AuthError) -> CliError {
 /// Returns a [`CliError`] if the target is malformed, the account does not
 /// exist, or the store cannot be written.
 #[allow(clippy::result_large_err)]
-pub fn account_result(config_path: &Path, args: &[String]) -> Result<String, CliError> {
+pub fn account_result(
+    config_path: &Path,
+    session_id: &str,
+    args: &[String],
+) -> Result<String, CliError> {
     match args {
         [] => list_accounts(config_path),
         [target] => {
             let (provider, alias) = account_target(target)?;
-            crate::auth::select_account(provider, alias).map_err(account_error)?;
+            crate::auth::select_for_session(session_id, provider, alias, crate::oauth::now_ms())
+                .map_err(account_error)?;
             Ok(format!("conta ativa do provider '{provider}': {alias}"))
         }
         _ => Err(CliError::Connect {
@@ -1349,7 +1357,7 @@ pub fn account_result(config_path: &Path, args: &[String]) -> Result<String, Cli
 /// Returns an error if the target is malformed or the config cannot be written.
 #[allow(clippy::needless_pass_by_value)]
 pub fn account(config_path: PathBuf, args: Vec<String>) -> miette::Result<()> {
-    let out = account_result(&config_path, &args).map_err(miette::Report::from)?;
+    let out = account_result(&config_path, "", &args).map_err(miette::Report::from)?;
     println!("{out}");
     Ok(())
 }

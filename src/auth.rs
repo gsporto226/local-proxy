@@ -292,6 +292,13 @@ fn open_db(path: &Path) -> Result<Connection, AuthError> {
          CREATE TABLE IF NOT EXISTS selected (
            provider TEXT PRIMARY KEY,
            alias TEXT NOT NULL
+         );
+         CREATE TABLE IF NOT EXISTS session_accounts (
+           session_id TEXT NOT NULL,
+           provider TEXT NOT NULL,
+           alias TEXT NOT NULL,
+           last_used INTEGER NOT NULL,
+           PRIMARY KEY(session_id, provider)
          );",
     )
     .map_err(AuthError::Database)?;
@@ -376,7 +383,8 @@ fn with_db<T>(f: impl FnOnce(&mut Connection) -> Result<T, AuthError>) -> Result
 
 /// The process-wide connection, opened once (the key derivation is costly)
 /// and keyed by its path.
-// ponytail: one global lock, fine for a handful of rare store calls.
+// ponytail: one global lock; requests do one short snapshot lookup under it,
+// fine for a local proxy. A connection pool if contention ever shows up.
 static DB: std::sync::Mutex<Option<(PathBuf, Connection)>> = std::sync::Mutex::new(None);
 
 /// Read every saved account and its credential.
@@ -592,6 +600,118 @@ pub fn select_account(provider: &str, alias: &str) -> Result<(), AuthError> {
             .map_err(AuthError::Database)?;
         select_in(&tx, provider, alias)?;
         tx.commit().map_err(AuthError::Database)
+    })
+}
+
+/// Make `alias` the selected account of `provider` and, for a non-empty
+/// `session_id`, that session's snapshot, in one transaction.
+///
+/// # Errors
+/// Returns [`AuthError::UnknownAccount`] if it is not stored, or a storage error.
+pub fn select_for_session(
+    session_id: &str,
+    provider: &str,
+    alias: &str,
+    now_ms: i64,
+) -> Result<(), AuthError> {
+    with_db(|conn| {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        select_in(&tx, provider, alias)?;
+        if !session_id.is_empty() {
+            snapshot_in(&tx, session_id, provider, alias, now_ms)?;
+        }
+        tx.commit().map_err(AuthError::Database)
+    })
+}
+
+fn snapshot_in(
+    conn: &Connection,
+    session_id: &str,
+    provider: &str,
+    alias: &str,
+    now_ms: i64,
+) -> Result<(), AuthError> {
+    conn.execute(
+        "INSERT INTO session_accounts(session_id, provider, alias, last_used)
+         VALUES(?1, ?2, ?3, ?4)
+         ON CONFLICT(session_id, provider)
+         DO UPDATE SET alias=excluded.alias, last_used=excluded.last_used",
+        params![session_id, provider, alias, now_ms],
+    )
+    .map_err(AuthError::Database)?;
+    Ok(())
+}
+
+/// The account `session_id` uses for `provider`, snapshotted on first use.
+///
+/// The snapshot is taken from the provider's selection on the session's first
+/// request and kept even when the selection later changes. A snapshot whose
+/// account was disconnected is retaken from the current selection. Without a
+/// session id, the live selection.
+///
+/// # Errors
+/// Returns an error if the vault or database is unavailable.
+pub fn session_account(
+    session_id: &str,
+    provider: &str,
+    now_ms: i64,
+) -> Result<Option<String>, AuthError> {
+    if session_id.is_empty() {
+        return selected_for(provider);
+    }
+    with_db(|conn| {
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        // The join drops snapshots of disconnected accounts.
+        let snapshot: Option<(String, i64)> = tx
+            .query_row(
+                "SELECT s.alias, s.last_used FROM session_accounts s
+                 JOIN accounts a ON a.provider = s.provider AND a.alias = s.alias
+                 WHERE s.session_id = ?1 AND s.provider = ?2",
+                params![session_id, provider],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .map_err(AuthError::Database)?;
+        let alias = if let Some((alias, last_used)) = snapshot {
+            // Only touched to age out old sessions; a minute is plenty.
+            if now_ms - last_used > 60_000 {
+                snapshot_in(&tx, session_id, provider, &alias, now_ms)?;
+            }
+            Some(alias)
+        } else {
+            let selected: Option<String> = tx
+                .query_row(
+                    "SELECT alias FROM selected WHERE provider=?1",
+                    [provider],
+                    |row| row.get(0),
+                )
+                .optional()
+                .map_err(AuthError::Database)?;
+            if let Some(alias) = &selected {
+                snapshot_in(&tx, session_id, provider, alias, now_ms)?;
+            }
+            selected
+        };
+        tx.commit().map_err(AuthError::Database)?;
+        Ok(alias)
+    })
+}
+
+/// Delete session snapshots unused since `cutoff_ms`, returning how many.
+///
+/// # Errors
+/// Returns an error if the vault or database is unavailable.
+pub fn prune_sessions(cutoff_ms: i64) -> Result<usize, AuthError> {
+    with_db(|conn| {
+        conn.execute(
+            "DELETE FROM session_accounts WHERE last_used < ?1",
+            [cutoff_ms],
+        )
+        .map_err(AuthError::Database)
     })
 }
 
@@ -875,6 +995,51 @@ mod tests {
         // The last account can go, and takes the selection with it.
         assert!(remove_account("p", "personal").unwrap());
         assert_eq!(selected_for("p").unwrap(), None);
+
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn session_snapshot_survives_selection_changes_but_not_disconnects() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "local-proxy-auth-session-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", &dir);
+        set_key_for("p", "work", "k1").unwrap();
+        set_key_for("p", "personal", "k2").unwrap();
+
+        assert_eq!(
+            session_account("a", "p", 1).unwrap().as_deref(),
+            Some("work")
+        );
+        select_account("p", "personal").unwrap();
+        assert_eq!(
+            session_account("a", "p", 2).unwrap().as_deref(),
+            Some("work")
+        );
+        assert_eq!(
+            session_account("", "p", 2).unwrap().as_deref(),
+            Some("personal"),
+            "no session id: live selection"
+        );
+
+        // Disconnecting the snapshot's account retakes it from the selection.
+        remove_account("p", "work").unwrap();
+        assert_eq!(
+            session_account("a", "p", 3).unwrap().as_deref(),
+            Some("personal")
+        );
+
+        // Idle snapshots are pruned; a pruned session starts over.
+        assert_eq!(prune_sessions(100_000).unwrap(), 1);
 
         std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

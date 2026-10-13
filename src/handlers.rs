@@ -50,11 +50,6 @@ pub struct RuntimeState {
 #[derive(Clone)]
 pub struct AppState {
     inner: Arc<RwLock<RuntimeState>>,
-    /// Per-session account pins (`session id -> provider -> alias`), set by
-    /// `$proxy account` inside a session. In-memory only: a restart drops the
-    /// pins and every session falls back to the persisted last-selected
-    /// default.
-    sessions: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
     /// The account store's `data_version` the clients were built from; `None`
     /// until [`AppState::track_accounts`] (a live server) turns tracking on.
     accounts_version: Arc<std::sync::Mutex<Option<(i64, i64)>>>,
@@ -66,36 +61,8 @@ impl AppState {
     pub fn new(state: RuntimeState) -> Self {
         Self {
             inner: Arc::new(RwLock::new(state)),
-            sessions: Arc::new(RwLock::new(HashMap::new())),
             accounts_version: Arc::new(std::sync::Mutex::new(None)),
         }
-    }
-
-    /// The account pinned to `session_id` for `provider`, if any.
-    pub async fn session_account(&self, session_id: &str, provider: &str) -> Option<String> {
-        if session_id.is_empty() {
-            return None;
-        }
-        self.sessions
-            .read()
-            .await
-            .get(session_id)
-            .and_then(|accounts| accounts.get(provider))
-            .cloned()
-    }
-
-    /// Pin `alias` as the account of `session_id` for `provider`. A request
-    /// without a session id cannot pin anything (there is no session).
-    pub async fn set_session_account(&self, session_id: &str, provider: &str, alias: &str) {
-        if session_id.is_empty() {
-            return;
-        }
-        self.sessions
-            .write()
-            .await
-            .entry(session_id.to_string())
-            .or_default()
-            .insert(provider.to_string(), alias.to_string());
     }
 
     /// Snapshot the current runtime state (cheap Arc clones), first picking up
@@ -122,6 +89,11 @@ impl AppState {
     /// Start following the account store: the current clients count as
     /// built from its current `(data_version, revision)`.
     pub fn track_accounts(&self) {
+        // Sessions don't announce their end; forget snapshots idle for 30 days.
+        let cutoff = crate::oauth::now_ms() - 30 * 86_400_000;
+        if let Err(e) = crate::auth::prune_sessions(cutoff) {
+            tracing::warn!("failed to prune session account snapshots: {e}");
+        }
         match crate::auth::revision() {
             Ok(version) => self.set_seen_version(Some(version)),
             Err(e) => tracing::warn!("account store change tracking disabled: {e}"),
@@ -767,26 +739,25 @@ fn connected_providers(clients: &HashMap<String, HashMap<String, ProviderClient>
     names
 }
 
-/// The account a request without the header uses: the session's pin, else the
-/// provider's selection. A provider with no stored accounts has neither, and
-/// skips the store.
-async fn chosen_account(
-    app: &AppState,
+/// The account a request without the header uses: the session's snapshot
+/// (taken from the provider's selection on its first request), else the live
+/// selection. A provider with no stored accounts has neither and skips the
+/// store, as does a request that names its account in the header: the header
+/// is per request and never creates or changes a snapshot.
+fn chosen_account(
     state: &RuntimeState,
     session_id: &str,
     provider: &str,
+    header: Option<&str>,
 ) -> Result<Option<String>, ApiError> {
     let has_accounts = state
         .clients
         .get(provider)
         .is_some_and(|accounts| accounts.values().any(ProviderClient::has_key));
-    if !has_accounts {
+    if header.is_some() || !has_accounts {
         return Ok(None);
     }
-    if let Some(alias) = app.session_account(session_id, provider).await {
-        return Ok(Some(alias));
-    }
-    crate::auth::selected_for(provider)
+    crate::auth::session_account(session_id, provider, crate::oauth::now_ms())
         .map_err(|e| ApiError::internal(format!("account store: {e}")))
 }
 
@@ -923,7 +894,7 @@ async fn maybe_exec(
     } else if args.first().map(String::as_str) == Some("effort") {
         Some(handle_effort_exec(app, state, &args).await)
     } else if args.first().map(String::as_str) == Some("account") {
-        Some(handle_account_exec(app, state, session_id, &args).await)
+        Some(handle_account_exec(state, session_id, &args))
     } else if args.first().map(String::as_str) == Some("logs") {
         Some(handle_logs_exec(&args))
     } else {
@@ -1045,32 +1016,22 @@ async fn handle_model_exec(
 }
 
 /// Handle `$proxy account ...` in-process: list accounts, or switch this
-/// session to `provider/alias`.
-///
-/// Selecting pins the account to the session id that made the request and
-/// also makes it the provider's selection (via the CLI logic). Without a
-/// session id the command only changes the selection.
-async fn handle_account_exec(
-    app: &AppState,
+/// session to `provider/alias`. Switching moves the session's snapshot and the
+/// provider's selection together, so sessions started afterwards begin there;
+/// other running sessions keep their own snapshot.
+fn handle_account_exec(
     state: &RuntimeState,
     session_id: &str,
     args: &[String],
 ) -> crate::exec::ExecOutput {
     let rest = args.get(1..).unwrap_or_default();
-    match crate::cli::account_result(&state.config_path, rest) {
-        Ok(msg) => {
-            if let [target] = rest {
-                if let Some((provider, alias)) = target.split_once('/') {
-                    app.set_session_account(session_id, provider, alias).await;
-                }
-            }
-            crate::exec::ExecOutput {
-                stdout: msg,
-                stderr: String::new(),
-                code: 0,
-                timed_out: false,
-            }
-        }
+    match crate::cli::account_result(&state.config_path, session_id, rest) {
+        Ok(msg) => crate::exec::ExecOutput {
+            stdout: msg,
+            stderr: String::new(),
+            code: 0,
+            timed_out: false,
+        },
         Err(e) => crate::exec::ExecOutput {
             stdout: String::new(),
             stderr: e.to_string(),
@@ -1279,7 +1240,7 @@ async fn handle_chat(
             body["output_config"]["effort"] = json!(effort);
         }
     }
-    let chosen = chosen_account(app, state, session_id, &provider.name).await?;
+    let chosen = chosen_account(state, session_id, &provider.name, account_alias)?;
     let client = client_for(state, &provider, account_alias, chosen.as_deref())?;
     let upstream_format = Format::from(provider.format);
     let same = upstream_format == client_format;
@@ -2192,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_exec_account_pins_the_session_and_selects_the_account() {
+    fn maybe_exec_account_moves_the_session_snapshot_and_selection() {
         let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         let stamp = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -2217,6 +2178,9 @@ mod tests {
         });
         block_on(async {
             let state = app.snapshot().await;
+            let session = |id: &str| crate::auth::session_account(id, "mock", 0).unwrap();
+            // Session 2 starts on the first connected account.
+            assert_eq!(session("sess-2").as_deref(), Some("personal"));
 
             let body =
                 json!({"messages": [{"role": "user", "content": "$proxy account mock/work"}]});
@@ -2224,15 +2188,15 @@ mod tests {
                 .await
                 .expect("is $proxy");
             assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-            assert_eq!(
-                app.session_account("sess-1", "mock").await.as_deref(),
-                Some("work")
-            );
-            // The selection is also the store's selection for the provider.
+            assert_eq!(session("sess-1").as_deref(), Some("work"));
+            // The selection moves too, so new sessions start on it, while a
+            // session that already snapshotted keeps its account.
             assert_eq!(
                 crate::auth::selected_for("mock").unwrap().as_deref(),
                 Some("work")
             );
+            assert_eq!(session("sess-3").as_deref(), Some("work"));
+            assert_eq!(session("sess-2").as_deref(), Some("personal"));
         });
 
         std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
