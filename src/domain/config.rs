@@ -219,12 +219,12 @@ impl Default for Exec {
 pub struct Defaults {
     /// Provider used when no route matches.
     pub provider: String,
-    /// Active model that the proxy routes all traffic through, ignoring the
-    /// model requested by the harness. Set via `local-proxy model` or
+    /// Default model, used when the harness sends none (or an unresolvable
+    /// Claude-family default like Claude Code's first request). Set via `local-proxy model` or
     /// `$proxy model`; persists across restarts.
     pub active_model: Option<String>,
-    /// Reasoning effort the proxy forces on every Anthropic request
-    /// (`output_config.effort`), ignoring the harness's. Set via
+    /// Default reasoning effort for Anthropic requests that carry no
+    /// `output_config.effort` of their own. Set via
     /// `local-proxy effort`; persists across restarts.
     pub active_effort: Option<String>,
     /// Active account alias per provider (`provider -> alias`), used when a

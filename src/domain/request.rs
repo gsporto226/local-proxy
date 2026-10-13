@@ -55,7 +55,7 @@ pub fn prepare_responses_request(
 }
 
 /// Prepare a client request for its upstream provider: the upstream model,
-/// the forced effort, format translation, and per-format request hygiene.
+/// the default effort, format translation, and per-format request hygiene.
 ///
 /// # Errors
 ///
@@ -73,8 +73,12 @@ pub fn prepare_upstream_body(
 ) -> Result<Value, TranslateError> {
     body["model"] = json!(upstream_model);
     if client_format == Format::Anthropic {
+        // The harness's `/effort` wins; `active_effort` only fills a request
+        // that carries none.
         if let Some(effort) = active_effort {
-            body["output_config"]["effort"] = json!(effort);
+            if body.pointer("/output_config/effort").is_none() {
+                body["output_config"]["effort"] = json!(effort);
+            }
         }
     }
 

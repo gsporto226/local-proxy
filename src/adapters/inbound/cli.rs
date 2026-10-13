@@ -432,6 +432,11 @@ pub fn launch_environment(
         ("ANTHROPIC_BASE_URL".to_string(), base),
         ("ANTHROPIC_API_KEY".to_string(), auth.clone()),
         ("ANTHROPIC_AUTH_TOKEN".to_string(), auth),
+        // Makes Claude Code's `/model` list this proxy's `GET /v1/models`.
+        (
+            "CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY".to_string(),
+            "1".to_string(),
+        ),
     ];
     if let Some(m) = model.filter(|m| !m.is_empty()) {
         env.push(("ANTHROPIC_MODEL".to_string(), m.to_string()));
@@ -533,6 +538,37 @@ fn start_ephemeral_proxy(
     Ok(child)
 }
 
+/// Claude Code's `modelPicker` setting built from an Anthropic-shaped
+/// `/v1/models` body: the proxy's catalog replaces the built-in lineup in
+/// `/model`. `None` when the body lists no models.
+fn model_picker(models: &serde_json::Value) -> Option<serde_json::Value> {
+    let options: Vec<_> = models["data"]
+        .as_array()?
+        .iter()
+        .map(|m| serde_json::json!({ "model": m["id"], "label": m["display_name"] }))
+        .collect();
+    (!options.is_empty())
+        .then(|| serde_json::json!({ "options": options, "replaceBuiltInOptions": true }))
+}
+
+/// Ask the launched proxy for its live catalog (`GET /v1/models`, Anthropic
+/// shape) and turn it into a [`model_picker`]. `None` on any failure, which
+/// leaves Claude Code's built-in `/model` lineup in place.
+fn fetch_model_picker(host: &str, port: u16) -> Option<serde_json::Value> {
+    use std::io::{Read, Write};
+    let mut stream = TcpStream::connect((host, port)).ok()?;
+    stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+    write!(
+        stream,
+        "GET /v1/models HTTP/1.1\r\nHost: {host}\r\nanthropic-version: 2023-06-01\r\nConnection: close\r\n\r\n"
+    )
+    .ok()?;
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).ok()?;
+    let body = raw.split_once("\r\n\r\n")?.1;
+    model_picker(&serde_json::from_str(body).ok()?)
+}
+
 /// Launch the given CLI tool against this proxy, starting the proxy in the
 /// background first if it is not already serving.
 ///
@@ -562,11 +598,12 @@ pub fn launch(
     let proxy = if dry_run {
         None
     } else {
-        // Only Anthropic-compatible tools (claude, design) send their own model
-        // and must be pinned to the active model. Cursor is pinned via the
-        // `OPENAI_API_BASE` override and the shared `local-proxy model` setting,
-        // so it keeps client-driven selection.
-        let enforce = tool_cmd == "claude" || tool_cmd == "design";
+        // Design sends its own model and is pinned to the active model. Claude
+        // Code drives the model itself through `/model`, which lists the
+        // proxy's catalog (gateway discovery + `modelPicker`). Cursor is pinned
+        // via the `OPENAI_API_BASE` override and the shared `local-proxy model`
+        // setting, so it keeps client-driven selection.
+        let enforce = tool_cmd == "design";
         Some(start_ephemeral_proxy(
             &host,
             port,
@@ -606,6 +643,12 @@ pub fn launch(
     }
     if yes && tool_cmd != "cursor" {
         cmd.arg("--yes");
+    }
+    if tool_cmd == "claude" {
+        if let Some(picker) = fetch_model_picker(&host, port) {
+            cmd.arg("--settings")
+                .arg(serde_json::json!({ "modelPicker": picker }).to_string());
+        }
     }
     cmd.args(&args);
     let status = cmd.status().map_err(|e| CliError::Tool {
@@ -1758,8 +1801,21 @@ mod tests {
         assert_eq!(map["ANTHROPIC_BASE_URL"], "http://127.0.0.1:8787");
         assert_eq!(map["ANTHROPIC_API_KEY"], "sk-proxy");
         assert_eq!(map["ANTHROPIC_AUTH_TOKEN"], "sk-proxy");
+        assert_eq!(map["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], "1");
         assert_eq!(map["ANTHROPIC_MODEL"], "kimi-k2.6");
         assert_eq!(map["ANTHROPIC_SMALL_FAST_MODEL"], "kimi-k2.6");
+    }
+
+    #[test]
+    fn model_picker_replaces_builtin_lineup_with_catalog() {
+        let body = serde_json::json!({"data": [
+            {"type": "model", "id": "anthropic:openai/gpt-4o", "display_name": "openai/gpt-4o"},
+        ]});
+        let picker = model_picker(&body).expect("picker");
+        assert_eq!(picker["replaceBuiltInOptions"], true);
+        assert_eq!(picker["options"][0]["model"], "anthropic:openai/gpt-4o");
+        assert_eq!(picker["options"][0]["label"], "openai/gpt-4o");
+        assert!(model_picker(&serde_json::json!({"data": []})).is_none());
     }
 
     #[test]

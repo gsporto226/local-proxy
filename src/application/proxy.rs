@@ -92,6 +92,21 @@ fn is_connected(state: &RuntimeState, provider: &str) -> bool {
         .is_some_and(|accounts| accounts.values().any(|a| a.has_credentials()))
 }
 
+/// Prefix that keeps a model ID visible in Claude Code's `/model`.
+///
+/// Claude Code's gateway discovery keeps only IDs matching
+/// `/(claude|anthropic)/i`, so the Anthropic-shaped `/v1/models` prefixes the
+/// rest and [`resolve_model`] strips it back off. Not `/`, which would collide
+/// with the real `anthropic` provider.
+pub const GATEWAY_ID_MARKER: &str = "anthropic:";
+
+/// Whether Claude Code's gateway model discovery keeps this ID as-is.
+#[must_use]
+pub fn passes_gateway_filter(id: &str) -> bool {
+    let id = id.to_ascii_lowercase();
+    id.contains("claude") || id.contains("anthropic")
+}
+
 /// Resolve the model a request asks for to `(provider, upstream model,
 /// reasoning effort)`.
 ///
@@ -104,6 +119,11 @@ fn is_connected(state: &RuntimeState, provider: &str) -> bool {
 /// a client-sent model is ignored entirely so the user's active model is
 /// always the one routed, regardless of what the launched tool selects.
 ///
+/// A Claude-family name the router can't resolve (Claude Code's own default,
+/// sent before the user picks anything in `/model`) also falls back to the
+/// active model instead of failing. IDs carrying [`GATEWAY_ID_MARKER`] (picked
+/// from `/model`) have it stripped first.
+///
 /// # Errors
 ///
 /// Returns an [`ApiError`] for unknown models, no available model, or a
@@ -112,7 +132,16 @@ pub fn resolve_model(
     state: &RuntimeState,
     client_model: Option<&str>,
 ) -> Result<(Arc<Provider>, String, Option<String>), ApiError> {
-    let client_sent = !state.enforce_active_model && client_model.is_some_and(|m| !m.is_empty());
+    let client_model = client_model
+        .map(|m| m.strip_prefix(GATEWAY_ID_MARKER).unwrap_or(m))
+        .filter(|m| !m.is_empty());
+    let connected = |name: &str| is_connected(state, name);
+    let client_sent = !state.enforce_active_model
+        && client_model.is_some_and(|m| {
+            state.config.defaults.active_model.is_none()
+                || !passes_gateway_filter(m)
+                || state.router.resolve_client_model(m, &connected).is_ok()
+        });
     let requested = if client_sent {
         client_model.unwrap_or_default().to_string()
     } else if let Some(model) = state.config.defaults.active_model.clone() {
@@ -129,22 +158,21 @@ pub fn resolve_model(
             )
         })?
     };
-    let is_connected = |name: &str| is_connected(state, name);
     // A client-provided model is resolved strictly (no default-provider
     // fallback), so an unknown model fails loudly instead of silently routing
     // elsewhere. The proxy-override path keeps the default fallback.
     let resolved = if client_sent {
         state
             .router
-            .resolve_client_model(&requested, &is_connected)
+            .resolve_client_model(&requested, &connected)
             .map_err(ApiError::from)?
     } else {
         state
             .router
-            .resolve_model(&requested, &is_connected)
+            .resolve_model(&requested, &connected)
             .map_err(ApiError::from)?
     };
-    if !is_connected(&resolved.provider.name) {
+    if !connected(&resolved.provider.name) {
         return Err(ApiError::bad_request(format!(
             "model '{requested}' resolves to provider '{}' which has no account; \
              connect it via `local-proxy connect {} --account <alias>` or select a connected model",
@@ -482,6 +510,31 @@ mod tests {
         // model`, regardless of the configured active_model fallback.
         let err = resolve_model(&state, Some("totally-unknown")).expect_err("unknown model");
         assert_eq!(err.message, "proxy: unknown model totally-unknown");
+
+        // Claude Code's own default (a Claude name the router can't resolve)
+        // falls back to the active model instead.
+        let (provider, upstream, _) =
+            resolve_model(&state, Some("claude-opus-9")).expect("falls back");
+        assert_eq!(
+            (provider.name.as_str(), upstream.as_str()),
+            ("openai", "gpt-4o")
+        );
+
+        // An ID picked from `/model` arrives with the discovery marker.
+        let (provider, upstream, _) =
+            resolve_model(&state, Some("anthropic:openai/gpt-4o")).expect("marker stripped");
+        assert_eq!(
+            (provider.name.as_str(), upstream.as_str()),
+            ("openai", "gpt-4o")
+        );
+    }
+
+    #[test]
+    fn gateway_filter_matches_claude_code_regex() {
+        assert!(passes_gateway_filter("claude-sonnet-4-5"));
+        assert!(passes_gateway_filter("anthropic/x"));
+        assert!(passes_gateway_filter("Claude"));
+        assert!(!passes_gateway_filter("openai/gpt-4o"));
     }
 
     #[test]
