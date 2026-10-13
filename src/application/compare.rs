@@ -225,18 +225,11 @@ pub fn resolve_target(
     let accounts = accounts
         .get(name)
         .ok_or_else(|| setup(format!("no clients for provider {name}")))?;
+    let selected = runtime::selections(ports, &config)
+        .map_err(|error| setup(format!("failed to read the account selection: {error}")))?;
     let alias = account
-        .or_else(|| config.defaults.active_accounts.get(name).cloned())
-        .or_else(|| {
-            (accounts.len() == 1)
-                .then(|| accounts.keys().next().cloned())
-                .flatten()
-        })
-        .ok_or_else(|| {
-            setup(format!(
-                "provider {name} has multiple accounts; pass --account"
-            ))
-        })?;
+        .or_else(|| selected.get(name).cloned())
+        .ok_or_else(|| setup(format!("provider {name} has no account; connect one first")))?;
     let account = accounts
         .get(&alias)
         .ok_or_else(|| setup(format!("account {alias} not found for {name}")))?;

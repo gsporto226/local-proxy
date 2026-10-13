@@ -188,8 +188,6 @@ async fn session(State(app): State<AppState>, Path(id): Path<String>) -> ApiResu
 struct AccountBody {
     provider: String,
     alias: Option<String>,
-    #[serde(default)]
-    clear: bool,
 }
 
 async fn pin_account(
@@ -237,11 +235,9 @@ async fn set_effort(State(app): State<AppState>, Json(body): Json<EffortBody>) -
 }
 
 async fn set_account(State(app): State<AppState>, Json(body): Json<AccountBody>) -> ApiResult {
-    let args = match (body.clear, body.alias) {
-        (true, _) => vec!["clear".to_string(), body.provider],
-        (false, Some(alias)) => vec![format!("{}/{alias}", body.provider)],
-        (false, None) => return Err(bad_request("alias or clear is required")),
-    };
+    // A provider with accounts always has a selection: there is no clear.
+    let alias = body.alias.ok_or_else(|| bad_request("alias is required"))?;
+    let args = vec![format!("{}/{alias}", body.provider)];
     commands::apply_account(&app, &args)
         .await
         .map(message)

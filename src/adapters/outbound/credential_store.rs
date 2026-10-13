@@ -15,7 +15,7 @@ use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 use crate::adapters::outbound::paths;
-use crate::domain::account::{is_valid_alias, AuthEntry, AuthMap, OAuthTokens};
+use crate::domain::account::{is_valid_alias, pick_selection, AuthEntry, AuthMap, OAuthTokens};
 use crate::ports::{CredentialError, CredentialStore};
 
 /// [`CredentialStore`] over a `SQLCipher` database whose key lives in the OS
@@ -79,6 +79,14 @@ enum AuthError {
     /// The account to update does not exist.
     #[error("account '{alias}' not found for provider '{provider}'")]
     NotFound {
+        /// Provider name.
+        provider: String,
+        /// Account alias.
+        alias: String,
+    },
+    /// The selected account cannot be removed while others remain.
+    #[error("selected account")]
+    SelectedAccount {
         /// Provider name.
         provider: String,
         /// Account alias.
@@ -201,6 +209,10 @@ fn open_db(path: &Path) -> Result<Connection, AuthError> {
            alias TEXT NOT NULL,
            credential TEXT NOT NULL,
            PRIMARY KEY(provider, alias)
+         );
+         CREATE TABLE IF NOT EXISTS selected (
+           provider TEXT PRIMARY KEY,
+           alias TEXT NOT NULL
          );",
     )
     .map_err(AuthError::Database)?;
@@ -266,6 +278,9 @@ impl From<AuthError> for CredentialError {
             AuthError::InvalidAlias => Self::InvalidAlias,
             AuthError::Exists { provider, alias } => Self::Exists { provider, alias },
             AuthError::NotFound { provider, alias } => Self::NotFound { provider, alias },
+            AuthError::SelectedAccount { provider, alias } => {
+                Self::SelectedAccount { provider, alias }
+            }
             other => Self::Backend(other.to_string()),
         }
     }
@@ -384,6 +399,12 @@ fn insert_account(provider: &str, alias: &str, entry: &AuthEntry) -> Result<(), 
                 alias: alias.to_string(),
             });
         }
+        // A provider's first account becomes its selection.
+        tx.execute(
+            "INSERT OR IGNORE INTO selected(provider, alias) VALUES(?1, ?2)",
+            params![provider, alias],
+        )
+        .map_err(AuthError::Database)?;
         bump_revision(&tx)?;
         tx.commit().map_err(AuthError::Database)
     })
@@ -434,15 +455,27 @@ fn swap_oauth_for(
     })
 }
 
-/// Remove one provider/account pair, returning whether it existed.
-///
-/// # Errors
-/// Returns an error if the vault or database is unavailable.
+/// Remove one provider/account pair, returning whether it existed. The
+/// selected account can only go when it is the provider's last one, so a
+/// provider with accounts always has a selection.
 fn remove_account(provider: &str, alias: &str) -> Result<bool, AuthError> {
     with_db(|conn| {
         let tx = conn
             .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(AuthError::Database)?;
+        let siblings: i64 = tx
+            .query_row(
+                "SELECT COUNT(*) FROM accounts WHERE provider=?1 AND alias<>?2",
+                params![provider, alias],
+                |row| row.get(0),
+            )
+            .map_err(AuthError::Database)?;
+        if siblings > 0 && selected_in(&tx, provider)?.as_deref() == Some(alias) {
+            return Err(AuthError::SelectedAccount {
+                provider: provider.to_string(),
+                alias: alias.to_string(),
+            });
+        }
         let removed = tx
             .execute(
                 "DELETE FROM accounts WHERE provider=?1 AND alias=?2",
@@ -452,9 +485,105 @@ fn remove_account(provider: &str, alias: &str) -> Result<bool, AuthError> {
         if removed == 0 {
             return Ok(false);
         }
+        if siblings == 0 {
+            tx.execute("DELETE FROM selected WHERE provider=?1", [provider])
+                .map_err(AuthError::Database)?;
+        }
         bump_revision(&tx)?;
         tx.commit().map_err(AuthError::Database)?;
         Ok(true)
+    })
+}
+
+fn selected_in(conn: &Connection, provider: &str) -> Result<Option<String>, AuthError> {
+    conn.query_row(
+        "SELECT alias FROM selected WHERE provider=?1",
+        [provider],
+        |row| row.get(0),
+    )
+    .optional()
+    .map_err(AuthError::Database)
+}
+
+/// Make `alias` (which must be stored) the selected account of `provider`.
+fn select_in(conn: &Connection, provider: &str, alias: &str) -> Result<(), AuthError> {
+    let stored = conn
+        .query_row(
+            "SELECT 1 FROM accounts WHERE provider=?1 AND alias=?2",
+            params![provider, alias],
+            |_| Ok(()),
+        )
+        .optional()
+        .map_err(AuthError::Database)?;
+    if stored.is_none() {
+        return Err(AuthError::NotFound {
+            provider: provider.to_string(),
+            alias: alias.to_string(),
+        });
+    }
+    conn.execute(
+        "INSERT INTO selected(provider, alias) VALUES(?1, ?2)
+         ON CONFLICT(provider) DO UPDATE SET alias=excluded.alias",
+        params![provider, alias],
+    )
+    .map_err(AuthError::Database)?;
+    Ok(())
+}
+
+/// Give every provider with stored accounts but no selection one, seeded from
+/// the legacy `defaults.active_accounts` (`provider -> alias`) where possible.
+fn seed_selections(legacy: &HashMap<String, String>) -> Result<(), AuthError> {
+    with_db(|conn| {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        let mut unselected: HashMap<String, Vec<String>> = HashMap::new();
+        {
+            let mut stmt = tx
+                .prepare(
+                    "SELECT provider, alias FROM accounts
+                     WHERE provider NOT IN (SELECT provider FROM selected)",
+                )
+                .map_err(AuthError::Database)?;
+            let rows = stmt
+                .query_map([], |row| Ok((row.get::<_, String>(0)?, row.get(1)?)))
+                .map_err(AuthError::Database)?;
+            for row in rows {
+                let (provider, alias) = row.map_err(AuthError::Database)?;
+                unselected.entry(provider).or_default().push(alias);
+            }
+        }
+        for (provider, aliases) in &unselected {
+            let Some(alias) = pick_selection(aliases, legacy.get(provider).map(String::as_str))
+            else {
+                continue;
+            };
+            select_in(&tx, provider, &alias)?;
+            tracing::info!(target: crate::LOG_TARGET, %provider, %alias, "selected account");
+        }
+        tx.commit().map_err(AuthError::Database)
+    })
+}
+
+fn selections() -> Result<HashMap<String, String>, AuthError> {
+    with_db(|conn| {
+        let mut stmt = conn
+            .prepare("SELECT provider, alias FROM selected")
+            .map_err(AuthError::Database)?;
+        let rows = stmt
+            .query_map([], |row| Ok((row.get(0)?, row.get(1)?)))
+            .map_err(AuthError::Database)?;
+        rows.collect::<Result<_, _>>().map_err(AuthError::Database)
+    })
+}
+
+fn select_account(provider: &str, alias: &str) -> Result<(), AuthError> {
+    with_db(|conn| {
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        select_in(&tx, provider, alias)?;
+        tx.commit().map_err(AuthError::Database)
     })
 }
 
@@ -512,6 +641,18 @@ impl CredentialStore for SqlCipherCredentialStore {
 
     fn revision(&self) -> Result<(i64, i64), CredentialError> {
         Ok(revision()?)
+    }
+
+    fn seed_selections(&self, legacy: &HashMap<String, String>) -> Result<(), CredentialError> {
+        Ok(seed_selections(legacy)?)
+    }
+
+    fn selections(&self) -> Result<HashMap<String, String>, CredentialError> {
+        Ok(selections()?)
+    }
+
+    fn select(&self, provider: &str, alias: &str) -> Result<(), CredentialError> {
+        Ok(select_account(provider, alias)?)
     }
 }
 

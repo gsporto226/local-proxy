@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::domain::account::{AuthEntry, AuthMap, OAuthTokens};
 
 /// Errors from the credential store.
@@ -17,6 +19,17 @@ pub enum CredentialError {
     /// The account to update does not exist.
     #[error("account '{alias}' not found for provider '{provider}'")]
     NotFound {
+        /// Provider name.
+        provider: String,
+        /// Account alias.
+        alias: String,
+    },
+    /// The selected account cannot be removed while the provider has others.
+    #[error(
+        "conta '{alias}' e a selecionada do provider '{provider}'; selecione outra com \
+         `local-proxy account {provider}/<alias>` antes de remove-la"
+    )]
+    SelectedAccount {
         /// Provider name.
         provider: String,
         /// Account alias.
@@ -83,4 +96,27 @@ pub trait CredentialStore: Send + Sync {
     ///
     /// Returns [`CredentialError::Backend`] if the store is unavailable.
     fn revision(&self) -> Result<(i64, i64), CredentialError>;
+
+    /// Give every provider with stored accounts but no selection one, seeded
+    /// from the legacy config selections (`provider -> alias`); see
+    /// [`crate::domain::account::pick_selection`]. Existing selections stay.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Backend`] if the store is unavailable.
+    fn seed_selections(&self, legacy: &HashMap<String, String>) -> Result<(), CredentialError>;
+
+    /// The selected alias of every provider that has stored accounts.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::Backend`] if the store is unavailable.
+    fn selections(&self) -> Result<HashMap<String, String>, CredentialError>;
+
+    /// Make `alias` the selected account of `provider`.
+    ///
+    /// # Errors
+    ///
+    /// Returns [`CredentialError::NotFound`] if the account is not stored.
+    fn select(&self, provider: &str, alias: &str) -> Result<(), CredentialError>;
 }

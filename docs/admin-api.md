@@ -44,7 +44,7 @@ session. Omitting `session_id` keeps the existing all-sessions behavior.
 | `DELETE /admin/session/{id}/account/{provider}` | – | unpin |
 | `PUT /admin/model` | `{ model: string \| null }` | same as `local-proxy model` / `model clear` |
 | `PUT /admin/effort` | `{ effort: string \| null }` | same as `local-proxy effort` |
-| `PUT /admin/account` | `{ provider, alias } \| { provider, clear: true }` | persisted default account |
+| `PUT /admin/account` | `{ provider, alias }` | selected account of the provider (always set; no clear) |
 | `DELETE /admin/accounts/{provider}/{alias}` | – | same as `local-proxy disconnect` |
 
 Successful writes return `{ message }` (the CLI's message); session pin

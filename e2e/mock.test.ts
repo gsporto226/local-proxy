@@ -719,14 +719,14 @@ describe("e2e: multiple accounts per provider", () => {
 
   afterAll(() => stopScenario({ mock, proxy }));
 
-  test("a request without an account header fails when the provider has several accounts", async () => {
+  test("the first connected account is selected; header-less requests use it", async () => {
     const r = await postJson(proxy.base, "/v1/messages", {
       model: "claude-via-responses",
       max_tokens: 10,
       messages: [{ role: "user", content: "hi" }],
     });
-    expect(r.status).toBe(400);
-    expect(await readBody(r)).toContain("X-Local-Proxy-Account");
+    expect(r.status).toBe(200);
+    expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
   });
 
   test("an unknown alias is rejected", async () => {
@@ -807,7 +807,7 @@ describe("e2e: multiple accounts per provider", () => {
     expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-personal");
   });
 
-  test("switching the selection and clearing it take effect", async () => {
+  test("switching the selection takes effect; there is no clear", async () => {
     let res = await runCli(["--config", cfgPath, "account", "mock_responses/personal"], env);
     expect(res.exit).toBe(0);
     let auth = "";
@@ -826,20 +826,16 @@ describe("e2e: multiple accounts per provider", () => {
     expect(auth).toBe("Bearer key-personal");
 
     res = await runCli(["--config", cfgPath, "account", "clear", "mock_responses"], env);
-    expect(res.exit).toBe(0);
-    // Cleared selection: header-less requests are ambiguous again.
-    let status = 0;
-    for (let i = 0; i < 30; i++) {
-      const r = await postJson(proxy.base, "/v1/messages", {
-        model: "claude-via-responses",
-        max_tokens: 10,
-        messages: [{ role: "user", content: "hi" }],
-      });
-      status = r.status;
-      if (status === 400) break;
-      await Bun.sleep(100);
-    }
-    expect(status).toBe(400);
+    expect(res.exit).not.toBe(0);
+  });
+
+  test("the selected account cannot be disconnected while others remain", async () => {
+    const res = await runCli(
+      ["--config", cfgPath, "disconnect", "mock_responses", "--account", "personal"],
+      env,
+    );
+    expect(res.exit).not.toBe(0);
+    expect(res.output).toContain("selecionada");
   });
 
   test("$proxy account pins the account for the session and updates the default", async () => {
@@ -881,17 +877,6 @@ describe("e2e: multiple accounts per provider", () => {
     const stillA = await postJson(proxy.base, "/v1/messages", chat, sessionA);
     expect(stillA.status).toBe(200);
     expect(mock.lastResponsesHeaders().authorization).toBe("Bearer key-work");
-
-    // Clearing drops the session's selection: two accounts, no pick -> 400.
-    const clear = await postJson(
-      proxy.base,
-      "/v1/messages",
-      { model: "claude-via-responses", max_tokens: 10, messages: [{ role: "user", content: "$proxy account clear mock_responses" }] },
-      sessionA,
-    );
-    expect(clear.status).toBe(200);
-    const cleared = await postJson(proxy.base, "/v1/messages", chat, sessionA);
-    expect(cleared.status).toBe(400);
   });
 });
 

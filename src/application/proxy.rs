@@ -186,68 +186,54 @@ pub fn resolve_model(
     ))
 }
 
-/// Pick the account a request goes through: the session pin, then the
-/// per-request header, then the persisted selection, then the only account.
+/// Pick the account a request goes through.
+///
+/// The per-request `header` alias wins, then `chosen` (the session's account,
+/// else the provider's selection). Both must name a stored credential; the
+/// unauthenticated placeholder of a provider without accounts is only used
+/// when neither is given.
 ///
 /// # Errors
 ///
-/// Returns a `400` for stale pins/selections, unknown aliases, or an
-/// ambiguous provider with several accounts.
+/// Returns a `400` for an unknown or stale alias.
 pub fn account_for(
     state: &RuntimeState,
     provider: &Provider,
-    session_alias: Option<&str>,
-    alias: Option<&str>,
+    header: Option<&str>,
+    chosen: Option<&str>,
 ) -> Result<Account, ApiError> {
     let accounts = state.accounts.get(&provider.name).ok_or_else(|| {
         ApiError::internal(format!("client not built for provider {}", provider.name))
     })?;
-    // A `$proxy account` pin outranks everything for this session.
-    if let Some(alias) = session_alias {
-        return accounts
+    let stored = |alias: &str| {
+        accounts
             .get(alias)
             .filter(|account| account.has_credentials())
             .cloned()
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "session account '{alias}' for provider '{}' is no longer stored; \
-                     select another with `$proxy account {}/<alias>`",
-                    provider.name, provider.name
-                ))
-            });
-    }
-    if let Some(alias) = alias {
-        return accounts.get(alias).cloned().ok_or_else(|| {
+    };
+    if let Some(alias) = header {
+        return stored(alias).ok_or_else(|| {
             ApiError::bad_request(format!(
                 "unknown account '{alias}' for provider '{}'",
                 provider.name
             ))
         });
     }
-    if let Some(selected) = state.config.defaults.active_accounts.get(&provider.name) {
-        // The selection must resolve to a stored credential; the unauthenticated
-        // placeholder account never satisfies it.
-        return accounts
-            .get(selected)
-            .filter(|account| account.has_credentials())
-            .cloned()
-            .ok_or_else(|| {
-                ApiError::bad_request(format!(
-                    "selected account '{selected}' for provider '{}' is no longer stored; \
-                     select another with `local-proxy account {}/<alias>`",
-                    provider.name, provider.name
-                ))
-            });
+    if let Some(alias) = chosen {
+        return stored(alias).ok_or_else(|| {
+            ApiError::bad_request(format!(
+                "account '{alias}' for provider '{}' is no longer stored; \
+                 select another with `local-proxy account {}/<alias>`",
+                provider.name, provider.name
+            ))
+        });
     }
-    if accounts.len() > 1 {
-        return Err(ApiError::bad_request(format!(
-            "provider '{}' has multiple accounts; select one with \
-             `local-proxy account {}/<alias>` or specify X-Local-Proxy-Account",
-            provider.name, provider.name
-        )));
-    }
-    accounts.values().next().cloned().ok_or_else(|| {
-        ApiError::internal(format!("client not built for provider {}", provider.name))
+    // Only a provider without stored accounts has no selection.
+    accounts.get("default").cloned().ok_or_else(|| {
+        ApiError::internal(format!(
+            "no account selected for provider {}",
+            provider.name
+        ))
     })
 }
 
@@ -332,13 +318,19 @@ pub async fn handle_chat(app: &AppState, req: ChatRequest<'_>) -> Result<ChatRep
         streaming,
         "resolved route"
     );
-    let session_alias = app.session_account(session_id, &provider.name).await;
-    let account = account_for(
-        &state,
-        &provider,
-        session_alias.as_deref(),
-        req.account_alias,
-    )?;
+    // A provider without stored accounts has nothing to choose (passthrough).
+    let has_accounts = state
+        .accounts
+        .get(&provider.name)
+        .is_some_and(|accounts| accounts.values().any(|a| a.has_credentials()));
+    let chosen = if req.account_alias.is_none() && has_accounts {
+        app.request_account(session_id, &provider.name)
+            .await
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    } else {
+        None
+    };
+    let account = account_for(&state, &provider, req.account_alias, chosen.as_deref())?;
     let upstream_format = Format::from(provider.format);
     let same = upstream_format == client_format;
     let upstream_body = request::prepare_upstream_body(
@@ -620,73 +612,31 @@ mod tests {
     }
 
     #[test]
-    fn account_selection_requires_alias_only_for_multiple_accounts() {
+    fn account_resolution_is_header_then_chosen() {
         let provider = openai_provider(&["gpt-test"]);
         let cfg = Config {
             providers: vec![provider.clone()],
             ..Config::default()
         };
-        let one = state_with(cfg.clone(), openai_accounts(&["one"]));
-        assert!(account_for(&one, &provider, None, None).is_ok());
-        assert!(account_for(&one, &provider, None, Some("one")).is_ok());
-        let err = account_for(&one, &provider, None, Some("missing"))
-            .expect_err("unknown alias must fail even with one account");
+        let state = state_with(cfg, openai_accounts(&["personal", "work"]));
+
+        // The chosen account (session, else selection) is used.
+        let chosen = account_for(&state, &provider, None, Some("work")).unwrap();
+        assert_eq!(chosen.alias(), "work");
+        // The header overrides it per request.
+        let header = account_for(&state, &provider, Some("personal"), Some("work")).unwrap();
+        assert_eq!(header.alias(), "personal");
+
+        // An unknown header alias is a 400.
+        let err = account_for(&state, &provider, Some("nope"), None).expect_err("unknown");
         assert_eq!(err.status, 400);
-        assert!(err.message.contains("unknown account 'missing'"));
-
-        let two = state_with(cfg, openai_accounts(&["one", "two"]));
-        let err = account_for(&two, &provider, None, None).expect_err("ambiguous account");
-        assert_eq!(err.status, 400);
-        assert!(err.message.contains("X-Local-Proxy-Account"));
-        assert!(account_for(&two, &provider, None, Some("two")).is_ok());
-    }
-
-    #[test]
-    fn account_resolution_is_session_then_header_then_selection() {
-        let provider = openai_provider(&["gpt-test"]);
-        let state_with_selected = |selected: &str| {
-            let cfg = Config {
-                providers: vec![provider.clone()],
-                defaults: Defaults {
-                    active_accounts: HashMap::from([("openai".to_string(), selected.to_string())]),
-                    ..Defaults::default()
-                },
-                ..Config::default()
-            };
-            state_with(cfg, openai_accounts(&["personal", "work"]))
-        };
-
-        // No header: the selected account is used without error.
-        let state = state_with_selected("work");
-        let selected = account_for(&state, &provider, None, None).unwrap();
-        assert_eq!(selected.alias(), "work");
-        // The header overrides the persisted selection per request.
-        let overridden = account_for(&state, &provider, None, Some("personal")).unwrap();
-        assert_eq!(overridden.alias(), "personal");
-
-        // A session pin (from `$proxy account`) outranks both the persisted
-        // selection and the per-request header.
-        let pinned = account_for(&state, &provider, Some("personal"), None).unwrap();
-        assert_eq!(pinned.alias(), "personal");
-        let pinned_over_header =
-            account_for(&state, &provider, Some("personal"), Some("work")).unwrap();
-        assert_eq!(pinned_over_header.alias(), "personal");
-
-        // A selection whose account was disconnected is a clear 400, never a
+        assert!(err.message.contains("unknown account 'nope'"));
+        // A chosen account that was disconnected is a clear 400, never a
         // silent fallback to another account.
-        let disconnected = state_with_selected("ghost");
-        let err = account_for(&disconnected, &provider, None, None).expect_err("stale selection");
+        let err = account_for(&state, &provider, None, Some("ghost")).expect_err("stale");
         assert_eq!(err.status, 400);
         assert!(
             err.message.contains("no longer stored"),
-            "got: {}",
-            err.message
-        );
-        // Same for a stale session pin.
-        let err = account_for(&state, &provider, Some("ghost"), None).expect_err("stale pin");
-        assert_eq!(err.status, 400);
-        assert!(
-            err.message.contains("session account"),
             "got: {}",
             err.message
         );

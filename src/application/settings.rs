@@ -102,7 +102,7 @@ pub struct AccountInfo {
     pub alias: String,
     /// Credential kind: `api` or `oauth`.
     pub kind: &'static str,
-    /// Whether this alias is the persisted default (`defaults.active_accounts`).
+    /// Whether this alias is the provider's selected account.
     pub is_default: bool,
 }
 
@@ -128,6 +128,7 @@ pub fn provider_accounts(
 ) -> Result<Vec<ProviderInfo>, SettingsError> {
     let config = runtime::effective_config(ports, config_path)?;
     let auth = ports.credentials.read_all()?;
+    let selected = runtime::selections(ports, &config)?;
     Ok(config
         .providers
         .iter()
@@ -140,7 +141,7 @@ pub fn provider_accounts(
                     provider: p.name.clone(),
                     alias: alias.clone(),
                     kind: entry.kind(),
-                    is_default: config.defaults.active_accounts.get(&p.name) == Some(alias),
+                    is_default: selected.get(&p.name) == Some(alias),
                 })
                 .collect();
             accounts.sort_unstable_by(|a, b| a.alias.cmp(&b.alias));
@@ -193,31 +194,28 @@ pub fn set_default_model(
     Ok(())
 }
 
-/// Persist or clear (`None`) the active account alias for `provider`.
+/// Make `alias` the selected account of `provider`, persisted in the
+/// credential store.
 ///
 /// # Errors
 ///
-/// Returns a [`SettingsError`] if the config cannot be written.
+/// Returns [`SettingsError::Invalid`] if the account is not stored, or a
+/// store error.
 pub fn set_default_account(
     ports: &Ports,
-    config_path: &Path,
     provider: &str,
-    alias: Option<&str>,
+    alias: &str,
 ) -> Result<(), SettingsError> {
     ports
-        .config
-        .update(config_path, &mut |config| match alias {
-            Some(alias) => {
-                config
-                    .defaults
-                    .active_accounts
-                    .insert(provider.to_string(), alias.to_string());
-            }
-            None => {
-                config.defaults.active_accounts.remove(provider);
-            }
-        })?;
-    Ok(())
+        .credentials
+        .select(provider, alias)
+        .map_err(|e| match e {
+            CredentialError::NotFound { provider, alias } => invalid(format!(
+                "conta '{alias}' nao encontrada para o provider '{provider}'; \
+                 veja `local-proxy account`"
+            )),
+            other => SettingsError::Credentials(other),
+        })
 }
 
 /// Reasoning effort levels accepted by `local-proxy effort`.
@@ -313,14 +311,27 @@ pub fn model_result(
     }
 }
 
-/// List accounts (no args), select one (`provider/alias`), or clear the
-/// selection (`clear [provider]`), returning the message to print. Running
-/// proxies pick the change up via hot-reload.
+/// Split a `provider/alias` account target.
+///
+/// # Errors
+///
+/// Returns [`SettingsError::Invalid`] when there is no `/`.
+pub fn parse_account_target(target: &str) -> Result<(&str, &str), SettingsError> {
+    target.split_once('/').ok_or_else(|| {
+        invalid(format!(
+            "alvo '{target}' invalido; use provider/alias (ex.: chatgpt/work)"
+        ))
+    })
+}
+
+/// List accounts (no args) or select one (`provider/alias`), returning the
+/// message to print. A provider with accounts always has a selection, so
+/// there is nothing to clear.
 ///
 /// # Errors
 ///
 /// Returns a [`SettingsError`] if the target is malformed, the account does
-/// not exist, or the config cannot be written.
+/// not exist, or the store cannot be written.
 pub fn account_result(
     ports: &Ports,
     config_path: &Path,
@@ -328,42 +339,12 @@ pub fn account_result(
 ) -> Result<String, SettingsError> {
     match args {
         [] => list_accounts(ports, config_path),
-        [command, provider] if command == "clear" => {
-            set_default_account(ports, config_path, provider, None)?;
-            Ok(format!("conta ativa do provider '{provider}' limpa"))
-        }
-        [command] if command == "clear" => {
-            let config = runtime::effective_config(ports, config_path)?;
-            if config.defaults.active_accounts.is_empty() {
-                return Ok("nenhuma conta ativa para limpar".to_string());
-            }
-            ports.config.update(config_path, &mut |config| {
-                config.defaults.active_accounts.clear();
-            })?;
-            Ok("contas ativas limpas".to_string())
-        }
         [target] => {
-            let Some((provider, alias)) = target.split_once('/') else {
-                return Err(invalid(format!(
-                    "alvo '{target}' invalido; use provider/alias (ex.: chatgpt/work)"
-                )));
-            };
-            let auth = ports.credentials.read_all()?;
-            if !auth
-                .get(provider)
-                .is_some_and(|accounts| accounts.contains_key(alias))
-            {
-                return Err(invalid(format!(
-                    "conta '{alias}' nao encontrada para o provider '{provider}'; \
-                     veja `local-proxy account`"
-                )));
-            }
-            set_default_account(ports, config_path, provider, Some(alias))?;
+            let (provider, alias) = parse_account_target(target)?;
+            set_default_account(ports, provider, alias)?;
             Ok(format!("conta ativa do provider '{provider}': {alias}"))
         }
-        _ => Err(invalid(
-            "uso: `local-proxy account [provider/alias | clear [provider]]`",
-        )),
+        _ => Err(invalid("uso: `local-proxy account [provider/alias]`")),
     }
 }
 
@@ -525,22 +506,30 @@ mod tests {
     }
 
     #[test]
-    fn set_default_account_persists_and_clears() {
+    fn selected_account_is_kept_until_it_is_the_last() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("config.yaml");
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", dir.path());
         let ports = crate::bootstrap::ports();
+        let selected = || ports.credentials.selections().unwrap().get("p").cloned();
 
-        set_default_account(&ports, &path, "chatgpt", Some("work")).expect("persist account");
-        set_default_account(&ports, &path, "opencode-go", Some("personal"))
-            .expect("persist second");
-        let config = ports.config.load(&path).expect("reload");
-        assert_eq!(config.defaults.active_accounts["chatgpt"], "work");
-        assert_eq!(config.defaults.active_accounts["opencode-go"], "personal");
+        // The first account is selected; a second one leaves it alone.
+        save_api_key(&ports, "p", "work", "k1").unwrap();
+        save_api_key(&ports, "p", "personal", "k2").unwrap();
+        assert_eq!(selected().as_deref(), Some("work"));
 
-        set_default_account(&ports, &path, "chatgpt", None).expect("clear one");
-        let config = ports.config.load(&path).expect("reload");
-        assert!(!config.defaults.active_accounts.contains_key("chatgpt"));
-        assert_eq!(config.defaults.active_accounts["opencode-go"], "personal");
+        let err = disconnect_provider(&ports, "p", "work").unwrap_err();
+        assert!(err.to_string().contains("selecionada"), "{err}");
+        let err = set_default_account(&ports, "p", "ghost").unwrap_err();
+        assert!(err.to_string().contains("nao encontrada"), "{err}");
+
+        set_default_account(&ports, "p", "personal").unwrap();
+        disconnect_provider(&ports, "p", "work").unwrap();
+        // The last account can go, and takes the selection with it.
+        disconnect_provider(&ports, "p", "personal").unwrap();
+        assert_eq!(selected(), None);
+
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
     }
 
     #[test]

@@ -202,12 +202,12 @@ async fn handle_model(
     })
 }
 
-/// `$proxy account ...`: list accounts, switch this session to
-/// `provider/alias`, or clear the selection.
+/// `$proxy account ...`: list accounts or switch this session to
+/// `provider/alias`.
 ///
 /// Selecting pins the account to the session id that made the request and
-/// persists it as the last-selected default; clearing drops the session pin
-/// too. Without a session id the command only changes the persisted default.
+/// persists it as the provider's selection. Without a session id the command
+/// only changes the selection.
 async fn handle_account(
     app: &AppState,
     state: &RuntimeState,
@@ -217,19 +217,10 @@ async fn handle_account(
     let rest = args.get(1..).unwrap_or_default();
     let result = settings::account_result(app.ports(), &state.config_path, rest);
     if result.is_ok() {
-        match rest {
-            [command] if command == "clear" => {
-                app.clear_session_accounts(session_id, None).await;
+        if let [target] = rest {
+            if let Some((provider, alias)) = target.split_once('/') {
+                app.set_session_account(session_id, provider, alias).await;
             }
-            [command, provider] if command == "clear" => {
-                app.clear_session_accounts(session_id, Some(provider)).await;
-            }
-            [target] => {
-                if let Some((provider, alias)) = target.split_once('/') {
-                    app.set_session_account(session_id, provider, alias).await;
-                }
-            }
-            _ => {}
         }
         emit_config(app).await;
     }
@@ -269,7 +260,7 @@ mod tests {
     }
 
     #[test]
-    fn maybe_exec_account_pins_the_session_and_persists_the_default() {
+    fn maybe_exec_account_pins_the_session_and_persists_the_selection() {
         let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
         let dir = tempfile::tempdir().unwrap();
         std::env::set_var("LOCAL_PROXY_CONFIG_DIR", dir.path());
@@ -281,6 +272,16 @@ mod tests {
                 "work",
                 &AuthEntry::Api {
                     key: "key-work".to_string(),
+                },
+            )
+            .unwrap();
+        ports
+            .credentials
+            .insert(
+                "mock",
+                "personal",
+                &AuthEntry::Api {
+                    key: "key-personal".to_string(),
                 },
             )
             .unwrap();
@@ -296,30 +297,25 @@ mod tests {
             .block_on(async {
                 let state = app.snapshot().await;
 
-                let body =
-                    json!({"messages": [{"role": "user", "content": "$proxy account mock/work"}]});
+                let body = json!({"messages": [{"role": "user", "content": "$proxy account mock/personal"}]});
                 let out = maybe_exec(&app, &state, &body, "sess-1")
                     .await
                     .expect("is $proxy");
                 assert_eq!(out.code, 0, "stderr: {}", out.stderr);
                 assert_eq!(
                     app.session_account("sess-1", "mock").await.as_deref(),
-                    Some("work")
+                    Some("personal")
                 );
-                // The selection is also the persisted last-selected default.
-                let saved = ports.config.load(&config_path).unwrap();
-                assert_eq!(saved.defaults.active_accounts["mock"], "work");
+                // The selection is also persisted in the store.
+                assert_eq!(ports.credentials.selections().unwrap()["mock"], "personal");
 
-                // `clear` drops the session pin and the persisted default.
-                let body =
-                    json!({"messages": [{"role": "user", "content": "$proxy account clear mock"}]});
+                // There is no `clear`: a provider always has a selection.
+                let body = json!({"messages": [{"role": "user", "content": "$proxy account clear mock"}]});
                 let out = maybe_exec(&app, &state, &body, "sess-1")
                     .await
                     .expect("is $proxy");
-                assert_eq!(out.code, 0, "stderr: {}", out.stderr);
-                assert_eq!(app.session_account("sess-1", "mock").await, None);
-                let saved = ports.config.load(&config_path).unwrap();
-                assert!(!saved.defaults.active_accounts.contains_key("mock"));
+                assert_ne!(out.code, 0);
+                assert_eq!(ports.credentials.selections().unwrap()["mock"], "personal");
             });
 
         std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");

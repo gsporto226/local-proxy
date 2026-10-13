@@ -97,6 +97,13 @@ pub fn build_runtime_state(
     config_path: &Path,
 ) -> Result<RuntimeState, RuntimeError> {
     let mut config = effective_config(ports, config_path)?;
+    if !config.defaults.active_accounts.is_empty() {
+        tracing::warn!(
+            "`defaults.active_accounts` in the config is no longer used (the selection \
+             lives in the account store); it only seeds providers without one"
+        );
+    }
+    selections(ports, &config)?;
     let auth = ports.credentials.read_all().map_err(RuntimeError::Auth)?;
     ports.upstream.discover_models(&mut config, &auth);
     let config = Arc::new(config);
@@ -110,6 +117,22 @@ pub fn build_runtime_state(
         model_override: None,
         config_path: config_path.to_path_buf(),
     })
+}
+
+/// The selected alias of every provider with stored accounts, first giving
+/// the ones without a selection one (seeded from the legacy config
+/// `defaults.active_accounts`).
+///
+/// # Errors
+///
+/// Returns [`RuntimeError::Auth`] if the credential store is unavailable.
+#[allow(clippy::result_large_err)]
+pub fn selections(ports: &Ports, config: &Config) -> Result<HashMap<String, String>, RuntimeError> {
+    ports
+        .credentials
+        .seed_selections(&config.defaults.active_accounts)
+        .and_then(|()| ports.credentials.selections())
+        .map_err(RuntimeError::Auth)
 }
 
 /// Build an upstream account for every stored credential of every provider; a
@@ -363,6 +386,23 @@ impl AppState {
             .get(session_id)
             .and_then(|session| session.pins.get(provider))
             .cloned()
+    }
+
+    /// The account a header-less request of `session_id` uses for
+    /// `provider`: the session's pin, else the provider's selection.
+    ///
+    /// # Errors
+    ///
+    /// Returns a [`CredentialError`] if the store cannot be read.
+    pub async fn request_account(
+        &self,
+        session_id: &str,
+        provider: &str,
+    ) -> Result<Option<String>, CredentialError> {
+        if let Some(pin) = self.session_account(session_id, provider).await {
+            return Ok(Some(pin));
+        }
+        Ok(self.ports.credentials.selections()?.remove(provider))
     }
 
     /// All account pins of `session_id` (`provider -> alias`).

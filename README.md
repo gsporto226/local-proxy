@@ -15,9 +15,9 @@ Most AI tools hardcode their vendor's API shape. The reference design here is [o
 - Endpoints: `/v1/messages`, `/v1/messages/count_tokens`, `/v1/chat/completions`, `/v1/responses`, `/v1/models`, `/health`.
 - Request and response translation plus streaming SSE, event by event, in all three directions (Anthropic to OpenAI, OpenAI to Anthropic, Responses to Anthropic and OpenAI).
 - Embedded provider catalog (`anthropic`, `claude`, `openai`, `chatgpt`, `opencode-go`, `zen`, `groq`, `xai`, `google`, `deepseek`, `openrouter`, `neuralwatt`). Your `config.yaml` only adds to it or overrides entries; it never replaces the whole list.
-- Hot reload. Editing the config or the credential store applies in runtime through a file watcher, no restart.
+- Hot reload. Editing the config applies in runtime through a file watcher, and account changes from the CLI (or another proxy) are picked up on the next request, no restart.
 - Encrypted credential store separate from the config (`accounts.db`, SQLCipher), modeled after opencode's `/connect`. The database key lives in the OS vault (Windows Credential Manager, Linux Secret Service), never in a file.
-- Multiple accounts per provider. An account is a provider plus an alias you choose. Select the active account per provider with `local-proxy account <provider>/<alias>`, switch a live session with `$proxy account <provider>/<alias>`, and override per request with the `X-Local-Proxy-Account: <alias>` header; a provider with a single account needs none of these.
+- Multiple accounts per provider. An account is a provider plus an alias you choose. Select the active account per provider with `local-proxy account <provider>/<alias>`, switch a live session with `$proxy account <provider>/<alias>`, and override per request with the `X-Local-Proxy-Account: <alias>` header; the first account connected for a provider is selected automatically, and a provider with accounts always has one selected.
 - OAuth subscription logins (`local-proxy connect claude --account personal --oauth`, `local-proxy connect chatgpt --account work --oauth`): a provider with an `oauth:` block runs a PKCE login, stores the token bundle as that account, refreshes it automatically near expiry, and the engine stays provider-agnostic.
 - ChatGPT Plus/Pro support: requests go to the ChatGPT backend over the Responses API (`format: openai-responses`).
 - `$proxy` executor. When the last user message starts with `$proxy `, the proxy runs the rest as a `local-proxy` command and returns the output as the model's reply. Works with no provider connected.
@@ -98,7 +98,7 @@ Claude Code sends `/v1/messages`; the proxy routes to a connected provider and t
 | `model [<m>]` | Show or set the active model. `model clear` unsets it. |
 | `connect <provider> --account <alias> [key]` | Store an API key as a named account for an existing provider. Prompts hidden if the key is omitted. `--oauth` runs the provider's OAuth login instead. |
 | `disconnect <provider> --account <alias>` | Remove one stored account; other accounts of the provider are preserved. |
-| `account [<provider>/<alias>]` | List stored accounts (the active one is marked) or select the active account for a provider. `account clear [<provider>]` unsets one or all selections. |
+| `account [<provider>/<alias>]` | List stored accounts (the active one is marked) or select the active account for a provider. There is no `clear`: a provider with accounts always has one selected. |
 | `providers` | List effective providers (catalog plus config) with their account aliases and auth kind (`api`, `oauth`, or `-`). |
 | `stats [--since day\|week\|month\|all] [--json]` | Show usage statistics from recorded requests. |
 | `setup claude [--uninstall]` | Install (or remove) the Claude Code mod via `claude plugin`. |
@@ -180,12 +180,11 @@ local-proxy providers                                  # providers with their ac
 local-proxy disconnect opencode-go --account work      # remove one account
 ```
 
-With several accounts for the same provider, select the active one — persisted in the config and applied by a running proxy via hot reload:
+The first account connected for a provider becomes its selected account. With several, switch the selection — persisted in the account store and picked up by a running proxy on its next request:
 
 ```bash
 local-proxy account                        # list stored accounts, active marked
 local-proxy account opencode-go/work       # use `work` for opencode-go
-local-proxy account clear opencode-go      # back to no selection
 ```
 
 Any single request can override the selection with the `X-Local-Proxy-Account` header:
@@ -194,18 +193,17 @@ Any single request can override the selection with the `X-Local-Proxy-Account` h
 curl -H "X-Local-Proxy-Account: personal" http://127.0.0.1:8787/v1/messages ...
 ```
 
-Inside a session (any client that sends a session id, like Claude Code), `$proxy account <provider>/<alias>` switches that session immediately — the pin is remembered for the session's lifetime and also becomes the persisted last-selected default, so new sessions start there. `$proxy account` lists, and `$proxy account clear [provider]` drops the session pin:
+Inside a session (any client that sends a session id, like Claude Code), `$proxy account <provider>/<alias>` switches that session immediately — the pin is remembered for the session's lifetime and also becomes the persisted last-selected default, so new sessions start there. `$proxy account` lists:
 
 ```
 $proxy account chatgpt/work
-$proxy account clear chatgpt
 ```
 
-Resolution order: a session pin wins; then the `X-Local-Proxy-Account` header; then the selected account for the provider; then the only account when there is exactly one. With two or more accounts and none of those, a missing or unknown alias is a clear 400 error — the proxy never silently picks another account, and a selection whose account was disconnected is reported as stale instead of being replaced.
+Resolution order: the `X-Local-Proxy-Account` header wins for that request; then the session's account; then the provider's selected account. An unknown alias in the header, or a session account that was disconnected, is a clear 400 error — the proxy never silently picks another account.
 
 An alias identifies one stored credential; connecting an alias that already exists is rejected, so a reconnect cannot silently replace a working credential. Disconnect it first, or use another alias.
 
-The store is a fully encrypted SQLite database (SQLCipher). The database key is random per config directory and lives in the OS vault: Windows Credential Manager, or the Linux Secret Service (GNOME Keyring, KWallet). Headless Linux needs a running, unlocked Secret Service — there is no plaintext fallback. On first use, a legacy `auth.json` is migrated as the `default` account of each provider, and the file is kept next to the database as `auth.json.migrated`.
+The store is a fully encrypted SQLite database (SQLCipher). The database key is random and lives in the OS vault (under `local-proxy/accounts-db`/`default` for the real store, so moving the config directory keeps it): Windows Credential Manager, or the Linux Secret Service (GNOME Keyring, KWallet). Headless Linux needs a running, unlocked Secret Service — there is no plaintext fallback. On first use, a legacy `auth.json` is migrated as the `default` account of each provider, and the file is kept next to the database as `auth.json.migrated`.
 
 ### OAuth subscription logins
 
@@ -338,7 +336,7 @@ The selection is stored in `defaults.active_model` in the config. Last write win
 
 ### Hot reload
 
-Any edit to `config.yaml` or the account store (`accounts.db`), by CLI or by hand, applies in runtime through a file watcher with a 300ms debounce. No restart. One exception: `defaults.active_model` is not reread from the file. Each instance keeps the active model it set in memory.
+Any edit to `config.yaml`, by CLI or by hand, applies in runtime through a file watcher with a 300ms debounce. Account changes in `accounts.db` (connect, disconnect from the CLI or another proxy) are detected on the next request through the database's revision counter instead. No restart. One exception: `defaults.active_model` is not reread from the file. Each instance keeps the active model it set in memory.
 
 ## HTTP endpoints
 
@@ -546,7 +544,7 @@ e2e/                  Bun test suite (mock and live)
 The known gaps, tracked in `docs/PENDING.md`, are not in scope for the current version:
 
 - `model` rewrites the config through serde, so manual comments and formatting in `config.yaml` are lost on that write.
-- Concurrent OAuth refreshes for the same account from several proxy instances can race; the store serializes writes, but the last refresh wins.
+- Concurrent OAuth refreshes for the same account from several proxy instances: before refreshing, a proxy rereads the stored tokens and adopts them if another process already rotated the refresh token; the write is a compare-and-swap, so the first refresh wins and the others adopt it.
 - The launcher keeps a single pid file, so multiple background proxies overwrite each other.
 - No retry or round-robin across keys, no rate limiting, no embeddings, no cache, no container image.
 
