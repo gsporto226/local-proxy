@@ -51,17 +51,22 @@ pub trait CredentialStore: Send + Sync {
     fn insert(&self, provider: &str, alias: &str, entry: &AuthEntry)
         -> Result<(), CredentialError>;
 
-    /// Replace an existing account's OAuth tokens after a refresh.
+    /// Store refreshed OAuth tokens unless another process refreshed first: a
+    /// compare-and-swap on `used_refresh`, the refresh token `fresh` was
+    /// obtained with. Returns `None` when `fresh` was written, or the stored
+    /// tokens when another process won (rotating refresh tokens form one
+    /// chain, and the stored one is it).
     ///
     /// # Errors
     ///
     /// Returns an error if the account is missing or storage is unavailable.
-    fn update_oauth(
+    fn swap_oauth(
         &self,
         provider: &str,
         alias: &str,
-        tokens: &OAuthTokens,
-    ) -> Result<(), CredentialError>;
+        used_refresh: &str,
+        fresh: &OAuthTokens,
+    ) -> Result<Option<OAuthTokens>, CredentialError>;
 
     /// Remove one account, returning whether it existed.
     ///

@@ -389,27 +389,48 @@ fn insert_account(provider: &str, alias: &str, entry: &AuthEntry) -> Result<(), 
     })
 }
 
-/// Replace an existing account's OAuth tokens after a refresh.
-///
-/// # Errors
-/// Returns an error if the account is missing or storage is unavailable.
-fn update_oauth_for(provider: &str, alias: &str, tokens: &OAuthTokens) -> Result<(), AuthError> {
+/// Compare-and-swap refreshed OAuth tokens under `BEGIN IMMEDIATE`; see
+/// [`CredentialStore::swap_oauth`].
+fn swap_oauth_for(
+    provider: &str,
+    alias: &str,
+    used_refresh: &str,
+    fresh: &OAuthTokens,
+) -> Result<Option<OAuthTokens>, AuthError> {
     let value =
-        serde_json::to_string(&AuthEntry::OAuth(tokens.clone())).map_err(AuthError::Format)?;
+        serde_json::to_string(&AuthEntry::OAuth(fresh.clone())).map_err(AuthError::Format)?;
     with_db(|conn| {
-        let updated = conn
-            .execute(
-                "UPDATE accounts SET credential=?3 WHERE provider=?1 AND alias=?2",
-                params![provider, alias, value],
-            )
+        let tx = conn
+            .transaction_with_behavior(TransactionBehavior::Immediate)
             .map_err(AuthError::Database)?;
-        if updated == 0 {
+        let stored: Option<String> = tx
+            .query_row(
+                "SELECT credential FROM accounts WHERE provider=?1 AND alias=?2",
+                params![provider, alias],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(AuthError::Database)?;
+        let Some(stored) = stored else {
             return Err(AuthError::NotFound {
                 provider: provider.to_string(),
                 alias: alias.to_string(),
             });
+        };
+        if let AuthEntry::OAuth(current) =
+            serde_json::from_str(&stored).map_err(AuthError::Format)?
+        {
+            if current.refresh != used_refresh {
+                return Ok(Some(current));
+            }
         }
-        Ok(())
+        tx.execute(
+            "UPDATE accounts SET credential=?3 WHERE provider=?1 AND alias=?2",
+            params![provider, alias, value],
+        )
+        .map_err(AuthError::Database)?;
+        tx.commit().map_err(AuthError::Database)?;
+        Ok(None)
     })
 }
 
@@ -475,13 +496,14 @@ impl CredentialStore for SqlCipherCredentialStore {
         Ok(insert_account(provider, alias, entry)?)
     }
 
-    fn update_oauth(
+    fn swap_oauth(
         &self,
         provider: &str,
         alias: &str,
-        tokens: &OAuthTokens,
-    ) -> Result<(), CredentialError> {
-        Ok(update_oauth_for(provider, alias, tokens)?)
+        used_refresh: &str,
+        fresh: &OAuthTokens,
+    ) -> Result<Option<OAuthTokens>, CredentialError> {
+        Ok(swap_oauth_for(provider, alias, used_refresh, fresh)?)
     }
 
     fn remove(&self, provider: &str, alias: &str) -> Result<bool, CredentialError> {
@@ -507,6 +529,36 @@ mod tests {
         // Equivalent spellings of the same dir share one key.
         let dotted = dir.join(".").join("accounts.db");
         assert_eq!(vault_identity(&dotted, true).unwrap(), isolated);
+    }
+
+    #[test]
+    fn oauth_swap_keeps_the_first_refresh() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", dir.path());
+        let store = SqlCipherCredentialStore;
+        let tokens = |refresh: &str| OAuthTokens {
+            access: format!("a-{refresh}"),
+            refresh: refresh.to_string(),
+            expires: 1,
+            account_id: None,
+        };
+        store
+            .insert("p", "a", &AuthEntry::OAuth(tokens("r0")))
+            .unwrap();
+
+        // The first refresher (holding r0) wins and writes r1.
+        assert_eq!(
+            store.swap_oauth("p", "a", "r0", &tokens("r1")).unwrap(),
+            None
+        );
+        // A second refresher that also started from r0 adopts r1.
+        let adopted = store.swap_oauth("p", "a", "r0", &tokens("r2")).unwrap();
+        assert_eq!(adopted, Some(tokens("r1")));
+        let stored = store.get("p", "a").unwrap().unwrap();
+        assert_eq!(stored.oauth().unwrap().refresh, "r1");
+
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
     }
 
     #[test]
