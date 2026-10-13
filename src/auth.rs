@@ -441,28 +441,48 @@ fn insert_account(provider: &str, alias: &str, entry: &AuthEntry) -> Result<(), 
     })
 }
 
-/// Replace an existing account's OAuth tokens after a refresh.
+/// Store refreshed OAuth tokens unless another process refreshed first.
+///
+/// A compare-and-swap under `BEGIN IMMEDIATE` on the refresh token `fresh`
+/// was obtained with. Returns `None` when `fresh` was written, or the stored tokens when another
+/// process refreshed first: with rotating refresh tokens there is one chain,
+/// and the stored one wins.
 ///
 /// # Errors
 /// Returns an error if the account is missing or storage is unavailable.
-pub fn update_oauth_for(
+pub fn swap_oauth_for(
     provider: &str,
     alias: &str,
-    tokens: &OAuthTokens,
-) -> Result<(), AuthError> {
+    used_refresh: &str,
+    fresh: &OAuthTokens,
+) -> Result<Option<OAuthTokens>, AuthError> {
     let value =
-        serde_json::to_string(&AuthEntry::OAuth(tokens.clone())).map_err(AuthError::Format)?;
+        serde_json::to_string(&AuthEntry::OAuth(fresh.clone())).map_err(AuthError::Format)?;
     with_db(|conn| {
-        let updated = conn
-            .execute(
-                "UPDATE accounts SET credential=?3 WHERE provider=?1 AND alias=?2",
-                params![provider, alias, value],
+        let tx = conn
+            .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
+            .map_err(AuthError::Database)?;
+        let stored: String = tx
+            .query_row(
+                "SELECT credential FROM accounts WHERE provider=?1 AND alias=?2",
+                params![provider, alias],
+                |row| row.get(0),
             )
             .map_err(AuthError::Database)?;
-        if updated == 0 {
-            return Err(AuthError::Database(rusqlite::Error::QueryReturnedNoRows));
+        if let AuthEntry::OAuth(current) =
+            serde_json::from_str(&stored).map_err(AuthError::Format)?
+        {
+            if current.refresh != used_refresh {
+                return Ok(Some(current));
+            }
         }
-        Ok(())
+        tx.execute(
+            "UPDATE accounts SET credential=?3 WHERE provider=?1 AND alias=?2",
+            params![provider, alias, value],
+        )
+        .map_err(AuthError::Database)?;
+        tx.commit().map_err(AuthError::Database)?;
+        Ok(None)
     })
 }
 
@@ -556,6 +576,39 @@ mod tests {
         drop(other);
         assert_ne!(data_version().unwrap(), start);
         assert!(read_auth().unwrap()["p"].contains_key("cli"));
+
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oauth_swap_keeps_the_first_refresh() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "local-proxy-auth-swap-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", &dir);
+        let tokens = |refresh: &str| OAuthTokens {
+            access: format!("a-{refresh}"),
+            refresh: refresh.to_string(),
+            expires: 1,
+            account_id: None,
+        };
+        set_oauth_for("p", "a", &tokens("r0")).unwrap();
+
+        // First refresher (holding r0) wins and writes r1.
+        assert_eq!(swap_oauth_for("p", "a", "r0", &tokens("r1")).unwrap(), None);
+        // A second refresher that also started from r0 must adopt r1.
+        let adopted = swap_oauth_for("p", "a", "r0", &tokens("r2")).unwrap();
+        assert_eq!(adopted, Some(tokens("r1")));
+        let stored = account_for("p", "a").unwrap().unwrap();
+        assert_eq!(stored.oauth().unwrap().refresh, "r1");
 
         std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
         let _ = std::fs::remove_dir_all(&dir);

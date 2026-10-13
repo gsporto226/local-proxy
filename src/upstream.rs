@@ -182,7 +182,7 @@ impl ProviderClient {
 
     /// Current OAuth access token, refreshing first when it is at or inside
     /// [`crate::oauth::REFRESH_LEEWAY_MS`] of expiry. Refreshes are serialized
-    /// per provider by the shared state mutex, so concurrent requests refresh
+    /// per account by the shared state mutex, so concurrent requests refresh
     /// once. A failed refresh keeps the current token; the upstream answers
     /// 401 if it is truly expired.
     async fn oauth_access(&self) -> Option<String> {
@@ -195,19 +195,40 @@ impl ProviderClient {
                 .filter(|a| !a.is_empty());
         };
         let mut guard = state.lock().await;
-        if guard.tokens.expires <= crate::oauth::now_ms() + crate::oauth::REFRESH_LEEWAY_MS {
+        let expiring =
+            |t: &OAuthTokens| t.expires <= crate::oauth::now_ms() + crate::oauth::REFRESH_LEEWAY_MS;
+        if expiring(&guard.tokens) {
+            // Other processes (CLI, other proxies) share this account. If one
+            // already rotated the refresh token, adopt its tokens instead of
+            // spending ours. The store lock is not held across the network
+            // call; `swap_oauth_for` compares-and-swaps after it instead.
+            if let Ok(Some(AuthEntry::OAuth(stored))) =
+                crate::auth::account_for(&self.name, &self.alias)
+            {
+                if stored.refresh != guard.tokens.refresh {
+                    guard.tokens = stored;
+                }
+            }
+        }
+        if expiring(&guard.tokens) {
             tracing::info!(target: crate::LOG_TARGET, provider = %self.name, "refreshing oauth token");
             match crate::oauth::refresh(&self.http, &guard.config, &guard.tokens).await {
                 Ok(fresh) => {
-                    if let Err(e) = crate::auth::update_oauth_for(&self.name, &self.alias, &fresh) {
-                        tracing::warn!(
-                            target: crate::LOG_TARGET,
-                            provider = %self.name,
-                            error = %e,
-                            "failed to persist refreshed oauth token"
-                        );
-                    }
-                    guard.tokens = fresh;
+                    let used = guard.tokens.refresh.clone();
+                    guard.tokens =
+                        match crate::auth::swap_oauth_for(&self.name, &self.alias, &used, &fresh) {
+                            Ok(None) => fresh,
+                            Ok(Some(stored)) => stored,
+                            Err(e) => {
+                                tracing::warn!(
+                                    target: crate::LOG_TARGET,
+                                    provider = %self.name,
+                                    error = %e,
+                                    "failed to persist refreshed oauth token"
+                                );
+                                fresh
+                            }
+                        };
                 }
                 Err(e) => {
                     tracing::warn!(
