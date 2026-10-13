@@ -55,6 +55,9 @@ pub struct AppState {
     /// pins and every session falls back to the persisted last-selected
     /// default.
     sessions: Arc<RwLock<HashMap<String, HashMap<String, String>>>>,
+    /// The account store's `data_version` the clients were built from; `None`
+    /// until [`AppState::track_accounts`] (a live server) turns tracking on.
+    accounts_version: Arc<std::sync::Mutex<Option<i64>>>,
 }
 
 impl AppState {
@@ -64,6 +67,7 @@ impl AppState {
         Self {
             inner: Arc::new(RwLock::new(state)),
             sessions: Arc::new(RwLock::new(HashMap::new())),
+            accounts_version: Arc::new(std::sync::Mutex::new(None)),
         }
     }
 
@@ -112,9 +116,78 @@ impl AppState {
         }
     }
 
-    /// Snapshot the current runtime state (cheap Arc clones).
+    /// Snapshot the current runtime state (cheap Arc clones), first picking up
+    /// account changes another process committed to the store.
     pub async fn snapshot(&self) -> RuntimeState {
+        self.reload_accounts_if_changed().await;
         self.inner.read().await.clone()
+    }
+
+    fn seen_version(&self) -> Option<i64> {
+        *self
+            .accounts_version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    fn set_seen_version(&self, version: Option<i64>) {
+        *self
+            .accounts_version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = version;
+    }
+
+    /// Start following the account store: the current clients count as
+    /// built from its current `data_version`.
+    pub fn track_accounts(&self) {
+        match crate::auth::data_version() {
+            Ok(version) => self.set_seen_version(Some(version)),
+            Err(e) => tracing::warn!("account store change tracking disabled: {e}"),
+        }
+    }
+
+    /// Rebuild the clients when the store's `data_version` moved. A provider
+    /// that gained or lost its only usable account changes the model catalog
+    /// too, so that case rebuilds the whole state (with model discovery).
+    async fn reload_accounts_if_changed(&self) {
+        let Some(seen) = self.seen_version() else {
+            return;
+        };
+        let Ok(now) = crate::auth::data_version() else {
+            return;
+        };
+        if now == seen {
+            return;
+        }
+        let mut guard = self.inner.write().await;
+        // Another request may have rebuilt while this one waited.
+        if self.seen_version() == Some(now) {
+            return;
+        }
+        let clients = match build_clients(&guard.config) {
+            Ok(clients) => clients,
+            Err(e) => {
+                tracing::warn!("account reload failed: {e}");
+                return;
+            }
+        };
+        if connected_providers(&clients) == connected_providers(&guard.clients) {
+            guard.clients = Arc::new(clients);
+        } else {
+            match build_runtime_state(&guard.config_path) {
+                Ok(mut new_state) => {
+                    carry_instance_state(&guard, &mut new_state);
+                    *guard = new_state;
+                }
+                Err(e) => {
+                    tracing::warn!("account reload failed: {e}");
+                    return;
+                }
+            }
+        }
+        self.set_seen_version(Some(now));
+        drop(guard);
+        tracing::info!("account change applied (data_version {seen} -> {now})");
     }
 
     /// Set the in-memory `active_model` for this instance without touching any
@@ -210,13 +283,13 @@ fn carry_instance_state(old: &RuntimeState, new: &mut RuntimeState) {
 }
 
 /// Whether `path` is one of the files whose change triggers a hot-reload:
-/// the active config file or the auth store.
+/// the active config file. Account changes are picked up through the store's
+/// `data_version` instead ([`AppState::snapshot`]).
 fn is_reload_path(path: &Path, config_file: &std::ffi::OsStr) -> bool {
-    path.file_name()
-        .is_some_and(|name| name == config_file || name == "auth.json" || name == "accounts.db")
+    path.file_name().is_some_and(|name| name == config_file)
 }
 
-/// Spawn a file-watcher task that rebuilds `state` when the config or auth file
+/// Spawn a file-watcher task that rebuilds `state` when the config file
 /// changes (hot-reload without restart). Watches the global config dir and the
 /// parent of `config_path` when they differ.
 ///
@@ -269,6 +342,7 @@ pub fn spawn_watcher(config_path: PathBuf, app_state: &AppState) -> Result<(), R
         }
     }
 
+    app_state.track_accounts();
     let state = app_state.inner.clone();
     let (btx, mut brx) = tokio::sync::mpsc::unbounded_channel::<()>();
     tokio::task::spawn_blocking(move || {
@@ -681,6 +755,18 @@ fn resolve_model(
         resolved.upstream_model,
         resolved.reasoning_effort,
     ))
+}
+
+/// Providers with at least one usable account (sorted), the part of the
+/// clients that decides which models are discovered.
+fn connected_providers(clients: &HashMap<String, HashMap<String, ProviderClient>>) -> Vec<&str> {
+    let mut names: Vec<&str> = clients
+        .iter()
+        .filter(|(_, accounts)| accounts.values().any(ProviderClient::has_key))
+        .map(|(name, _)| name.as_str())
+        .collect();
+    names.sort_unstable();
+    names
 }
 
 fn client_for(
@@ -1546,7 +1632,8 @@ mod tests {
     fn watcher_reacts_only_to_config_and_auth() {
         let config = std::ffi::OsStr::new("config.yaml");
         assert!(is_reload_path(Path::new("C:/cfg/config.yaml"), config));
-        assert!(is_reload_path(Path::new("C:/cfg/auth.json"), config));
+        assert!(!is_reload_path(Path::new("C:/cfg/auth.json"), config));
+        assert!(!is_reload_path(Path::new("C:/cfg/accounts.db"), config));
         assert!(!is_reload_path(Path::new("C:/cfg/other.yaml"), config));
         assert!(!is_reload_path(Path::new("C:/cfg/local-proxy.log"), config));
         assert!(!is_reload_path(Path::new("C:/cfg/stats.db"), config));

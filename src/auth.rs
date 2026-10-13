@@ -246,6 +246,9 @@ fn open_db(path: &Path) -> Result<Connection, AuthError> {
     })?;
     let key = db_key(path)?;
     let conn = Connection::open(path).map_err(AuthError::Database)?;
+    // The CLI and every running proxy share the file; wait out their writes.
+    conn.busy_timeout(std::time::Duration::from_secs(5))
+        .map_err(AuthError::Database)?;
     // Encryption is the security boundary; owner-only permissions are defense
     // in depth where the OS supports them.
     #[cfg(unix)]
@@ -263,7 +266,7 @@ fn open_db(path: &Path) -> Result<Connection, AuthError> {
         return Err(AuthError::Database(rusqlite::Error::InvalidQuery));
     }
     conn.execute_batch(
-        "PRAGMA journal_mode = DELETE;
+        "PRAGMA journal_mode = WAL;
          CREATE TABLE IF NOT EXISTS accounts (
            provider TEXT NOT NULL,
            alias TEXT NOT NULL,
@@ -327,7 +330,7 @@ fn migrate(conn: &mut Connection, path: &Path) -> Result<(), AuthError> {
     Ok(())
 }
 
-fn with_db<T>(f: impl FnOnce(&Connection) -> Result<T, AuthError>) -> Result<T, AuthError> {
+fn with_db<T>(f: impl FnOnce(&mut Connection) -> Result<T, AuthError>) -> Result<T, AuthError> {
     // A unit test that forgot to point `LOCAL_PROXY_CONFIG_DIR` at an isolated
     // dir must fail loudly instead of migrating and touching the real store.
     #[cfg(test)]
@@ -336,9 +339,36 @@ fn with_db<T>(f: impl FnOnce(&Connection) -> Result<T, AuthError>) -> Result<T, 
         "unit tests must set LOCAL_PROXY_CONFIG_DIR to an isolated directory; \
          refusing to touch the real credential store"
     );
-    let mut conn = open_db(&auth_db())?;
-    migrate(&mut conn, &auth_file())?;
-    f(&conn)
+    let path = auth_db();
+    // A poisoned lock only means a panic mid-call; SQLite rolled back.
+    let mut shared = DB.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    // Tests repoint `LOCAL_PROXY_CONFIG_DIR`, so the connection follows the path.
+    if shared.as_ref().is_none_or(|(open, _)| *open != path) {
+        *shared = None;
+        *shared = Some((path.clone(), open_db(&path)?));
+    }
+    let (_, conn) = shared.as_mut().expect("connection opened above");
+    migrate(conn, &auth_file())?;
+    let result = f(conn);
+    drop(shared);
+    result
+}
+
+/// The process-wide connection, opened once (the key derivation is costly)
+/// and keyed by its path.
+// ponytail: one global lock, fine for a handful of rare store calls.
+static DB: std::sync::Mutex<Option<(PathBuf, Connection)>> = std::sync::Mutex::new(None);
+
+/// SQLite's `data_version`: changes only when another connection (another
+/// process) commits, never for this process's own writes.
+///
+/// # Errors
+/// Returns an error if the vault or database is unavailable.
+pub fn data_version() -> Result<i64, AuthError> {
+    with_db(|conn| {
+        conn.query_row("PRAGMA data_version", [], |row| row.get(0))
+            .map_err(AuthError::Database)
+    })
 }
 
 /// Read every saved account and its credential.
@@ -495,6 +525,40 @@ mod tests {
         // Equivalent spellings of the same dir share one key.
         let dotted = dir.join(".").join("accounts.db");
         assert_eq!(vault_identity(&dotted, true).unwrap(), isolated);
+    }
+
+    #[test]
+    fn data_version_moves_only_for_other_connections() {
+        let _guard = crate::TEST_STATE_LOCK.lock().unwrap();
+        let dir = std::env::temp_dir().join(format!(
+            "local-proxy-auth-version-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::env::set_var("LOCAL_PROXY_CONFIG_DIR", &dir);
+
+        let start = data_version().unwrap();
+        set_key_for("p", "own", "k").unwrap();
+        assert_eq!(data_version().unwrap(), start, "own writes are not changes");
+
+        // A second connection stands in for the CLI process.
+        let other = open_db(&auth_db()).unwrap();
+        other
+            .execute(
+                "INSERT INTO accounts(provider, alias, credential) VALUES('p', 'cli', ?1)",
+                [r#"{"type":"api","key":"k2"}"#],
+            )
+            .unwrap();
+        drop(other);
+        assert_ne!(data_version().unwrap(), start);
+        assert!(read_auth().unwrap()["p"].contains_key("cli"));
+
+        std::env::remove_var("LOCAL_PROXY_CONFIG_DIR");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
