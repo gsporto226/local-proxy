@@ -53,6 +53,7 @@ providers:
   - name: chatgpt
     base_url: https://chatgpt.com/backend-api/codex
     format: openai-responses
+    session_header: session_id
     headers:
       originator: codex_cli_rs
       OpenAI-Beta: responses=experimental

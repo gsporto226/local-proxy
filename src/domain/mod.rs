@@ -4,6 +4,7 @@
 //! sit behind the [`crate::ports`] traits.
 
 pub mod account;
+pub mod cache;
 pub mod catalog;
 pub mod config;
 pub mod error;

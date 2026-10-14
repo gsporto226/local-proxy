@@ -101,8 +101,12 @@ Claude Code sends `/v1/messages`; the proxy routes to a connected provider and t
 | `account [<provider>/<alias>]` | List stored accounts (the active one is marked) or select the active account for a provider. There is no `clear`: a provider with accounts always has one selected. |
 | `providers` | List effective providers (catalog plus config) with their account aliases and auth kind (`api`, `oauth`, or `-`). |
 | `stats [--since day\|week\|month\|all] [--json]` | Show usage statistics from recorded requests. |
+| `cache-check --model <provider/model> --dry-run` | Preview a generated prompt-cache comparison. Add `--confirm-live` instead of `--dry-run` to send requests. |
 | `setup claude [--uninstall]` | Install (or remove) the Claude Code mod via `claude plugin`. |
 | `update` | Check for and apply a newer release. |
+
+See [Check prompt cache reuse](docs/prompt-cache.md) for live comparisons,
+token reuse metrics, diagnostics, and the optional Anthropic cache policy.
 
 ## Configuration
 

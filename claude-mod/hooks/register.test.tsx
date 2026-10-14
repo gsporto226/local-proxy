@@ -1,6 +1,6 @@
 import { expect, mock, test } from 'claude-code/testing'
 import type { On } from 'claude-code'
-import { formatResetTime, fuzzyMatch, meter, plain, providerOrder, tailFit } from './register'
+import { cacheTokenText, formatResetTime, fuzzyMatch, meter, plain, providerOrder, tailFit } from './register'
 
 const BASE = 'http://127.0.0.1:9999'
 const ROUTES: Record<string, unknown> = {
@@ -36,17 +36,17 @@ const ROUTES: Record<string, unknown> = {
       input_tokens: 10,
       output_tokens: 20,
       cost_usd: 0.25,
-      cache: { hit_requests: 2, reported_requests: 2, rate_percent: 100, coverage_percent: 66.67 },
+      cache: { hit_requests: 2, reported_requests: 2, rate_percent: 100, coverage_percent: 66.67, read_tokens: 600, write_tokens: 200, reported_input_tokens: 1000, uncached_tokens: 200, read_percent: 60 },
     },
     providers: [{ provider: 'openai', requests: 3, input_tokens: 10, output_tokens: 20, cost_usd: 0.25,
-      cache: { hit_requests: 2, reported_requests: 2, rate_percent: 100, coverage_percent: 66.67 } }],
+      cache: { hit_requests: 2, reported_requests: 2, rate_percent: 100, coverage_percent: 66.67, read_tokens: 600, write_tokens: 200, reported_input_tokens: 1000, uncached_tokens: 200, read_percent: 60 } }],
     accounts: [
       { provider: 'openai', alias: 'work', requests: 2, input_tokens: 10, output_tokens: 20, cost_usd: 0.25,
         cache: { hit_requests: 2, reported_requests: 2, rate_percent: 100, coverage_percent: 100 } },
       { provider: 'openai', alias: 'home', requests: 1, input_tokens: 0, output_tokens: 0, cost_usd: 0,
         cache: { hit_requests: 0, reported_requests: 0, rate_percent: null, coverage_percent: 0 } },
     ],
-    recent: [],
+    recent: [{ ts: 1, provider: "openai", alias: "work", model: "gpt-x", cache_read_tokens: null, cache_write_tokens: 0, cache_diagnostics: ["telemetry_unavailable", "stable_prefix_changed"] }],
   },
   'GET /admin/session/sess-1': { account: {}, effort: null, stats: null },
   'GET /admin/logs?n=200': { lines: ['boot'] },
@@ -273,6 +273,10 @@ test('Usage shows request cache hit rate and telemetry coverage', async ($, on) 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'tab-Usage' })
   expect(await ui.find({ text: /Cache hit rate/ })).toBeDefined()
+  expect(await ui.find({ text: /Input token reuse/ })).toBeDefined()
+  expect(await ui.find({ text: /60% reused.*600 read.*200 written.*200 uncached/ })).toBeDefined()
+  expect(await ui.find({ text: /Cache telemetry unavailable/ })).toBeDefined()
+  expect(await ui.find({ text: /Stable prompt prefix changed/ })).toBeDefined()
   expect(await ui.find({ text: /100%.*2\/2/ })).toBeDefined()
   expect(await ui.find({ text: /openai\/work.*100%/ })).toBeDefined()
 })
@@ -410,4 +414,13 @@ test('quota reset time includes a local date-time and relative countdown', async
 test('log tail wraps long lines and keeps the newest that fit', () => {
   expect(tailFit(['a', 'b'.repeat(25), 'c'], 4, 10)).toEqual(['b'.repeat(25), 'c'])
   expect(tailFit(['x'.repeat(100)], 2, 10)).toEqual(['x'.repeat(100)])
+})
+
+
+test('token reuse distinguishes missing telemetry from a reported zero', () => {
+  expect(cacheTokenText(undefined)).toContain('unavailable')
+  expect(cacheTokenText({ hit_requests: 0, reported_requests: 0, rate_percent: null, coverage_percent: 0,
+    read_tokens: 0, write_tokens: 0, reported_input_tokens: 0, uncached_tokens: 0, read_percent: null })).toContain('n/a')
+  expect(cacheTokenText({ hit_requests: 0, reported_requests: 1, rate_percent: 0, coverage_percent: 100,
+    read_tokens: 0, write_tokens: 200, reported_input_tokens: 1000, uncached_tokens: 800, read_percent: 0 })).toBe('0% reused · 0 read · 200 written · 800 uncached')
 })

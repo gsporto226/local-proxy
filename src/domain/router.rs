@@ -324,6 +324,7 @@ mod tests {
                     headers: std::collections::HashMap::new(),
                     session_header: None,
                     oauth: None,
+                    prompt_cache: crate::domain::config::PromptCachePolicy::Preserve,
                 },
                 Provider {
                     name: "openai".to_string(),
@@ -334,6 +335,7 @@ mod tests {
                     headers: std::collections::HashMap::new(),
                     session_header: None,
                     oauth: None,
+                    prompt_cache: crate::domain::config::PromptCachePolicy::Preserve,
                 },
             ],
             routes: vec![

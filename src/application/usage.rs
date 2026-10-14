@@ -1,11 +1,14 @@
 //! Best-effort usage recording: a stats problem is logged, never surfaced, so
 //! it can never break a proxied request.
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use serde_json::{json, Value};
 
+use crate::domain::cache::{self, CacheDiagnostic, CacheObservation};
+use crate::domain::config::ProviderFormat;
 use crate::domain::stats::StatLine;
 use crate::domain::translate::{self, EnergyCost, TokenUsage};
 use crate::ports::{EventBus, Ports, UsageStore};
@@ -16,6 +19,7 @@ use crate::ports::{EventBus, Ports, UsageStore};
 pub struct UsageRecorder {
     store: Arc<dyn UsageStore>,
     events: Arc<dyn EventBus>,
+    observations: Arc<Mutex<HashMap<String, CacheObservation>>>,
 }
 
 impl UsageRecorder {
@@ -25,7 +29,34 @@ impl UsageRecorder {
         Self {
             store: ports.usage.clone(),
             events: ports.events.clone(),
+            observations: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Observe request structure before sending, retaining only bounded session hashes.
+    #[must_use]
+    pub fn observe_cache(
+        &self,
+        session: &str,
+        format: ProviderFormat,
+        observation: CacheObservation,
+        body: &Value,
+    ) -> Vec<CacheDiagnostic> {
+        let mut diagnostics = cache::request_diagnostics(format, body);
+        if session.is_empty() {
+            return diagnostics;
+        }
+        let Ok(mut observations) = self.observations.lock() else {
+            return diagnostics;
+        };
+        if let Some(previous) = observations.get(session) {
+            diagnostics.extend(observation.changes_from(previous));
+        }
+        if observations.len() >= 1024 && !observations.contains_key(session) {
+            observations.clear();
+        }
+        observations.insert(session.to_string(), observation);
+        diagnostics
     }
 
     /// Record one request; latency runs from `started` until now.
@@ -45,6 +76,7 @@ impl UsageRecorder {
             input = stat.input_tokens,
             cache_read = ?stat.cache_read_tokens,
             cache_write = stat.cache_write_tokens,
+            cache_diagnostics = ?stat.cache_diagnostics,
             latency_ms,
             "request usage"
         );
@@ -61,6 +93,9 @@ impl UsageRecorder {
                     "latency_ms": latency_ms,
                     "cost_usd": stat.cost.and_then(|c| c.request_cost_usd),
                     "session_id": stat.session_id,
+                    "cache_read_tokens": stat.cache_read_tokens,
+                    "cache_write_tokens": stat.cache_write_tokens,
+                    "cache_diagnostics": stat.cache_diagnostics,
                 }),
             ),
             Err(e) => tracing::warn!(
@@ -142,6 +177,8 @@ pub struct RequestMeta {
     pub started: Instant,
     /// The client session id, or `""`.
     pub session_id: String,
+    /// Request-side evidence observed before forwarding to the provider.
+    pub cache_diagnostics: Vec<CacheDiagnostic>,
 }
 
 impl RequestMeta {
@@ -168,6 +205,7 @@ impl RequestMeta {
             cache_hit: usage.cache_hit(),
             cache_read_tokens: usage.cache_read,
             cache_write_tokens: usage.cache_write,
+            cache_diagnostics: cache::outcome_diagnostics(&self.cache_diagnostics, status, &usage),
         }
     }
 }
@@ -222,7 +260,36 @@ mod tests {
             streamed: false,
             started: Instant::now(),
             session_id: "sess-1".to_string(),
+            cache_diagnostics: Vec::new(),
         }
+    }
+
+    #[test]
+    fn observations_are_bounded_and_do_not_cross_sessions() {
+        let ports = crate::bootstrap::ports();
+        let recorder = UsageRecorder::new(&ports);
+        let first = json!({"instructions":"first", "prompt_cache_key":"key"});
+        let changed = json!({"instructions":"changed", "prompt_cache_key":"key"});
+        let observe = |session: &str, body: &Value| {
+            recorder.observe_cache(
+                session,
+                ProviderFormat::OpenaiResponses,
+                CacheObservation::new("chatgpt", "gpt", "work", body),
+                body,
+            )
+        };
+        assert!(observe("one", &first).is_empty());
+        assert!(observe("two", &changed).is_empty());
+        assert_eq!(
+            observe("one", &changed),
+            vec![CacheDiagnostic::StablePrefixChanged]
+        );
+        assert!(observe("", &first).is_empty());
+        assert!(observe("", &changed).is_empty());
+        for index in 0..1030 {
+            let _ = observe(&format!("session-{index}"), &first);
+        }
+        assert!(recorder.observations.lock().unwrap().len() <= 1024);
     }
 
     #[test]

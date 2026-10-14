@@ -17,7 +17,7 @@ import {
   writeConfig,
   type ProxyHandle,
 } from "./helpers";
-import { mockConfig, startMockUpstream, type MockUpstream } from "./mock-upstream";
+import { mockConfig, startMockUpstream, type CacheUsage, type MockUpstream } from "./mock-upstream";
 
 // Providers get their API keys only from the credential store. These tests seed
 // the legacy `auth.json` on purpose: the proxy migrates it to the encrypted
@@ -66,6 +66,236 @@ function stopScenario(handle: { mock: MockUpstream; proxy: ProxyHandle }): void 
   stopProxy(handle.proxy);
   handle.mock.stop();
 }
+
+function cacheRecord(value: unknown): Record<string, unknown> {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new Error("expected a JSON object in cache test");
+  }
+  return Object.fromEntries(Object.entries(value));
+}
+
+function cacheRecords(value: unknown): Record<string, unknown>[] {
+  if (!Array.isArray(value)) throw new Error("expected a JSON array in cache test");
+  return value.map(cacheRecord);
+}
+
+async function cacheJson(response: Response): Promise<Record<string, unknown>> {
+  if (response.status !== 200) throw new Error(`cache test HTTP ${response.status}: ${await response.text()}`);
+  expect(response.status).toBe(200);
+  const value: unknown = await response.json();
+  return cacheRecord(value);
+}
+
+async function startCacheScenario(opts: { cacheUsage?: CacheUsage[]; simulateCache?: boolean; policy?: string } = {}) {
+  const { dir, env } = isolatedConfigDir();
+  writeFileSync(authStorePath(dir), JSON.stringify({
+    mock_openai: { type: "api", key: "test-openai" },
+    mock_anthropic: { type: "api", key: "test-anthropic" },
+    mock_responses: { type: "api", key: "test-responses" },
+  }));
+  const mock = await startMockUpstream(opts);
+  let config = mockConfig(`http://127.0.0.1:${mock.port}`, { activeModel: opts.policy ? "gpt-via-anthropic" : "claude-via-responses" });
+  if (opts.policy) config = config.replace("    format: anthropic", `    format: anthropic\n    prompt_cache: ${opts.policy}`);
+  const configPath = writeConfig(config);
+  try {
+    const proxy = await startProxy(config, undefined, env, configPath);
+    return { mock, proxy, env, configPath };
+  } catch (error) {
+    mock.stop();
+    throw error;
+  }
+}
+
+async function cacheStats(proxy: ProxyHandle, count: number, session?: string): Promise<Record<string, unknown>> {
+  const path = `/admin/stats?since=all${session ? `&session_id=${encodeURIComponent(session)}` : ""}`;
+  for (let attempt = 0; attempt < 40; attempt++) {
+    const stats = await cacheJson(await get(proxy.base, path));
+    if (cacheRecord(stats.summary).requests === count) return stats;
+    await Bun.sleep(50);
+  }
+  throw new Error(`cache stats did not record ${count} requests`);
+}
+
+describe("e2e: prompt cache request, response and persisted statistics", () => {
+  test("cache-check generates separate repeatable arms and reports actual mock reuse", async () => {
+    const handle = await startCacheScenario({ simulateCache: true });
+    try {
+      const args = ["--config", handle.configPath, "cache-check", "--model", "mock_responses/gpt-6.1-sol-medium", "--runs", "2", "--prefix-tokens", "1024", "--json"];
+      const dryRun = await runCli([...args, "--dry-run"], handle.env);
+      if (dryRun.exit !== 0) throw new Error(dryRun.output);
+      expect(handle.mock.requests()).toHaveLength(0);
+      const live = await runCli([...args, "--confirm-live"], handle.env);
+      if (live.exit !== 0) throw new Error(live.output);
+      const report = cacheRecord(JSON.parse(live.stdout));
+      for (const arm of [cacheRecord(report.direct), cacheRecord(report.proxied)]) {
+        expect(arm.requests).toBe(2);
+        expect(arm.successful_requests).toBe(2);
+        expect(arm.measured_requests).toBe(2);
+        expect(arm.hits).toBe(1);
+        expect(arm.cache_read_tokens).toBe(800);
+        expect(arm.cache_read_percent).toBe(40);
+        expect(arm.verdict).toBe("reuse");
+      }
+      const captured = handle.mock.requests();
+      expect(captured).toHaveLength(4);
+      expect(captured[0].body).toEqual(captured[1].body);
+      expect(captured[2].body).toEqual(captured[3].body);
+      expect(captured[0].body.prompt_cache_key).not.toBe(captured[2].body.prompt_cache_key);
+      expect(captured.every((request) => request.body.stream === true && request.body.store === false)).toBe(true);
+    } finally { stopScenario(handle); }
+  }, 30000);
+
+  test("Anthropic markers and TTL survive, with cold JSON then warm SSE usage", async () => {
+    const handle = await startCacheScenario({ simulateCache: true });
+    try {
+      const body = {
+        model: "gpt-via-anthropic", max_tokens: 20,
+        system: [{ type: "text", text: "Stable instructions", cache_control: { type: "ephemeral", ttl: "1h" } }],
+        tools: [{ name: "lookup", description: "Stable tool", input_schema: { type: "object", properties: {} }, cache_control: { type: "ephemeral" } }],
+        messages: [{ role: "user", content: [{ type: "text", text: "Stable question", cache_control: { type: "ephemeral", ttl: "5m" } }] }],
+      };
+      const headers = { "x-claude-code-session-id": "anthropic-cache" };
+      const cold = await cacheJson(await postJson(handle.proxy.base, "/v1/messages", body, headers));
+      expect(cacheRecord(cold.usage).cache_read_input_tokens).toBe(0);
+      expect(cacheRecord(cold.usage).cache_creation_input_tokens).toBe(800);
+      const warm = await postJson(handle.proxy.base, "/v1/messages", { ...body, stream: true }, headers);
+      expect(warm.status).toBe(200);
+      const start = cacheRecord(JSON.parse(frameData(parseSse(await readBody(warm)), "message_start")[0]));
+      expect(cacheRecord(cacheRecord(start.message).usage).cache_read_input_tokens).toBe(800);
+      for (const request of handle.mock.requests()) {
+        expect(request.body.system).toEqual(body.system);
+        expect(request.body.tools).toEqual(body.tools);
+        expect(request.body.messages).toEqual(body.messages);
+      }
+      const stats = await cacheStats(handle.proxy, 2);
+      const cache = cacheRecord(cacheRecord(stats.summary).cache);
+      expect(cache.read_tokens).toBe(800);
+      expect(cache.write_tokens).toBe(800);
+      expect(cache.reported_input_tokens).toBe(2000);
+      expect(cache.read_percent).toBe(40);
+    } finally { stopScenario(handle); }
+  }, 30000);
+
+  test("Responses uses the session cache key, preserves explicit keys and reports changed prefixes", async () => {
+    const handle = await startCacheScenario({ simulateCache: true });
+    try {
+      const body = { model: "claude-via-responses", max_tokens: 20,
+        system: "Stable instructions", messages: [{ role: "user", content: "Question" }] };
+      const headers = { "x-claude-code-session-id": "responses-cache" };
+      const reads: unknown[] = [];
+      for (const system of [body.system, body.system, "Changed instructions"]) {
+        const response = await cacheJson(await postJson(handle.proxy.base, "/v1/messages", { ...body, system }, headers));
+        reads.push(cacheRecord(response.usage).cache_read_input_tokens);
+        expect(handle.mock.lastResponsesBody().prompt_cache_key).toBe("responses-cache");
+      }
+      expect(reads).toEqual([0, 800, 0]);
+      const stats = await cacheStats(handle.proxy, 3, "responses-cache");
+      expect(cacheRecords(stats.recent)[0].cache_diagnostics).toContain("stable_prefix_changed");
+      await cacheJson(await postJson(handle.proxy.base, "/v1/responses", {
+        model: "resp-native", input: "Question", prompt_cache_key: "explicit-cache-key",
+      }, headers));
+      expect(handle.mock.lastResponsesBody().prompt_cache_key).toBe("explicit-cache-key");
+      await cacheJson(await postJson(handle.proxy.base, "/v1/responses", { model: "resp-native", input: "Question" }));
+      expect(handle.mock.lastResponsesBody().prompt_cache_key).toBeUndefined();
+    } finally { stopScenario(handle); }
+  }, 30000);
+
+  test("missing, zero and positive cache telemetry remain distinct and token percentages are weighted", async () => {
+    const handle = await startCacheScenario({ cacheUsage: [
+      { input: 9000, read: null, write: 0 },
+      { input: 100, read: 0, write: 0 },
+      { input: 1000, read: 900, write: 0 },
+      { input: 200, read: 100, write: 0 },
+    ] });
+    try {
+      for (let index = 0; index < 4; index++) {
+        const response = await postJson(handle.proxy.base, "/v1/chat/completions", {
+          model: "claude-via-openai", messages: [{ role: "user", content: "Cache statistics" }], stream: index === 2,
+        }, { "x-claude-code-session-id": index === 3 ? "other-session" : "weighted-session" });
+        expect(response.status).toBe(200);
+        await readBody(response);
+      }
+      const stats = await cacheStats(handle.proxy, 4);
+      const cache = cacheRecord(cacheRecord(stats.summary).cache);
+      expect(cache.reported_requests).toBe(3);
+      expect(cache.hit_requests).toBe(2);
+      expect(cache.read_tokens).toBe(1000);
+      expect(cache.reported_input_tokens).toBe(1300);
+      expect(cache.uncached_tokens).toBe(300);
+      expect(cache.read_percent).toBeCloseTo(1000 / 1300 * 100);
+      const recent = cacheRecords(stats.recent);
+      expect(recent.map((row) => row.cache_read_tokens)).toEqual([100, 900, 0, null]);
+      expect(recent[3].cache_diagnostics).toContain("telemetry_unavailable");
+      const session = await cacheStats(handle.proxy, 3, "weighted-session");
+      expect(cacheRecord(cacheRecord(session.summary).cache).read_percent).toBeCloseTo(900 / 1100 * 100);
+      expect(cacheRecord(cacheRecords(stats.accounts)[0].cache).read_tokens).toBe(1000);
+      // A new process reads the same persisted report, including missing telemetry.
+      handle.proxy.proc.kill();
+      await handle.proxy.proc.exited;
+      const restarted = await startProxy("", undefined, handle.env, handle.configPath);
+      handle.proxy = restarted;
+      expect(cacheRecord(cacheRecord((await cacheStats(restarted, 4)).summary).cache)).toEqual(cache);
+    } finally { stopScenario(handle); }
+  }, 30000);
+
+  test("cache reads are isolated by account and session", async () => {
+    const handle = await startCacheScenario({ simulateCache: true });
+    try {
+      for (const alias of ["work", "personal"]) {
+        const result = await runCli(["--config", handle.configPath, "connect", "mock_responses", "--account", alias, `key-${alias}`], handle.env);
+        if (result.exit !== 0) throw new Error(result.output);
+        expect(result.exit).toBe(0);
+      }
+      const body = { model: "resp-native", input: "Stable prefix", prompt_cache_key: "shared-key" };
+      const cases = [["work", "work-session"], ["work", "work-session"], ["personal", "personal-session"]];
+      const reads: unknown[] = [];
+      for (const [account, session] of cases) {
+        const response = await cacheJson(await postJson(handle.proxy.base, "/v1/responses", body, {
+          "x-local-proxy-account": account, "x-claude-code-session-id": session,
+        }));
+        reads.push(cacheRecord(cacheRecord(response.usage).input_tokens_details).cached_tokens);
+      }
+      expect(reads).toEqual([0, 800, 0]);
+      const stats = await cacheStats(handle.proxy, 3);
+      for (const account of cacheRecords(stats.accounts)) {
+        expect(cacheRecord(account.cache).read_tokens).toBe(account.alias === "work" ? 800 : 0);
+      }
+      const personal = await cacheStats(handle.proxy, 1, "personal-session");
+      expect(cacheRecord(cacheRecord(personal.summary).cache).read_tokens).toBe(0);
+    } finally { stopScenario(handle); }
+  }, 30000);
+
+  test("opt-in Anthropic policy marks translated stable content and preserve mode leaves it unmarked", async () => {
+    for (const policy of ["preserve", "anthropic-5m", "anthropic-1h"]) {
+      const handle = await startCacheScenario({ policy });
+      try {
+        await cacheJson(await postJson(handle.proxy.base, "/v1/chat/completions", {
+          model: "gpt-via-anthropic",
+          messages: [{ role: "system", content: "Keep this instruction" }, { role: "user", content: "Keep this question" }],
+          tools: [{ type: "function", function: { name: "lookup", description: "Keep this tool", parameters: { type: "object", properties: {} } } }],
+        }));
+        const request = handle.mock.requests()[0].body;
+        expect(JSON.stringify(request)).toContain("Keep this instruction");
+        expect(JSON.stringify(request)).toContain("Keep this question");
+        expect(JSON.stringify(request)).toContain("Keep this tool");
+        if (policy === "preserve") expect(JSON.stringify(request)).not.toContain("cache_control");
+        else {
+          const system = cacheRecords(request.system);
+          expect(system[system.length - 1].cache_control).toEqual({ type: "ephemeral", ttl: policy === "anthropic-1h" ? "1h" : "5m" });
+          expect(cacheRecords(request.tools)[0].cache_control).toBeDefined();
+        }
+        const marked = {
+          model: "gpt-via-anthropic", max_tokens: 20, system: "Preserve the native string",
+          messages: [{ role: "user", content: [{ type: "text", text: "Client chose the breakpoint", cache_control: { type: "ephemeral", ttl: "1h" } }] }],
+        };
+        await cacheJson(await postJson(handle.proxy.base, "/v1/messages", marked));
+        const native = handle.mock.requests()[1].body;
+        expect(native.system).toBe(marked.system);
+        expect(native.messages).toEqual(marked.messages);
+      } finally { stopScenario(handle); }
+    }
+  }, 60000);
+});
 
 describe("e2e: proxy against a mock upstream (openai upstream)", () => {
   let mock: MockUpstream;

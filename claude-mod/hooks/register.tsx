@@ -1,7 +1,7 @@
 import { atom, read, update } from 'claude-code'
 import type { Elements, EngineInterface, Register } from 'claude-code'
 
-import type { AccountUsageResult, ProxyAccount, ProxyCacheStats, ProxyPending, ProxyRateLimits, ProxyStats, ProxyStatsWindow, ProxyStatus, ProxyStatusline } from '../types'
+import type { AccountUsageResult, CacheDiagnostic, ProxyAccount, ProxyCacheStats, ProxyPending, ProxyRateLimits, ProxyStats, ProxyStatsWindow, ProxyStatus, ProxyStatusline } from '../types'
 
 type $ = EngineInterface
 
@@ -20,6 +20,27 @@ export function meter(pct: number, cols: number) {
 
 /** Log text without ANSI escapes or other control characters: a Text refuses them. */
 export const plain = (s: string) => s.replace(/\x1b\[[0-9;?]*[ -\/]*[@-~]/g, '').replace(/[\x00-\x08\x0b-\x1f\x7f]/g, '')
+
+const CACHE_DIAGNOSTICS: Record<CacheDiagnostic, string> = {
+  missing_cache_control: "No cache marker",
+  missing_session_key: "No session cache key",
+  stable_prefix_changed: "Stable prompt prefix changed",
+  model_changed: "Model changed",
+  account_changed: "Account changed",
+  cache_key_changed: "Cache key changed",
+  telemetry_unavailable: "Cache telemetry unavailable",
+  cache_miss_unknown: "Cache miss: cause unknown",
+  cache_warming: "Cache write reported",
+  upstream_error: "Upstream request failed",
+}
+
+export function cacheTokenText(cache: ProxyCacheStats | undefined) {
+  if (cache?.read_tokens == null || cache.write_tokens == null || cache.uncached_tokens == null) {
+    return "Token cache data unavailable · update local-proxy"
+  }
+  if (cache.read_percent == null) return "Token reuse n/a · no reported input token denominator"
+  return `${Math.round(cache.read_percent)}% reused · ${compact(cache.read_tokens)} read · ${compact(cache.write_tokens)} written · ${compact(cache.uncached_tokens)} uncached`
+}
 
 const compact = (n: number) => new Intl.NumberFormat('en', { notation: 'compact' }).format(n)
 export function fuzzyMatch(query: string, text: string) {
@@ -619,12 +640,19 @@ export const register: Register = (on, options) => {
               <Box flexDirection="column">
                 {kv('Total', row(s.summary))}
                 {kv('Cache hit rate', cacheRateText(s.summary.cache, s.summary.requests))}
+                {kv('Input token reuse', cacheTokenText(s.summary.cache))}
               </Box>
             ) : s ? <Text dimColor>Update local-proxy to see stats for this session.</Text> : <Text dimColor>No stats.</Text>}
             {sessionScopeMatches && s?.providers.map(p => kv(p.provider ?? '?', row(p)))}
             {sessionScopeMatches && s?.accounts.map(a => kv(
               `${a.provider}/${a.alias}`,
-              `${row(a)} · ${cacheRateText(a.cache, a.requests)}`,
+              `${row(a)} · ${cacheRateText(a.cache, a.requests)} · ${cacheTokenText(a.cache)}`,
+            ))}
+            {sessionScopeMatches && s?.recent?.map((request, index) => (
+              <Box key={`recent-cache-${index}`} flexDirection="column">
+                <Text>{`${request.provider}/${request.alias} · ${request.model} · cache read ${request.cache_read_tokens == null ? "unreported" : compact(request.cache_read_tokens)} · written ${compact(request.cache_write_tokens ?? 0)}`}</Text>
+                {request.cache_diagnostics?.map(diagnostic => <Text key={diagnostic} dimColor>{CACHE_DIAGNOSTICS[diagnostic] ?? diagnostic}</Text>)}
+              </Box>
             ))}
           </Box>
         </Box>

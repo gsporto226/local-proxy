@@ -347,6 +347,17 @@ pub async fn handle_chat(app: &AppState, req: ChatRequest<'_>) -> Result<ChatRep
         streaming,
     )?;
 
+    let cache_diagnostics = app.recorder().observe_cache(
+        session_id,
+        provider.format,
+        crate::domain::cache::CacheObservation::new(
+            &provider.name,
+            &upstream_model,
+            account.alias(),
+            &upstream_body,
+        ),
+        &upstream_body,
+    );
     let resp = account
         .send(UpstreamRequest {
             body: upstream_body,
@@ -368,6 +379,7 @@ pub async fn handle_chat(app: &AppState, req: ChatRequest<'_>) -> Result<ChatRep
         streamed: streaming,
         started,
         session_id: session_id.to_string(),
+        cache_diagnostics,
     };
     let recorder = app.recorder();
     let status = resp.status;

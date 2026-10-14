@@ -35,6 +35,8 @@ pub struct StatLine {
     pub cache_read_tokens: Option<u64>,
     /// Prompt tokens written to cache (Anthropic only; `0` otherwise).
     pub cache_write_tokens: u64,
+    /// Evidence explaining cache behavior; no prompt or credential contents.
+    pub cache_diagnostics: Vec<crate::domain::cache::CacheDiagnostic>,
 }
 
 /// A time window used to filter `stats` queries. `None` covers all time; a
@@ -70,6 +72,12 @@ pub struct CacheStats {
     pub hit_requests: u64,
     /// Requests whose upstream reported cached-read telemetry, including zero.
     pub reported_requests: u64,
+    /// Sum of prompt tokens read from cache.
+    pub read_tokens: u64,
+    /// Sum of prompt tokens written to cache on rows reporting cache reads.
+    pub write_tokens: u64,
+    /// Sum of input tokens only on rows reporting cache-read telemetry.
+    pub reported_input_tokens: u64,
 }
 
 /// Aggregate totals over the matching window.
@@ -166,6 +174,12 @@ pub struct ProviderStats {
 /// One raw request row, used for the recent/detail view.
 #[derive(Debug, Clone)]
 pub struct RequestRow {
+    /// Prompt tokens read from cache, or absent when telemetry is unavailable.
+    pub cache_read_tokens: Option<u64>,
+    /// Prompt tokens written to cache.
+    pub cache_write_tokens: u64,
+    /// Evidence explaining cache behavior.
+    pub cache_diagnostics: Vec<crate::domain::cache::CacheDiagnostic>,
     /// Unix timestamp (seconds).
     pub ts: i64,
     /// Proxied endpoint.

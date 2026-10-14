@@ -131,6 +131,7 @@ defaults:
             .expect("chatgpt provider present");
         assert_eq!(chatgpt.format, ProviderFormat::OpenaiResponses);
         assert_eq!(chatgpt.base_url, "https://chatgpt.com/backend-api/codex");
+        assert_eq!(chatgpt.session_header.as_deref(), Some("session_id"));
         // The Codex catalog slugs, not the chat web UI's `-wm` names.
         assert!(chatgpt.models.iter().any(|m| m == "gpt-6-sol"));
         assert!(!chatgpt.models.iter().any(|m| m.contains("-wm")));

@@ -10,6 +10,11 @@ export type ProxyCacheStats = {
   reported_requests: number
   rate_percent: number | null
   coverage_percent: number | null
+  read_tokens?: number
+  write_tokens?: number
+  reported_input_tokens?: number
+  uncached_tokens?: number
+  read_percent?: number | null
 }
 export type ProxyStatsRow = {
   provider?: string
@@ -29,11 +34,25 @@ export type ProxyAccountStats = {
   cost_usd: number
   cache?: ProxyCacheStats
 }
+export type CacheDiagnostic =
+  | "missing_cache_control" | "missing_session_key" | "stable_prefix_changed"
+  | "model_changed" | "account_changed" | "cache_key_changed"
+  | "telemetry_unavailable" | "cache_miss_unknown" | "cache_warming" | "upstream_error"
+export type ProxyRecentRequest = {
+  ts: number
+  provider: string
+  alias: string
+  model: string
+  cache_read_tokens?: number | null
+  cache_write_tokens?: number
+  cache_diagnostics?: CacheDiagnostic[]
+}
 export type ProxyStats = {
   scope?: ProxyStatsScope
   summary: ProxyStatsRow
   providers: ProxyStatsRow[]
   accounts: ProxyAccountStats[]
+  recent?: ProxyRecentRequest[]
 }
 export type UsageWindow = { utilization: number; resets_at: string | null }
 export type AccountUsage = {

@@ -37,6 +37,21 @@ pub enum ProviderFormat {
     OpenaiResponses,
 }
 
+/// Optional cache breakpoints added to Anthropic requests without client markers.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum PromptCachePolicy {
+    /// Forward the client's cache policy without adding breakpoints.
+    #[default]
+    Preserve,
+    /// Cache tools, instructions and the latest user text for five minutes.
+    #[serde(rename = "anthropic-5m")]
+    Anthropic5m,
+    /// Cache tools, instructions and the latest user text for one hour.
+    #[serde(rename = "anthropic-1h")]
+    Anthropic1h,
+}
+
 /// How token requests are encoded.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize, Serialize)]
 #[serde(rename_all = "lowercase")]
@@ -160,6 +175,8 @@ pub struct Provider {
     /// `connect <name> --oauth` and refresh their tokens automatically.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub oauth: Option<OAuthProvider>,
+    /// Optional Anthropic cache policy. Existing client markers always win.
+    pub prompt_cache: PromptCachePolicy,
 }
 
 /// Maps a requested model to a provider (exact match or prefix).
@@ -474,6 +491,30 @@ mod tests {
         // round-trips through YAML with the same spelling
         let yaml = serde_yaml::to_string(&config.providers[0]).expect("serializes");
         assert!(yaml.contains("openai-responses"), "{yaml}");
+    }
+
+    #[test]
+    fn prompt_cache_policy_defaults_and_validates_names() {
+        let bare: Provider = serde_json::from_value(serde_json::json!({"name":"test"})).unwrap();
+        assert_eq!(bare.prompt_cache, PromptCachePolicy::Preserve);
+        for (name, policy) in [
+            ("preserve", PromptCachePolicy::Preserve),
+            ("anthropic-5m", PromptCachePolicy::Anthropic5m),
+            ("anthropic-1h", PromptCachePolicy::Anthropic1h),
+        ] {
+            let provider: Provider =
+                serde_json::from_value(serde_json::json!({"name":"test", "prompt_cache":name}))
+                    .unwrap();
+            assert_eq!(provider.prompt_cache, policy);
+            assert_eq!(
+                serde_json::to_value(provider).unwrap()["prompt_cache"],
+                name
+            );
+        }
+        assert!(serde_json::from_value::<Provider>(
+            serde_json::json!({"prompt_cache":"automatic"})
+        )
+        .is_err());
     }
 
     #[test]

@@ -17,6 +17,22 @@ excluded from the rate denominator. `rate_percent` is `null` when no requests
 reported cache telemetry; `coverage_percent` is `null` when there are no
 requests in the aggregate. Older database rows remain unreported, not misses.
 
+The cache object also includes `read_tokens`, `write_tokens`,
+`reported_input_tokens`, `uncached_tokens`, and `read_percent`. Token totals
+cover only rows whose cache-read count was reported. `read_percent` is
+`100 * read_tokens / reported_input_tokens`, or `null` when that denominator
+is zero. `uncached_tokens` subtracts cache reads and writes from that
+denominator, saturating at zero. Requests without telemetry cannot dilute
+the token reuse percentage.
+
+Recent rows include nullable `cache_read_tokens`, `cache_write_tokens`, and
+`cache_diagnostics`, an array of evidence codes: `missing_cache_control`,
+`missing_session_key`, `stable_prefix_changed`, `model_changed`,
+`account_changed`, `cache_key_changed`, `telemetry_unavailable`,
+`cache_miss_unknown`, `cache_warming`, and `upstream_error`. These describe
+observations, not a guaranteed upstream explanation. Existing database rows
+have an empty diagnostic array. No prompt or credential contents are stored.
+
 `since=session` selects the full Claude Code session and requires `session_id`.
 Other windows can also take `session_id` to filter their time range to one
 session. Omitting `session_id` keeps the existing all-sessions behavior.
@@ -66,7 +82,7 @@ Errors: `{ error: string }` with 4xx/5xx.
 
 | event | data |
 | --- | --- |
-| `request` | one `requests` row: `{ ts, provider, model, input_tokens, output_tokens, status, latency_ms, cost_usd, session_id }` |
+| `request` | one `requests` row: `{ ts, provider, model, input_tokens, output_tokens, status, latency_ms, cost_usd, session_id, cache_read_tokens, cache_write_tokens, cache_diagnostics }` |
 | `log` | `{ line }` |
 | `config` | `{ model, effort }` after any write (API or CLI-in-process) |
 | `rate_limits` | `{ h5, week }` |

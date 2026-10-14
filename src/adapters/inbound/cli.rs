@@ -1109,6 +1109,31 @@ pub async fn compare(
     Ok(())
 }
 
+/// Run the generated prompt cache diagnostic and print its report.
+///
+/// # Errors
+///
+/// Returns an error for invalid options, configuration, accounts or requests.
+pub async fn cache_check(
+    ports: &Ports,
+    config_path: &Path,
+    options: compare_app::CacheCheckOptions,
+) -> miette::Result<()> {
+    let report = compare_app::run_cache_check(ports, config_path, &options)
+        .await
+        .map_err(|error| miette::miette!("cache check failed: {error}"))?;
+    if options.json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&report)
+                .map_err(|error| miette::miette!("failed to render cache check: {error}"))?
+        );
+    } else {
+        print!("{}", report.render_text());
+    }
+    Ok(())
+}
+
 // ---------------------------------------------------------------------------
 // stats
 // ---------------------------------------------------------------------------
