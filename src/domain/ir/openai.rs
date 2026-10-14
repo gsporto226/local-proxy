@@ -364,6 +364,9 @@ pub fn encode_request(req: &Request) -> Value {
     if req.stream {
         out.insert("stream".into(), json!(true));
     }
+    if let Some(key) = &req.cache_key {
+        out.insert("prompt_cache_key".into(), json!(key));
+    }
     Value::Object(out)
 }
 

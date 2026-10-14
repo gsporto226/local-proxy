@@ -327,11 +327,13 @@ fn usage_summary(usage: TokenUsage) -> UsageSummary {
     }
 }
 
-async fn response_usage(response: UpstreamResponse) -> Option<TokenUsage> {
+async fn response_usage(response: UpstreamResponse, requested_stream: bool) -> Option<TokenUsage> {
     if !(200..300).contains(&response.status) {
         return None;
     }
-    if !response.is_event_stream() {
+    let event_stream =
+        response.is_event_stream() || (response.content_type.is_none() && requested_stream);
+    if !event_stream {
         let body = serde_json::from_slice::<Value>(&sse::collect(response.body).await).ok()?;
         return body.get("usage").map(translate::parse_usage);
     }
@@ -347,6 +349,7 @@ async fn send_one(
     hints: &ClientHints,
 ) -> Result<RunSummary, CompareError> {
     let started = Instant::now();
+    let requested_stream = crate::domain::request::wants_stream(&body);
     let response = account
         .send(UpstreamRequest {
             body,
@@ -356,7 +359,9 @@ async fn send_one(
         })
         .await?;
     let status = response.status;
-    let usage = response_usage(response).await.map(usage_summary);
+    let usage = response_usage(response, requested_stream)
+        .await
+        .map(usage_summary);
     let latency_ms = started.elapsed().as_millis().try_into().unwrap_or(u64::MAX);
     Ok(RunSummary {
         status,
@@ -430,6 +435,270 @@ pub async fn run_comparison(
     })
 }
 
+/// Options for the generated prompt cache diagnostic.
+#[derive(Debug)]
+pub struct CacheCheckOptions {
+    /// Model resolved by the configured router.
+    pub model: String,
+    /// Account used by both arms.
+    pub account: Option<String>,
+    /// Requests per arm including warmup.
+    pub runs: u32,
+    /// Estimated prefix length at four bytes per token.
+    pub prefix_tokens: u32,
+    /// Authorization to send upstream requests.
+    pub confirm_live: bool,
+    /// Generate an overview without credentials or network access.
+    pub dry_run: bool,
+    /// Render JSON instead of terminal text.
+    pub json: bool,
+}
+
+/// Aggregate reported token reuse for a comparison arm.
+#[derive(Debug, Serialize)]
+pub struct CacheArmSummary {
+    requests: usize,
+    successful_requests: usize,
+    measured_requests: usize,
+    hits: usize,
+    input_tokens: u64,
+    cache_read_tokens: u64,
+    cache_write_tokens: u64,
+    cache_read_percent: Option<f64>,
+    verdict: &'static str,
+}
+
+impl CacheArmSummary {
+    #[allow(clippy::cast_precision_loss)]
+    fn from_runs(runs: &[RunSummary]) -> Self {
+        let successful_requests = runs
+            .iter()
+            .filter(|run| (200..300).contains(&run.status))
+            .count();
+        let measured: Vec<_> = runs
+            .iter()
+            .filter_map(|run| run.usage.as_ref())
+            .filter(|usage| usage.cache_read_tokens.is_some())
+            .collect();
+        let input_tokens = measured.iter().fold(0_u64, |total, usage| {
+            total.saturating_add(usage.input_tokens)
+        });
+        let cache_read_tokens = measured
+            .iter()
+            .filter_map(|usage| usage.cache_read_tokens)
+            .fold(0_u64, u64::saturating_add);
+        let cache_write_tokens = measured.iter().fold(0_u64, |total, usage| {
+            total.saturating_add(usage.cache_write_tokens)
+        });
+        let hits = measured
+            .iter()
+            .filter(|usage| usage.cache_hit == Some(true))
+            .count();
+        let repeats: Vec<_> = runs
+            .iter()
+            .skip(1)
+            .filter_map(|run| run.usage.as_ref())
+            .collect();
+        let verdict = if successful_requests != runs.len() {
+            "inconclusive"
+        } else if repeats.iter().any(|usage| usage.cache_hit == Some(true)) {
+            "reuse"
+        } else if repeats.len() != runs.len().saturating_sub(1)
+            || repeats
+                .iter()
+                .any(|usage| usage.cache_read_tokens.is_none())
+            || runs.len() < 2
+        {
+            "inconclusive"
+        } else {
+            "no_reuse_observed"
+        };
+        Self {
+            requests: runs.len(),
+            successful_requests,
+            measured_requests: measured.len(),
+            hits,
+            input_tokens,
+            cache_read_tokens,
+            cache_write_tokens,
+            cache_read_percent: (input_tokens > 0)
+                .then(|| cache_read_tokens as f64 / input_tokens as f64 * 100.0),
+            verdict,
+        }
+    }
+}
+
+/// Cache diagnostic with safe request metadata and provider usage.
+#[derive(Debug, Serialize)]
+pub struct CacheCheckReport {
+    provider: String,
+    model: String,
+    dry_run: bool,
+    requests_planned: u32,
+    approximate_prefix_tokens: u32,
+    request: RequestOverview,
+    direct: Option<CacheArmSummary>,
+    proxied: Option<CacheArmSummary>,
+    comparison: Option<ComparisonReport>,
+    limits: Vec<&'static str>,
+}
+
+impl CacheCheckReport {
+    /// Render the diagnostic for a person at the terminal.
+    #[must_use]
+    pub fn render_text(&self) -> String {
+        use std::fmt::Write;
+        let mut output = format!(
+            "Cache check: {}/{}\nApproximate prefix: {} tokens; planned requests: {}\n",
+            self.provider, self.model, self.approximate_prefix_tokens, self.requests_planned
+        );
+        let _ = writeln!(
+            output,
+            "Request: {} bytes; {} cache markers; cache key {}; stream {:?}",
+            self.request.body_bytes,
+            self.request.cache_control_markers,
+            self.request.prompt_cache_key_present,
+            self.request.stream
+        );
+        if self.dry_run {
+            output.push_str("Dry run: no credentials loaded and no requests sent.\n");
+        }
+        for (name, arm) in [("Direct", &self.direct), ("Proxy-prepared", &self.proxied)] {
+            if let Some(arm) = arm {
+                let percent = arm
+                    .cache_read_percent
+                    .map_or_else(|| "unknown".to_string(), |value| format!("{value:.2}%"));
+                let _ = writeln!(output, "{name}: {}; {} hits; {} read / {} input tokens ({percent}); {} written; telemetry {}/{}; successful {}/{}",
+                    arm.verdict, arm.hits, arm.cache_read_tokens, arm.input_tokens, arm.cache_write_tokens,
+                    arm.measured_requests, arm.requests, arm.successful_requests, arm.requests);
+            }
+        }
+        for limit in &self.limits {
+            let _ = writeln!(output, "- {limit}");
+        }
+        output
+    }
+}
+
+fn cache_fixture(format: Format, model: &str, prefix_tokens: u32) -> Value {
+    use std::fmt::Write;
+    let mut prefix =
+        "Cache diagnostic {{compare_tag}}. Read this reference and answer with only OK.\n"
+            .to_string();
+    let target_bytes = prefix_tokens as usize * 4;
+    let mut index = 0;
+    while prefix.len() < target_bytes {
+        let _ = writeln!(prefix, "Reference record {index:06}: the stable archive describes rivers, fields, roads and weather observations for this numbered location.");
+        index += 1;
+    }
+    match format {
+        Format::Anthropic => serde_json::json!({
+            "model": model, "max_tokens": 64,
+            "system": [{"type": "text", "text": prefix, "cache_control": {"type": "ephemeral"}}],
+            "messages": [{"role": "user", "content": "Reply only OK."}]
+        }),
+        Format::Openai => serde_json::json!({
+            "model": model, "max_completion_tokens": 64,
+            "messages": [{"role": "system", "content": prefix}, {"role": "user", "content": "Reply only OK."}]
+        }),
+        Format::Responses => serde_json::json!({
+            "model": model, "stream": true, "store": false,
+            "instructions": prefix, "prompt_cache_key": "{{compare_tag}}",
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": "Reply only OK."}]}]
+        }),
+    }
+}
+
+/// Generate a stable prompt and compare cache reuse through the same account.
+///
+/// Dry runs resolve only configuration and routing. Live runs use isolated
+/// prefixes and include a warmup followed by repeats for each arm.
+///
+/// # Errors
+///
+/// Returns an error for invalid bounds, unconfirmed calls, routing, account,
+/// preparation, or upstream transport failures.
+pub async fn run_cache_check(
+    ports: &Ports,
+    config_path: &Path,
+    options: &CacheCheckOptions,
+) -> Result<CacheCheckReport, CompareError> {
+    if !(2..=20).contains(&options.runs) {
+        return Err(CompareError::Setup(
+            "cache-check --runs must be between 2 and 20".to_string(),
+        ));
+    }
+    if !(1024..=32768).contains(&options.prefix_tokens) {
+        return Err(CompareError::Setup(
+            "cache-check --prefix-tokens must be between 1024 and 32768".to_string(),
+        ));
+    }
+    if !options.dry_run && !options.confirm_live {
+        return Err(CompareError::ConfirmationRequired);
+    }
+    let setup = |error: String| CompareError::Setup(error);
+    let config =
+        runtime::effective_config(ports, config_path).map_err(|error| setup(error.to_string()))?;
+    let router = Router::new(Arc::new(config)).map_err(|error| setup(error.to_string()))?;
+    let resolved = router
+        .resolve_model(&options.model, &|_| false)
+        .map_err(|error| setup(error.to_string()))?;
+    let format = Format::from(resolved.provider.format);
+    let fixture = cache_fixture(format, &resolved.upstream_model, options.prefix_tokens);
+    let mut report = CacheCheckReport {
+        provider: resolved.provider.name.clone(), model: resolved.upstream_model.clone(),
+        dry_run: options.dry_run, requests_planned: options.runs * 2,
+        approximate_prefix_tokens: options.prefix_tokens, request: request_overview(&fixture),
+        direct: None, proxied: None, comparison: None,
+        limits: vec![
+            "Prefix length is estimated at four bytes per token; provider usage supplies the measured length.",
+            "Thresholds, expiry, routing and eligibility depend on provider and model; zero reuse does not prove a proxy defect.",
+            "Percentages include warmup and only requests with cache-read telemetry. Missing telemetry is unknown.",
+            "Proxy-prepared requests exercise preparation through the same account, not the running HTTP proxy or dashboard.",
+            "Each arm has an isolated prefix and stable key. Token reuse is not a measure of monetary savings.",
+        ],
+    };
+    if options.dry_run {
+        return Ok(report);
+    }
+    let target = resolve_target(
+        ports,
+        config_path,
+        &options.model,
+        format,
+        options.account.clone(),
+    )?;
+    let id = uuid::Uuid::new_v4();
+    let direct_tag = format!("cache-check-{id}-direct");
+    let proxy_tag = format!("cache-check-{id}-proxy");
+    eprintln!(
+        "sending {} live requests to {}/{} with account {}",
+        options.runs * 2,
+        target.provider.name,
+        target.upstream_model,
+        target.account.alias()
+    );
+    let comparison = run_comparison(
+        &target.account,
+        format,
+        &target.provider,
+        &target.upstream_model,
+        &fixture,
+        target.active_effort.as_deref(),
+        target.reasoning_effort.as_deref(),
+        &format!("cache-check-{id}"),
+        options.runs,
+        &direct_tag,
+        &proxy_tag,
+        &ClientHints::default(),
+    )
+    .await?;
+    report.direct = Some(CacheArmSummary::from_runs(&comparison.direct));
+    report.proxied = Some(CacheArmSummary::from_runs(&comparison.proxied));
+    report.comparison = Some(comparison);
+    Ok(report)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -438,6 +707,117 @@ mod tests {
 
     use serde_json::json;
     use tracing_subscriber::fmt::writer::MakeWriter;
+
+    #[tokio::test]
+    async fn comparison_collects_responses_usage_without_content_type() {
+        let response = UpstreamResponse {
+            status: 200,
+            content_type: None,
+            rate_limits: None,
+            body: Box::pin(futures_util::stream::iter([Ok(bytes::Bytes::from_static(
+                b"event: response.completed\ndata: {\"type\":\"response.completed\",\"response\":{\"usage\":{\"input_tokens\":1500,\"output_tokens\":5,\"input_tokens_details\":{\"cached_tokens\":1408}}}}\n\n",
+            ))])),
+        };
+        let usage = response_usage(response, true)
+            .await
+            .expect("SSE usage must be collected without a content type");
+        assert_eq!(usage.input, 1500);
+        assert_eq!(usage.cache_read, Some(1408));
+    }
+
+    #[tokio::test]
+    async fn comparison_keeps_json_usage_without_content_type() {
+        let response = UpstreamResponse {
+            status: 200, content_type: None, rate_limits: None,
+            body: sse::once(br#"{"usage":{"input_tokens":20,"output_tokens":5,"input_tokens_details":{"cached_tokens":0}}}"#.to_vec()),
+        };
+        let usage = response_usage(response, false).await.unwrap();
+        assert_eq!(usage.input, 20);
+        assert_eq!(usage.cache_read, Some(0));
+    }
+
+    #[test]
+    fn cache_check_reports_weighted_reuse_and_unknown_telemetry() {
+        let run = |input, cached| RunSummary {
+            status: 200,
+            latency_ms: 1,
+            usage: Some(usage_summary(TokenUsage {
+                input,
+                cache_read: cached,
+                ..Default::default()
+            })),
+        };
+        let summary = CacheArmSummary::from_runs(&[run(100, Some(0)), run(300, Some(200))]);
+        assert_eq!(summary.cache_read_percent, Some(50.0));
+        assert_eq!(summary.verdict, "reuse");
+        assert_eq!(summary.measured_requests, 2);
+        let unknown = CacheArmSummary::from_runs(&[run(100, Some(0)), run(100, None)]);
+        assert_eq!(unknown.verdict, "inconclusive");
+        assert_eq!(unknown.measured_requests, 1);
+        let misses = CacheArmSummary::from_runs(&[run(100, Some(0)), run(100, Some(0))]);
+        assert_eq!(misses.verdict, "no_reuse_observed");
+        let failed = CacheArmSummary::from_runs(&[
+            run(100, Some(0)),
+            RunSummary {
+                status: 429,
+                latency_ms: 1,
+                usage: None,
+            },
+        ]);
+        assert_eq!(failed.verdict, "inconclusive");
+    }
+
+    #[test]
+    fn cache_check_fixtures_have_stable_isolated_prefixes_and_native_controls() {
+        for format in [Format::Anthropic, Format::Openai, Format::Responses] {
+            let fixture = cache_fixture(format, "mock-model", 8192);
+            let prefix = match format {
+                Format::Anthropic => fixture["system"][0]["text"].as_str().unwrap(),
+                Format::Openai => fixture["messages"][0]["content"].as_str().unwrap(),
+                Format::Responses => fixture["instructions"].as_str().unwrap(),
+            };
+            assert!(prefix.len() >= 8192 * 4);
+            assert!(prefix[..100].contains("{{compare_tag}}"));
+            let mut direct = fixture.clone();
+            let mut proxied = fixture.clone();
+            assert!(replace_compare_tag(&mut direct, "direct-arm"));
+            assert!(replace_compare_tag(&mut proxied, "proxy-arm"));
+            assert_ne!(direct, proxied);
+            assert_eq!(fixture, cache_fixture(format, "mock-model", 8192));
+            if format == Format::Anthropic {
+                assert_eq!(request_overview(&fixture).cache_control_markers, 1);
+            }
+            if format == Format::Responses {
+                assert_eq!(fixture["stream"], true);
+                assert_eq!(fixture["store"], false);
+                assert_eq!(direct["prompt_cache_key"], "direct-arm");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn cache_check_dry_run_needs_no_account_or_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("config.yaml");
+        std::fs::write(&config_path, "providers:\n  - name: cache-mock\n    format: openai-responses\n    base_url: http://127.0.0.1:1\n    models: [mock-model]\n").unwrap();
+        let options = CacheCheckOptions {
+            model: "cache-mock/mock-model".to_string(),
+            account: None,
+            runs: 3,
+            prefix_tokens: 8192,
+            confirm_live: false,
+            dry_run: true,
+            json: true,
+        };
+        let report = run_cache_check(&crate::bootstrap::ports(), &config_path, &options)
+            .await
+            .unwrap();
+        assert!(report.dry_run);
+        assert_eq!(report.requests_planned, 6);
+        assert!(report.comparison.is_none());
+        assert!(report.request.prompt_cache_key_present);
+        assert_eq!(report.request.stream, Some(true));
+    }
 
     #[derive(Clone)]
     struct SharedLogWriter(Arc<Mutex<Vec<u8>>>);
@@ -602,6 +982,7 @@ mod tests {
             headers: std::collections::HashMap::default(),
             session_header: None,
             oauth: None,
+            ..Default::default()
         };
         let client = crate::bootstrap::ports()
             .upstream

@@ -72,7 +72,8 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             session_id TEXT NOT NULL DEFAULT '',
             cache_hit INTEGER CHECK (cache_hit IN (0, 1)),
             cache_read_tokens INTEGER,
-            cache_write_tokens INTEGER
+            cache_write_tokens INTEGER,
+            cache_diagnostics TEXT
         );
         CREATE INDEX IF NOT EXISTS idx_requests_ts ON requests(ts);
         CREATE INDEX IF NOT EXISTS idx_requests_provider ON requests(provider);",
@@ -86,6 +87,7 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
         "cache_hit",
         "cache_read_tokens",
         "cache_write_tokens",
+        "cache_diagnostics",
     ];
     for col in cols {
         let exists: bool = conn
@@ -97,6 +99,7 @@ fn ensure_schema(conn: &rusqlite::Connection) -> Result<(), rusqlite::Error> {
             .unwrap_or(false);
         if !exists {
             let ty = match col {
+                "cache_diagnostics" => "TEXT",
                 "alias" => "TEXT NOT NULL DEFAULT 'default'",
                 "session_id" => "TEXT NOT NULL DEFAULT ''",
                 _ => "INTEGER",
@@ -151,12 +154,16 @@ pub(crate) fn write_line(
     latency_ms: u64,
 ) -> Result<(), DbError> {
     let conn = open_stats(path)?;
+    let diagnostics =
+        serde_json::to_string(&stat.cache_diagnostics).map_err(|source| DbError::Query {
+            source: rusqlite::Error::ToSqlConversionFailure(Box::new(source)),
+        })?;
     conn.execute(
         "INSERT INTO requests
              (ts, endpoint, provider, alias, model, input_tokens, output_tokens,
               streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
-              session_id, cache_hit, cache_read_tokens, cache_write_tokens)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+              session_id, cache_hit, cache_read_tokens, cache_write_tokens, cache_diagnostics)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18)",
         rusqlite::params![
             ts,
             stat.endpoint,
@@ -175,6 +182,7 @@ pub(crate) fn write_line(
             stat.cache_hit.map(i64::from),
             stat.cache_read_tokens,
             stat.cache_write_tokens,
+            diagnostics,
         ],
     )
     .map_err(|source| DbError::Query { source })?;
@@ -218,7 +226,10 @@ pub fn summary_on(
                     COALESCE(SUM(latency_ms),0), COALESCE(SUM(error),0),
                     COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0),
                     COUNT(cache_hit),
-                    COALESCE(SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END),0)
+                    COALESCE(SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(cache_read_tokens),0),
+                    COALESCE(SUM(CASE WHEN cache_read_tokens IS NOT NULL THEN cache_write_tokens ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN cache_read_tokens IS NOT NULL THEN input_tokens ELSE 0 END),0)
              FROM requests {wsql}"
         ))
         .map_err(|source| DbError::Query { source })?;
@@ -234,6 +245,9 @@ pub fn summary_on(
             cache: CacheStats {
                 reported_requests: r.get::<_, i64>(7)? as u64,
                 hit_requests: r.get::<_, i64>(8)? as u64,
+                read_tokens: r.get::<_, i64>(9)? as u64,
+                write_tokens: r.get::<_, i64>(10)? as u64,
+                reported_input_tokens: r.get::<_, i64>(11)? as u64,
             },
         })
     })
@@ -272,7 +286,10 @@ pub fn by_provider_on(
                     COALESCE(SUM(output_tokens),0), COALESCE(SUM(latency_ms),0),
                     COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0),
                     COUNT(cache_hit),
-                    COALESCE(SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END),0)
+                    COALESCE(SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(cache_read_tokens),0),
+                    COALESCE(SUM(CASE WHEN cache_read_tokens IS NOT NULL THEN cache_write_tokens ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN cache_read_tokens IS NOT NULL THEN input_tokens ELSE 0 END),0)
              FROM requests {wsql}
              GROUP BY provider ORDER BY provider"
         ))
@@ -290,6 +307,9 @@ pub fn by_provider_on(
                 cache: CacheStats {
                     reported_requests: r.get::<_, i64>(7)? as u64,
                     hit_requests: r.get::<_, i64>(8)? as u64,
+                    read_tokens: r.get::<_, i64>(9)? as u64,
+                    write_tokens: r.get::<_, i64>(10)? as u64,
+                    reported_input_tokens: r.get::<_, i64>(11)? as u64,
                 },
             })
         })
@@ -331,7 +351,10 @@ pub fn by_account_on(
                     COALESCE(SUM(output_tokens),0), COALESCE(SUM(latency_ms),0),
                     COALESCE(SUM(energy_kwh_um),0), COALESCE(SUM(cost_usd_um),0),
                     COUNT(cache_hit),
-                    COALESCE(SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END),0)
+                    COALESCE(SUM(CASE WHEN cache_hit = 1 THEN 1 ELSE 0 END),0),
+                    COALESCE(SUM(cache_read_tokens),0),
+                    COALESCE(SUM(CASE WHEN cache_read_tokens IS NOT NULL THEN cache_write_tokens ELSE 0 END),0),
+                    COALESCE(SUM(CASE WHEN cache_read_tokens IS NOT NULL THEN input_tokens ELSE 0 END),0)
              FROM requests {wsql}
              GROUP BY provider, 2 ORDER BY provider, 2"
         ))
@@ -350,6 +373,9 @@ pub fn by_account_on(
                 cache: CacheStats {
                     reported_requests: r.get::<_, i64>(8)? as u64,
                     hit_requests: r.get::<_, i64>(9)? as u64,
+                    read_tokens: r.get::<_, i64>(10)? as u64,
+                    write_tokens: r.get::<_, i64>(11)? as u64,
+                    reported_input_tokens: r.get::<_, i64>(12)? as u64,
                 },
             })
         })
@@ -390,7 +416,7 @@ pub fn recent_on(
     let sql = format!(
         "SELECT ts, endpoint, provider, COALESCE(CAST(alias AS TEXT), 'default'), model, input_tokens, output_tokens,
                 streamed, status, latency_ms, error, energy_kwh_um, cost_usd_um,
-                session_id
+                session_id, cache_read_tokens, COALESCE(cache_write_tokens,0), cache_diagnostics
          FROM requests {wsql}
          ORDER BY ts DESC, id DESC LIMIT {limit}"
     );
@@ -414,6 +440,21 @@ pub fn recent_on(
                 energy_kwh_um: r.get::<_, Option<i64>>(11)?.map(|v| v as u64),
                 cost_usd_um: r.get::<_, Option<i64>>(12)?.map(|v| v as u64),
                 session_id: r.get(13)?,
+                cache_read_tokens: r.get::<_, Option<i64>>(14)?.map(|v| v as u64),
+                cache_write_tokens: r.get::<_, i64>(15)? as u64,
+                cache_diagnostics: r
+                    .get::<_, Option<String>>(16)?
+                    .map(|json| {
+                        serde_json::from_str(&json).map_err(|error| {
+                            rusqlite::Error::FromSqlConversionFailure(
+                                16,
+                                rusqlite::types::Type::Text,
+                                Box::new(error),
+                            )
+                        })
+                    })
+                    .transpose()?
+                    .unwrap_or_default(),
             })
         })
         .map_err(|source| DbError::Query { source })?
@@ -1123,6 +1164,7 @@ mod tests {
             cache_hit: None,
             cache_read_tokens: None,
             cache_write_tokens: 0,
+            cache_diagnostics: Vec::new(),
         };
         insert_line(&conn, &line);
 
@@ -1175,6 +1217,13 @@ mod tests {
             .query_row("SELECT cache_hit FROM requests", [], |row| row.get(0))
             .unwrap();
         assert_eq!(cache_hit, None);
+        let legacy = recent_on(&conn, all(), 1).unwrap();
+        assert_eq!(legacy[0].cache_read_tokens, None);
+        assert_eq!(legacy[0].cache_write_tokens, 0);
+        assert_eq!(
+            legacy[0].cache_diagnostics,
+            Vec::<crate::domain::cache::CacheDiagnostic>::new()
+        );
         ensure_schema(&conn).unwrap();
     }
 
@@ -1204,6 +1253,7 @@ mod tests {
             cache_hit: None,
             cache_read_tokens: None,
             cache_write_tokens: 0,
+            cache_diagnostics: Vec::new(),
         };
         insert_line(&conn, &line);
         line.cost = None;
@@ -1269,6 +1319,64 @@ mod tests {
         let personal = accounts.iter().find(|row| row.alias == "personal").unwrap();
         assert_eq!(personal.cache.hit_requests, 1);
         assert_eq!(personal.cache.reported_requests, 1);
+    }
+
+    #[test]
+    fn token_cache_aggregates_known_rows_and_preserves_diagnostics() {
+        use crate::domain::cache::CacheDiagnostic;
+        let db = tempfile::NamedTempFile::new().unwrap();
+        let mut line = StatLine {
+            endpoint: "/v1/messages",
+            provider: "anthropic".to_string(),
+            alias: "work".to_string(),
+            model: "claude-test".to_string(),
+            session_id: "known".to_string(),
+            input_tokens: 1000,
+            cache_hit: Some(true),
+            cache_read_tokens: Some(600),
+            cache_write_tokens: 200,
+            cache_diagnostics: vec![CacheDiagnostic::StablePrefixChanged],
+            ..StatLine::default()
+        };
+        write_line(db.path(), &line, 1, 0).unwrap();
+        line.cache_hit = Some(false);
+        line.cache_read_tokens = Some(0);
+        line.cache_write_tokens = 0;
+        line.input_tokens = 100;
+        write_line(db.path(), &line, 2, 0).unwrap();
+        line.cache_hit = None;
+        line.cache_read_tokens = None;
+        line.cache_write_tokens = 999;
+        line.input_tokens = 9000;
+        write_line(db.path(), &line, 3, 0).unwrap();
+        line.session_id = "other".to_string();
+        line.cache_hit = Some(true);
+        line.cache_read_tokens = Some(8000);
+        write_line(db.path(), &line, 4, 0).unwrap();
+        let conn = open_stats(db.path()).unwrap();
+        let filter = StatsFilter {
+            window: TimeWindow { since: None },
+            scope: StatsScope::Session("known"),
+        };
+        let expected = CacheStats {
+            hit_requests: 1,
+            reported_requests: 2,
+            read_tokens: 600,
+            write_tokens: 200,
+            reported_input_tokens: 1100,
+        };
+        assert_eq!(summary_on(&conn, filter).unwrap().cache, expected);
+        assert_eq!(by_provider_on(&conn, filter).unwrap()[0].cache, expected);
+        assert_eq!(by_account_on(&conn, filter).unwrap()[0].cache, expected);
+        let recent = recent_on(&conn, filter, 3).unwrap();
+        assert_eq!(recent[0].cache_read_tokens, None);
+        assert_eq!(recent[1].cache_read_tokens, Some(0));
+        assert_eq!(recent[2].cache_read_tokens, Some(600));
+        assert_eq!(recent[2].cache_write_tokens, 200);
+        assert_eq!(
+            recent[2].cache_diagnostics,
+            [CacheDiagnostic::StablePrefixChanged]
+        );
     }
 
     #[test]

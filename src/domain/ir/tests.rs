@@ -725,6 +725,20 @@ fn anthropic_cache_control_survives_the_ir() {
     );
 }
 
+#[test]
+fn responses_to_openai_preserves_explicit_cache_routing_key() {
+    let out = translate_request(
+        Format::Responses,
+        Format::Openai,
+        json!({
+            "model": "gpt", "prompt_cache_key": "shared-prefix",
+            "input": [{"role":"user", "content":[{"type":"input_text", "text":"hello"}]}]
+        }),
+    )
+    .unwrap();
+    assert_eq!(out["prompt_cache_key"], "shared-prefix");
+}
+
 /// A conversation, optionally with one more exchange appended.
 fn conversation(extra_turn: bool) -> Value {
     let mut messages = vec![

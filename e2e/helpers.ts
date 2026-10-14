@@ -107,15 +107,18 @@ export async function startProxy(
 export async function runCli(
   args: string[],
   env: Record<string, string> = {},
-): Promise<{ exit: number; output: string }> {
+): Promise<{ exit: number; output: string; stdout: string; stderr: string }> {
   const p = spawn([BINARY, ...args], {
     stdout: "pipe",
     stderr: "pipe",
     env: { ...process.env, ...env },
   });
-  const out = (await new Response(p.stdout).text()) + (await new Response(p.stderr).text());
+  const [stdout, stderr] = await Promise.all([
+    new Response(p.stdout).text(),
+    new Response(p.stderr).text(),
+  ]);
   const exit = await p.exited;
-  return { exit, output: out };
+  return { exit, output: stdout + stderr, stdout, stderr };
 }
 
 export function stopProxy(_h: ProxyHandle): void {

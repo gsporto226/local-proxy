@@ -92,6 +92,7 @@ pub fn prepare_upstream_body(
         enable_usage(&mut upstream_body);
     }
     prepare_responses_request(provider, &mut upstream_body, reasoning_effort, session_id);
+    crate::domain::cache::apply_policy(provider.format, provider.prompt_cache, &mut upstream_body);
     Ok(upstream_body)
 }
 
@@ -189,6 +190,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
             session_header: None,
             oauth: None,
+            prompt_cache: crate::domain::config::PromptCachePolicy::Preserve,
         };
         let mut body = json!({"model": "gpt-6-sol", "stream": false});
         prepare_responses_request(&responses, &mut body, Some("medium"), "sess-1");
@@ -228,6 +230,7 @@ mod tests {
                 headers: std::collections::HashMap::new(),
                 session_header: None,
                 oauth: None,
+                prompt_cache: crate::domain::config::PromptCachePolicy::Preserve,
             };
             let mut body = json!({"stream": false});
             prepare_responses_request(&provider, &mut body, Some("medium"), "");
@@ -248,6 +251,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
             session_header: None,
             oauth: None,
+            prompt_cache: crate::domain::config::PromptCachePolicy::Preserve,
         };
         let body = json!({
             "model": "claude/haiku-5.5",
@@ -290,6 +294,7 @@ mod tests {
             headers: std::collections::HashMap::new(),
             session_header: None,
             oauth: None,
+            prompt_cache: crate::domain::config::PromptCachePolicy::Preserve,
         };
 
         let prepared = prepare_upstream_body(

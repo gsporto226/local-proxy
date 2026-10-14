@@ -32,6 +32,13 @@ server:
 #     auto_model: gpt-4o
 #
 # Example: add a custom provider.
+# An Anthropic-format provider can opt into prompt caching with
+# `prompt_cache: anthropic-5m` or `prompt_cache: anthropic-1h`.
+# The default is `preserve`. Client cache_control markers always win.
+# The policy marks tools, system instructions and the latest user text,
+# including requests translated from OpenAI. Cache writes may cost extra.
+# Provider overrides replace the catalog entry: keep its URL, models and
+# OAuth recipe if you need subscription login.
 # providers:
 #   - name: mylocal
 #     base_url: http://127.0.0.1:8080/v1

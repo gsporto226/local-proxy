@@ -10,6 +10,48 @@ export interface MockUpstream {
   lastResponsesBody: () => any;
   /** How many token refreshes `/token` has served. */
   tokenHits: () => number;
+  /** Bodies received by every model endpoint, in arrival order. */
+  requests: () => CapturedRequest[];
+}
+
+export interface CapturedRequest {
+  path: string;
+  body: Record<string, unknown>;
+  headers: Record<string, string>;
+}
+
+export interface CacheUsage {
+  input: number;
+  read: number | null;
+  write: number;
+}
+
+function withCacheUsage(response: Response, path: string, usage: CacheUsage): Promise<Response> {
+  const reported = path === "/v1/messages"
+    ? { input_tokens: usage.input - (usage.read ?? 0) - usage.write, output_tokens: 2,
+        ...(usage.read === null ? {} : { cache_read_input_tokens: usage.read }),
+        ...(usage.write === 0 ? {} : { cache_creation_input_tokens: usage.write }) }
+    : path === "/responses"
+      ? { input_tokens: usage.input, output_tokens: 2, total_tokens: usage.input + 2,
+          ...(usage.read === null ? {} : { input_tokens_details: { cached_tokens: usage.read } }) }
+      : { prompt_tokens: usage.input, completion_tokens: 2, total_tokens: usage.input + 2,
+          ...(usage.read === null ? {} : { prompt_tokens_details: { cached_tokens: usage.read } }) };
+  return response.text().then((text) => {
+    if (response.headers.get("content-type")?.includes("text/event-stream")) {
+      const rewritten = text.split("\n").map((line) => {
+        if (!line.startsWith("data: ") || line === "data: [DONE]") return line;
+        const event = JSON.parse(line.slice(6));
+        if (event.type === "message_start") event.message.usage = { ...reported, output_tokens: 0 };
+        else if (event.type === "response.completed") event.response.usage = reported;
+        else if (event.usage && path !== "/v1/messages") event.usage = reported;
+        return `data: ${JSON.stringify(event)}`;
+      }).join("\n");
+      return sse(rewritten);
+    }
+    const body = JSON.parse(text);
+    body.usage = reported;
+    return Response.json(body, { status: response.status });
+  });
 }
 
 function sse(text: string): Response {
@@ -118,10 +160,13 @@ function responsesHandler(body: any): Response {
   });
 }
 
-export async function startMockUpstream(): Promise<MockUpstream> {
+export async function startMockUpstream(opts: { cacheUsage?: CacheUsage[]; simulateCache?: boolean } = {}): Promise<MockUpstream> {
   let lastHeaders: Record<string, string> = {};
   let lastBody: any = {};
   let tokenHits = 0;
+  const requests: CapturedRequest[] = [];
+  const cachedPrefixes = new Set<string>();
+  let cacheIndex = 0;
   const server = Bun.serve({
     port: 0,
     hostname: "127.0.0.1",
@@ -133,12 +178,24 @@ export async function startMockUpstream(): Promise<MockUpstream> {
       } catch {
         // empty/invalid body
       }
-      if (url.pathname === "/v1/chat/completions") return chatHandler(body);
-      if (url.pathname === "/v1/messages") return messagesHandler(body);
-      if (url.pathname === "/responses") {
-        lastHeaders = Object.fromEntries(req.headers.entries());
-        lastBody = body;
-        return responsesHandler(body);
+      if (["/v1/chat/completions", "/v1/messages", "/responses"].includes(url.pathname)) {
+        const headers = Object.fromEntries(req.headers.entries());
+        requests.push({ path: url.pathname, body, headers });
+        let usage = opts.cacheUsage?.[cacheIndex++];
+        if (opts.simulateCache) {
+          const { stream: _stream, max_tokens: _maxTokens, ...prefix } = body;
+          const key = JSON.stringify([url.pathname, headers.authorization, headers["x-api-key"], headers["chatgpt-account-id"], prefix]);
+          const warm = cachedPrefixes.has(key);
+          cachedPrefixes.add(key);
+          usage = { input: 1000, read: warm ? 800 : 0, write: url.pathname === "/v1/messages" && !warm ? 800 : 0 };
+        }
+        if (url.pathname === "/responses") {
+          lastHeaders = headers;
+          lastBody = body;
+        }
+        const response = url.pathname === "/v1/messages" ? messagesHandler(body)
+          : url.pathname === "/responses" ? responsesHandler(body) : chatHandler(body);
+        return usage ? withCacheUsage(response, url.pathname, usage) : response;
       }
       if (url.pathname === "/token") {
         // OAuth refresh endpoint, used by the oauth-seeded provider test.
@@ -158,6 +215,7 @@ export async function startMockUpstream(): Promise<MockUpstream> {
     lastResponsesHeaders: () => lastHeaders,
     lastResponsesBody: () => lastBody,
     tokenHits: () => tokenHits,
+    requests: () => requests,
   };
 }
 

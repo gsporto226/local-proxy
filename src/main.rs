@@ -3,7 +3,7 @@
 
 use std::path::PathBuf;
 
-use clap::{Parser, Subcommand};
+use clap::{Args, Parser, Subcommand};
 use tokio::runtime::Runtime;
 
 use local_proxy::adapters::inbound::cli;
@@ -22,6 +22,45 @@ struct Cli {
     config: Option<PathBuf>,
     #[command(subcommand)]
     command: Option<Command>,
+}
+
+#[derive(Debug, Args)]
+struct CacheCheckArgs {
+    /// Routed model, preferably provider/model
+    #[arg(long)]
+    model: String,
+    /// Account alias; defaults to the configured active account
+    #[arg(long)]
+    account: Option<String>,
+    /// Requests per arm including warmup (2 to 20)
+    #[arg(long, default_value_t = 3, value_parser = clap::value_parser!(u32).range(2..=20))]
+    runs: u32,
+    /// Approximate prefix tokens at four bytes per token (1024 to 32768)
+    #[arg(long, default_value_t = 8192, value_parser = clap::value_parser!(u32).range(1024..=32768))]
+    prefix_tokens: u32,
+    /// Confirm live upstream calls; consumes account quota
+    #[arg(long, required_unless_present = "dry_run", conflicts_with = "dry_run")]
+    confirm_live: bool,
+    /// Show an overview without loading credentials or sending requests
+    #[arg(long)]
+    dry_run: bool,
+    /// Print JSON
+    #[arg(long)]
+    json: bool,
+}
+
+impl From<CacheCheckArgs> for local_proxy::application::compare::CacheCheckOptions {
+    fn from(args: CacheCheckArgs) -> Self {
+        Self {
+            model: args.model,
+            account: args.account,
+            runs: args.runs,
+            prefix_tokens: args.prefix_tokens,
+            confirm_live: args.confirm_live,
+            dry_run: args.dry_run,
+            json: args.json,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -129,6 +168,8 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check provider prompt cache reuse with a generated stable prefix
+    CacheCheck(CacheCheckArgs),
     /// Compare direct and proxy-prepared request behavior (diagnostic only)
     #[command(hide = true)]
     Compare {
@@ -260,6 +301,7 @@ fn main() -> miette::Result<()> {
         Some(Command::Stats { since, json }) => {
             cli::stats(&ports, since.as_deref().unwrap_or("day"), json)
         }
+        Some(Command::CacheCheck(args)) => block_on(cli::cache_check(&ports, &config, args.into())),
         Some(Command::Compare {
             model,
             format,
@@ -296,6 +338,54 @@ fn main() -> miette::Result<()> {
 mod tests {
     use super::*;
     use clap::CommandFactory;
+
+    #[test]
+    fn cache_check_requires_confirmation_or_dry_run_and_bounded_repeats() {
+        assert!(Cli::command()
+            .render_long_help()
+            .to_string()
+            .contains("cache-check"));
+        assert!(
+            Cli::try_parse_from(["local-proxy", "cache-check", "--model", "mock/model"]).is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "local-proxy",
+            "cache-check",
+            "--model",
+            "mock/model",
+            "--dry-run",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Some(Command::CacheCheck(CacheCheckArgs {
+                runs: 3,
+                prefix_tokens: 8192,
+                dry_run: true,
+                ..
+            }))
+        ));
+        assert!(Cli::try_parse_from([
+            "local-proxy",
+            "cache-check",
+            "--model",
+            "mock/model",
+            "--confirm-live",
+            "--runs",
+            "1"
+        ])
+        .is_err());
+        assert!(Cli::try_parse_from([
+            "local-proxy",
+            "cache-check",
+            "--model",
+            "mock/model",
+            "--dry-run",
+            "--prefix-tokens",
+            "99999999"
+        ])
+        .is_err());
+    }
 
     #[test]
     fn compare_command_is_hidden_from_main_help_but_has_its_own_help() {

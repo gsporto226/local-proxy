@@ -146,6 +146,9 @@ pub fn render_json(scope: StatsScope<'_>, report: &StatsReport) -> Value {
                 "status": r.status,
                 "latency_ms": r.latency_ms,
                 "error": r.error,
+                "cache_read_tokens": r.cache_read_tokens,
+                "cache_write_tokens": r.cache_write_tokens,
+                "cache_diagnostics": r.cache_diagnostics,
             });
             if let Some(e) = r.energy_kwh_um {
                 v["energy_kwh_um"] = json!(e);
@@ -179,7 +182,14 @@ fn cache_stats_json(cache: CacheStats, requests: u64) -> Value {
         .then(|| cache.hit_requests as f64 / cache.reported_requests as f64 * 100.0);
     let coverage_percent =
         (requests > 0).then(|| cache.reported_requests as f64 / requests as f64 * 100.0);
+    let read_percent = (cache.reported_input_tokens > 0)
+        .then(|| cache.read_tokens as f64 / cache.reported_input_tokens as f64 * 100.0);
     json!({
+        "read_tokens": cache.read_tokens,
+        "write_tokens": cache.write_tokens,
+        "reported_input_tokens": cache.reported_input_tokens,
+        "uncached_tokens": cache.reported_input_tokens.saturating_sub(cache.read_tokens).saturating_sub(cache.write_tokens),
+        "read_percent": read_percent,
         "hit_requests": cache.hit_requests,
         "reported_requests": cache.reported_requests,
         "rate_percent": rate_percent,
@@ -197,9 +207,14 @@ mod tests {
             CacheStats {
                 hit_requests: 3,
                 reported_requests: 4,
+                read_tokens: 600,
+                write_tokens: 200,
+                reported_input_tokens: 1000,
             },
             8,
         );
+        assert_eq!(reported["read_percent"], 60.0);
+        assert_eq!(reported["uncached_tokens"], 200);
         assert_eq!(reported["hit_requests"], 3);
         assert_eq!(reported["reported_requests"], 4);
         assert_eq!(reported["rate_percent"], 75.0);
@@ -207,11 +222,26 @@ mod tests {
 
         let unavailable = cache_stats_json(CacheStats::default(), 2);
         assert!(unavailable["rate_percent"].is_null());
+        assert!(unavailable["read_percent"].is_null());
         assert_eq!(unavailable["coverage_percent"], 0.0);
 
         let no_requests = cache_stats_json(CacheStats::default(), 0);
         assert!(no_requests["rate_percent"].is_null());
         assert!(no_requests["coverage_percent"].is_null());
+    }
+
+    #[test]
+    fn token_cache_subtraction_saturates_for_inconsistent_upstream_counts() {
+        let cache = cache_stats_json(
+            CacheStats {
+                read_tokens: 600,
+                write_tokens: 800,
+                reported_input_tokens: 1000,
+                ..CacheStats::default()
+            },
+            1,
+        );
+        assert_eq!(cache["uncached_tokens"], 0);
     }
 
     #[test]
