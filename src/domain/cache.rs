@@ -246,9 +246,10 @@ mod tests {
             .as_array_mut()
             .unwrap()
             .push(json!({"role":"user","content":"second"}));
-        assert!(CacheObservation::new("chatgpt", "gpt", "work", &next)
-            .changes_from(&first)
-            .is_empty());
+        assert_eq!(
+            CacheObservation::new("chatgpt", "gpt", "work", &next).changes_from(&first),
+            Vec::<CacheDiagnostic>::new()
+        );
         next["instructions"] = json!("changed");
         next["prompt_cache_key"] = json!("different");
         assert_eq!(
@@ -283,7 +284,10 @@ mod tests {
         );
         usage.cache_read = Some(40);
         usage.cache_write = 0;
-        assert!(outcome_diagnostics(&[], 200, &usage).is_empty());
+        assert_eq!(
+            outcome_diagnostics(&[], 200, &usage),
+            Vec::<CacheDiagnostic>::new()
+        );
         assert_eq!(
             outcome_diagnostics(&[], 429, &usage),
             vec![CacheDiagnostic::UpstreamError]

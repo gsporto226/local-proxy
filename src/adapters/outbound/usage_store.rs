@@ -1220,7 +1220,10 @@ mod tests {
         let legacy = recent_on(&conn, all(), 1).unwrap();
         assert_eq!(legacy[0].cache_read_tokens, None);
         assert_eq!(legacy[0].cache_write_tokens, 0);
-        assert!(legacy[0].cache_diagnostics.is_empty());
+        assert_eq!(
+            legacy[0].cache_diagnostics,
+            Vec::<crate::domain::cache::CacheDiagnostic>::new()
+        );
         ensure_schema(&conn).unwrap();
     }
 

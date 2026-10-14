@@ -278,14 +278,14 @@ mod tests {
                 body,
             )
         };
-        assert!(observe("one", &first).is_empty());
-        assert!(observe("two", &changed).is_empty());
+        assert_eq!(observe("one", &first), Vec::<CacheDiagnostic>::new());
+        assert_eq!(observe("two", &changed), Vec::<CacheDiagnostic>::new());
         assert_eq!(
             observe("one", &changed),
             vec![CacheDiagnostic::StablePrefixChanged]
         );
-        assert!(observe("", &first).is_empty());
-        assert!(observe("", &changed).is_empty());
+        assert_eq!(observe("", &first), Vec::<CacheDiagnostic>::new());
+        assert_eq!(observe("", &changed), Vec::<CacheDiagnostic>::new());
         for index in 0..1030 {
             let _ = observe(&format!("session-{index}"), &first);
         }
