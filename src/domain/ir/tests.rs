@@ -164,6 +164,12 @@ fn a_to_o_tools_drop_regex_patterns() {
             }
         }]
     });
+    // ChatGPT's Responses backend ends the turn `incomplete` with no output
+    // on a `\0` pattern, so the Responses encoder strips them too.
+    let responses = anthropic_to_responses_request(body.clone()).unwrap();
+    let r_schema = &responses["tools"][0]["parameters"];
+    assert!(r_schema["properties"]["name"].get("pattern").is_none());
+    assert_eq!(r_schema["properties"]["name"]["maxLength"], 10);
     let out = anthropic_to_openai_request(body).unwrap();
     let schema = &out["tools"][0]["function"]["parameters"];
     assert!(schema["properties"]["name"].get("pattern").is_none());

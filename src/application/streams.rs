@@ -180,6 +180,19 @@ impl IrMachine {
 
 impl Machine for IrMachine {
     fn process(&mut self, frame: &SseFrame) -> Vec<Value> {
+        // A 200 stream can still fail mid-way (`error`, `response.failed`,
+        // `response.incomplete`); the IR has no error event, so at least
+        // surface it in the log instead of leaving an empty reply unexplained.
+        if let Some(v) = frame.json() {
+            let ty = v.get("type").and_then(Value::as_str).unwrap_or("");
+            let err = v
+                .get("error")
+                .or_else(|| v.get("response").and_then(|r| r.get("error")))
+                .filter(|e| !e.is_null());
+            if matches!(ty, "error" | "response.failed" | "response.incomplete") || err.is_some() {
+                tracing::warn!(target: crate::LOG_TARGET, event = %v, "upstream stream error");
+            }
+        }
         let events = self.dec.frame(frame);
         self.encode(events)
     }
