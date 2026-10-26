@@ -1,6 +1,6 @@
 [package]
 name = "local-proxy"
-version = "0.25.15"
+version = "0.25.16"
 edition = "2021"
 description = "Local multi-provider translation proxy (OpenAI <-> Anthropic) in Rust"
 license = "MIT"
