@@ -256,7 +256,7 @@ pub fn encode_request(req: &Request) -> Value {
                 "type": "function",
                 "name": name,
                 "description": description,
-                "parameters": schema
+                "parameters": super::openai::strip_schema_patterns(schema.clone())
             }),
             Tool::WebSearch => json!({"type": "web_search"}),
         })

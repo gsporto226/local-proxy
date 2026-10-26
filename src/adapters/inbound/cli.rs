@@ -157,7 +157,28 @@ pub fn is_serving(host: &str, port: u16) -> bool {
     false
 }
 
+/// Past this size the log is truncated when the next proxy opens it.
+const LOG_MAX_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Open the shared log for appending. Several proxies (the background one and
+/// every `launch` instance) write to it at once: append mode keeps their lines
+/// whole instead of each handle overwriting the others from its own offset.
+fn open_log() -> io::Result<std::fs::File> {
+    let path = log_file();
+    // ponytail: size cap instead of rotation; rotate if the history matters.
+    if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_MAX_BYTES) {
+        let _ = std::fs::File::create(&path);
+    }
+    std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(path)
+}
+
 /// Spawn this same binary detached (background) with the given args.
+///
+/// Stdout goes nowhere (the child's tracing writes the log file itself);
+/// stderr is appended to the log so panics still land there.
 ///
 /// # Errors
 ///
@@ -166,8 +187,7 @@ pub fn is_serving(host: &str, port: u16) -> bool {
 pub fn spawn_background(args: &[String]) -> io::Result<std::process::Child> {
     let exe = std::env::current_exe()?;
     std::fs::create_dir_all(paths::config_dir())?;
-    let log = std::fs::File::create(log_file())?;
-    let err = log.try_clone()?;
+    let err = open_log()?;
 
     #[cfg(windows)]
     {
@@ -177,7 +197,7 @@ pub fn spawn_background(args: &[String]) -> io::Result<std::process::Child> {
         let mut cmd = Command::new(exe);
         cmd.creation_flags(DETACHED_PROCESS | CREATE_NO_WINDOW);
         cmd.args(args)
-            .stdout(Stdio::from(log))
+            .stdout(Stdio::null())
             .stderr(Stdio::from(err))
             .stdin(Stdio::null());
         cmd.spawn()
@@ -186,7 +206,7 @@ pub fn spawn_background(args: &[String]) -> io::Result<std::process::Child> {
     {
         let mut cmd = Command::new(exe);
         cmd.args(args)
-            .stdout(Stdio::from(log))
+            .stdout(Stdio::null())
             .stderr(Stdio::from(err))
             .stdin(Stdio::null());
         cmd.spawn()
@@ -211,9 +231,9 @@ pub fn pick_ephemeral_port(host: &str) -> io::Result<u16> {
 /// Spawn this same binary as a non-detached child with the given args, keeping
 /// the handle so the caller can kill it when the launched tool exits.
 ///
-/// Unlike [`spawn_background`], the child is not detached: its stdout/stderr are
-/// still mirrored to the log file, but the returned handle stays attached so the
-/// proxy lifetime can be tied to a foreground tool.
+/// Unlike [`spawn_background`], the child is not detached: the returned handle
+/// stays attached so the proxy lifetime can be tied to a foreground tool. Its
+/// logging is the same: the log file from tracing, stderr appended for panics.
 ///
 /// # Errors
 ///
@@ -222,12 +242,11 @@ pub fn pick_ephemeral_port(host: &str) -> io::Result<u16> {
 pub fn spawn_launch_proxy(args: &[String]) -> io::Result<std::process::Child> {
     let exe = std::env::current_exe()?;
     std::fs::create_dir_all(paths::config_dir())?;
-    let log = std::fs::File::create(log_file())?;
-    let err = log.try_clone()?;
+    let err = open_log()?;
 
     let mut cmd = Command::new(exe);
     cmd.args(args)
-        .stdout(Stdio::from(log))
+        .stdout(Stdio::null())
         .stderr(Stdio::from(err))
         .stdin(Stdio::null());
     cmd.spawn()
@@ -391,7 +410,7 @@ fn init_tracing(ports: &Ports) {
     // file even when the server runs in the background or detached. If the file
     // cannot be opened (e.g. read-only config dir), fall back to stdout only.
     let file_writer = std::fs::create_dir_all(paths::config_dir())
-        .and_then(|()| std::fs::File::create(log_file()))
+        .and_then(|()| open_log())
         .map(std::sync::Arc::new);
 
     // One formatter feeds the console, the log file and the `/admin/events` tap,

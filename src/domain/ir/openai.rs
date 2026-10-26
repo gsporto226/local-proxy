@@ -186,8 +186,9 @@ pub fn decode_request(body: Value) -> Result<Request, TranslateError> {
 
 /// Recursively drop JSON Schema `pattern`/`patternProperties`. They are
 /// advisory for tool calls, and some upstream validators reject regexes they
-/// cannot compile (`DeepSeek` 400s on a `\0` escape), failing the request.
-fn strip_schema_patterns(mut value: Value) -> Value {
+/// cannot compile (`DeepSeek` 400s on a `\0` escape; the `ChatGPT` Responses
+/// backend ends the response `incomplete` with no output), failing the request.
+pub(super) fn strip_schema_patterns(mut value: Value) -> Value {
     match &mut value {
         Value::Object(map) => {
             map.remove("pattern");
