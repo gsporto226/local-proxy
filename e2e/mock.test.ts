@@ -333,6 +333,8 @@ describe("e2e: proxy against a mock upstream (openai upstream)", () => {
     const ids = body.data.map((m: any) => m.id);
     expect(body.data[0].type).toBe("model");
     expect(ids).toContain("claude-via-openai");
+    expect(body.data.find((m: { id: string }) => m.id === "claude-via-openai").display_name)
+      .toBe("mock_openai/claude-via-openai");
   });
 
   test("messages streaming via openai upstream -> Anthropic events", async () => {

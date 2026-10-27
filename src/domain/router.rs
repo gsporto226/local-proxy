@@ -215,7 +215,8 @@ impl Router {
     }
 
     /// Catalog of models a client may request: exact route models plus each
-    /// provider's native model list.
+    /// provider's native model list, qualified by provider so identical model
+    /// names remain distinct in client model pickers.
     #[must_use]
     pub fn list_models(&self) -> Vec<String> {
         let mut models: Vec<String> = Vec::new();
@@ -226,8 +227,9 @@ impl Router {
         }
         for provider in &self.config.providers {
             for model in &provider.models {
-                if !models.contains(model) {
-                    models.push(model.clone());
+                let id = crate::domain::config::qualified_id(&provider.name, model);
+                if !models.contains(&id) {
+                    models.push(id);
                 }
             }
             if provider.auto_model.is_some() {
@@ -602,12 +604,30 @@ mod tests {
     }
 
     #[test]
+    fn model_picker_keeps_shared_models_distinct_and_routable() {
+        let mut cfg = config();
+        for provider in &mut cfg.providers {
+            provider.models = vec!["shared-model".to_string()];
+        }
+        let router = router_for(cfg);
+        let models = router.list_models();
+        for provider in ["anthropic", "openai"] {
+            let id = format!("{provider}/shared-model");
+            assert!(models.contains(&id));
+            let resolved = router.resolve_client_model(&id, &|_| true).unwrap();
+            assert_eq!(resolved.provider.name, provider);
+            assert_eq!(resolved.upstream_model, "shared-model");
+        }
+        assert!(!models.contains(&"shared-model".to_string()));
+    }
+
+    #[test]
     fn list_models_catalog() {
         let router = router_for(config());
         let models = router.list_models();
         assert!(models.contains(&"gpt-4o".to_string()));
-        assert!(models.contains(&"claude-native-1".to_string()));
-        assert!(models.contains(&"gpt-native-1".to_string()));
+        assert!(models.contains(&"anthropic/claude-native-1".to_string()));
+        assert!(models.contains(&"openai/gpt-native-1".to_string()));
         assert!(!models.contains(&"claude".to_string()));
     }
 }

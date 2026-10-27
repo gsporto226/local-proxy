@@ -219,7 +219,11 @@ pub(super) async fn models(State(app): State<AppState>, headers: HeaderMap) -> R
                 } else {
                     format!("{}{m}", proxy::GATEWAY_ID_MARKER)
                 };
-                json!({"type": "model", "id": id, "display_name": m})
+                let display_name = state.router.resolve_client_model(m, &|_| true).map_or_else(
+                    |_| m.clone(),
+                    |route| crate::domain::config::qualified_id(&route.provider.name, m),
+                );
+                json!({"type": "model", "id": id, "display_name": display_name})
             })
             .collect();
         let first = models.first();
