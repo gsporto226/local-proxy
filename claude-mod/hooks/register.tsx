@@ -102,6 +102,29 @@ const accountFilter = atom({ plugin: 'local-proxy', key: 'accountFilter' } as co
 // The proxy this session talks to: Claude's own base URL, when it is a loopback
 // address (where `launch`/`serve` put it). Undefined means no proxy connection.
 let origin: string | undefined
+let originalContextWindow: string | undefined
+let contextWindowApplied = false
+
+async function syncContextWindow($: $) {
+  const restore = async () => {
+    if (contextWindowApplied) {
+      await $.env.set('CLAUDE_CODE_MAX_CONTEXT_TOKENS', originalContextWindow)
+      contextWindowApplied = false
+    }
+  }
+  try {
+    const model = await $.session.model()
+    if (!model) return await restore()
+    const data = await api<{ context_window: unknown }>($, 'GET', `/admin/model-context?model=${encodeURIComponent(model)}`)
+    const window = data.context_window
+    if (typeof window !== 'number' || !Number.isSafeInteger(window) || window <= 0) return await restore()
+    await $.env.set('CLAUDE_CODE_MAX_CONTEXT_TOKENS', String(window))
+    contextWindowApplied = true
+  } catch {
+    // Do not carry another model's limit across an unavailable lookup.
+    await restore().catch(() => {})
+  }
+}
 
 async function detect($: $) {
   const raw = await $.env.get('ANTHROPIC_BASE_URL')
@@ -318,6 +341,9 @@ export const register: Register = (on, options) => {
     // Without a proxy connection the mod stays inert: no command, no row, no polling.
     origin = await detect($)
     if (!origin) return next(e)
+    originalContextWindow = await $.env.get('CLAUDE_CODE_MAX_CONTEXT_TOKENS')
+    contextWindowApplied = false
+    await syncContextWindow($)
     await $.command.register({
       name: 'proxy',
       description: 'local-proxy: no args opens the panel; otherwise runs the CLI (e.g. /proxy account)',
@@ -343,10 +369,17 @@ export const register: Register = (on, options) => {
 
   on('prompt.submit', async ($, e, next) => {
     if (origin) {
+      await syncContextWindow($)
       hadFocus = false
       await $.ui.close({ id: PANE })
     }
     return next(e)
+  })
+
+  on('command.run', { command: 'model' }, async ($, e, next) => {
+    const result = await next(e)
+    if (origin) await syncContextWindow($)
+    return result
   })
 
   on('command.run', { command: 'proxy' }, async ($, e) => {

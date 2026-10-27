@@ -160,7 +160,7 @@ function responsesHandler(body: any): Response {
   });
 }
 
-export async function startMockUpstream(opts: { cacheUsage?: CacheUsage[]; simulateCache?: boolean } = {}): Promise<MockUpstream> {
+export async function startMockUpstream(opts: { cacheUsage?: CacheUsage[]; simulateCache?: boolean; models?: { id: string; context_length?: number }[] } = {}): Promise<MockUpstream> {
   let lastHeaders: Record<string, string> = {};
   let lastBody: any = {};
   let tokenHits = 0;
@@ -177,6 +177,9 @@ export async function startMockUpstream(opts: { cacheUsage?: CacheUsage[]; simul
         body = JSON.parse(await req.text());
       } catch {
         // empty/invalid body
+      }
+      if (url.pathname === "/v1/models" && opts.models) {
+        return Response.json({ data: opts.models });
       }
       if (["/v1/chat/completions", "/v1/messages", "/responses"].includes(url.pathname)) {
         const headers = Object.fromEntries(req.headers.entries());

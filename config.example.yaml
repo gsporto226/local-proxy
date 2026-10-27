@@ -45,6 +45,10 @@ server:
 #     format: openai
 #     models:
 #       - local-model
+#     # Optional override: context windows are discovered from the provider,
+#     # then models.dev when absent. The mod applies the window to the session.
+#     context_windows:
+#       local-model: 1048576
 #
 # Example: a Responses-API provider with a static key.
 # providers:

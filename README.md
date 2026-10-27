@@ -363,6 +363,26 @@ claude
 
 Claude Code talks `/v1/messages`; the proxy routes to the configured provider and translates, for example `deepseek-free` to `deepseek-v4-flash-free` through opencode-zen.
 
+The proxy discovers context windows from each provider's model metadata. When
+that metadata is absent, it looks up the exact provider/model pair in
+[models.dev](https://models.dev), with an in-memory cache and a five-second
+timeout. HTTP model servers use their own metadata without public catalog
+requests. Explicit `context_windows` values in a provider's configuration
+override discovery.
+
+The local-proxy mod reads the selected model's discovered limit at startup,
+after `/model`, and before each prompt. It sets the session's
+`CLAUDE_CODE_MAX_CONTEXT_TOKENS` so Claude Code uses that window for native
+compaction, including windows such as 128K and 400K. Model names need no
+context suffix. An unknown limit or unavailable proxy restores the session's
+original value. Your auto-compact settings stay in effect. No model-specific
+context list is embedded in the proxy.
+
+This requires the mod. Without it, Claude Code uses its own context defaults.
+For IDs that Claude Code recognizes as native Claude models, its own model
+catalog determines the window; see
+[custom model context windows](https://code.claude.com/docs/en/model-config#which-ids-claude_code_max_context_tokens-applies-to).
+
 ### Launch: one dedicated instance
 
 `local-proxy launch claude [--model X] [--yes] [-- args...]` (and `launch design`) starts a dedicated proxy instance on a random free port, points the tool at it, and kills the proxy when the tool exits, including on error or non-zero exit. It never reuses or touches a background proxy that is already running, and never overwrites the shared pid file. Statistics still go to the same `stats.db` (WAL plus busy timeout, safe with multiple instances):

@@ -45,6 +45,7 @@ session. Omitting `session_id` keeps the existing all-sessions behavior.
 | `GET /admin/accounts` | `[{ provider, alias, kind, is_default }]` (`kind`: `api`\|`oauth`) |
 | `GET /admin/providers` | `[{ name, format, accounts: [<account as above>] }]` (catalog + config, same data as `local-proxy providers`) |
 | `GET /admin/models` | `[string]` |
+| `GET /admin/model-context?model=<id>` | `{ provider, model, context_window }` from the running router; the window is a token count or `null` when unknown. Accepts gateway IDs and route aliases. |
 | `GET /admin/stats?since=day\|week\|month\|all[&session_id=...]` | same JSON as `local-proxy stats --json`; optional session filter; `null` before any stats exist |
 | `GET /admin/stats?since=session&session_id=...` | Stats for the full Claude Code session; `session_id` is required |
 | `GET /admin/rate-limits` | `{ h5, week }` (percent, nullable) |

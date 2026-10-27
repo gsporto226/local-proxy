@@ -214,16 +214,25 @@ pub(super) async fn models(State(app): State<AppState>, headers: HeaderMap) -> R
         let data: Vec<Value> = models
             .iter()
             .map(|m| {
-                let id = if proxy::passes_gateway_filter(m) {
-                    m.clone()
+                let route = state.router.resolve_client_model(m, &|_| true).ok();
+                let context_window = route.as_ref().and_then(|route| {
+                    route
+                        .provider
+                        .context_windows
+                        .get(&route.upstream_model)
+                        .copied()
+                });
+                let model = m.clone();
+                let id = if proxy::passes_gateway_filter(&model) {
+                    model.clone()
                 } else {
-                    format!("{}{m}", proxy::GATEWAY_ID_MARKER)
+                    format!("{}{model}", proxy::GATEWAY_ID_MARKER)
                 };
-                let display_name = state.router.resolve_client_model(m, &|_| true).map_or_else(
-                    |_| m.clone(),
-                    |route| crate::domain::config::qualified_id(&route.provider.name, m),
+                let display_name = route.map_or_else(
+                    || model.clone(),
+                    |route| crate::domain::config::qualified_id(&route.provider.name, &model),
                 );
-                json!({"type": "model", "id": id, "display_name": display_name})
+                json!({"type": "model", "id": id, "display_name": display_name, "context_window": context_window})
             })
             .collect();
         let first = models.first();

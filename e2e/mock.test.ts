@@ -337,6 +337,47 @@ describe("e2e: proxy against a mock upstream (openai upstream)", () => {
       .toBe("mock_openai/claude-via-openai");
   });
 
+  test("model context is discovered per model without modifying its ID", async () => {
+    const mock = await startMockUpstream({ models: [
+      { id: "gpt-4o", context_length: 1048576 },
+      { id: "small-model", context_length: 128000 },
+      { id: "unknown-window" },
+    ] });
+    let contextProxy: ProxyHandle | undefined;
+    try {
+      const cfg = mockConfig(`http://127.0.0.1:${mock.port}`);
+      contextProxy = await startProxy(cfg, undefined, isolatedEnv);
+      const response = await get(contextProxy.base, "/v1/models", { "anthropic-version": "2023-06-01" });
+      const body = JSON.parse(await readBody(response));
+      const ids: string[] = body.data.map((model: { id: string }) => model.id);
+      expect(ids).toContain("anthropic:mock_openai/gpt-4o");
+      expect(ids).toContain("anthropic:mock_openai/small-model");
+      expect(ids).not.toContain("anthropic:mock_openai/small-model[1m]");
+      expect(ids).toContain("anthropic:mock_openai/unknown-window");
+      expect(ids).not.toContain("anthropic:mock_openai/unknown-window[1m]");
+      expect(ids).toContain("claude-via-openai");
+      expect(body.data.find((model: { id: string }) => model.id === "anthropic:mock_openai/gpt-4o").context_window).toBe(1048576);
+      for (const [model, expected] of [["mock_openai/small-model", 128000], ["claude-via-openai", 1048576], ["mock_openai/unknown-window", null]]) {
+        const metadata = await get(contextProxy.base, `/admin/model-context?model=${encodeURIComponent(String(model))}`);
+        expect(metadata.status).toBe(200);
+        expect(JSON.parse(await readBody(metadata)).context_window).toBe(expected);
+      }
+      const admin = await get(contextProxy.base, "/admin/models");
+      expect(JSON.parse(await readBody(admin))).toContain("mock_openai/gpt-4o");
+      for (const model of ["anthropic:mock_openai/gpt-4o[1m]", "claude-via-openai[1m]"]) {
+        const reply = await postJson(contextProxy.base, "/v1/messages", {
+          model, max_tokens: 10, messages: [{ role: "user", content: "hi" }], stream: false,
+        });
+        expect(reply.status).toBe(200);
+        await readBody(reply);
+        expect(mock.requests().at(-1)?.body.model).toBe("gpt-4o");
+      }
+    } finally {
+      if (contextProxy) stopProxy(contextProxy);
+      mock.stop();
+    }
+  });
+
   test("messages streaming via openai upstream -> Anthropic events", async () => {
     const r = await postJson(proxy.base, "/v1/messages", {
       model: "claude-via-openai",

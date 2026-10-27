@@ -207,6 +207,8 @@ pub trait UpstreamConnector: Send + Sync {
 
     /// Fill `models` for providers that list none, asking each upstream with
     /// any usable account from `accounts`. Failures leave the list empty.
+    /// Discover context windows from upstream metadata, falling back to a
+    /// public provider/model catalog when necessary. Explicit windows win.
     /// Blocks the caller.
     fn discover_models(&self, config: &mut Config, accounts: &AuthMap);
 }

@@ -56,17 +56,18 @@ const ROUTES: Record<string, unknown> = {
  * Mocks the proxy's HTTP API, the clock, env, session and the SSE child; records
  * each call and each registered command. `baseUrl` is Claude's ANTHROPIC_BASE_URL.
  */
-function mockProxy(on: On, opts: { sse?: string[]; baseUrl?: string; routes?: Record<string, unknown> } = {}) {
+function mockProxy(on: On, opts: { sse?: string[]; baseUrl?: string; routes?: Record<string, unknown>; env?: Record<string, string>; model?: () => string; contextDown?: () => boolean } = {}) {
   const calls: string[] = []
   const commands: string[] = []
   const opened: string[] = []
   const openArgs: unknown[] = []
   const routes = { ...(opts.routes ?? ROUTES) }
   mock.clock(on)
-  mock.env(on, opts.baseUrl === undefined ? { ANTHROPIC_BASE_URL: BASE } : opts.baseUrl ? { ANTHROPIC_BASE_URL: opts.baseUrl } : {})
+  mock.env(on, { ...(opts.baseUrl === undefined ? { ANTHROPIC_BASE_URL: BASE } : opts.baseUrl ? { ANTHROPIC_BASE_URL: opts.baseUrl } : {}), ...opts.env })
   on('http.fetch', ($, e) => {
     const key = `${e.init?.method ?? 'GET'} ${e.url.replace(BASE, '')}`
     calls.push(e.init?.body ? `${key} ${e.init.body}` : key)
+    if (key.startsWith('GET /admin/model-context?') && opts.contextDown?.()) return { value: { status: 503, ok: false, headers: {}, text: '{}' } }
     if (e.init?.method === 'PUT' && (key === 'PUT /admin/model' || key === 'PUT /admin/effort')) {
       const field = key.endsWith('model') ? 'model' : 'effort'
       const current = routes['GET /admin/status'] as Record<string, unknown>
@@ -76,7 +77,7 @@ function mockProxy(on: On, opts: { sse?: string[]; baseUrl?: string; routes?: Re
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(routes[key] ?? {}) } }
   })
   on('session.id', () => ({ value: 'sess-1' }))
-  on('session.model', () => ({ value: 'claude-x' }))
+  on('session.model', () => ({ value: opts.model?.() ?? 'claude-x' }))
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 100, percent: 42 }, rateLimits: [], cost: { usd: 1.5 } } }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   // Stand-ins for the engine beneath: a submitted prompt passes, an empty band draws nothing.
@@ -135,6 +136,41 @@ const STATUSLINE = {
     })
   },
 }
+
+test('context follows the selected model and restores the original limit for unknown models', async ($, on) => {
+  const routes = { ...ROUTES,
+    'GET /admin/model-context?model=provider%2Fsmall': { context_window: 128000 },
+    'GET /admin/model-context?model=provider%2Fmedium': { context_window: 400000 },
+    'GET /admin/model-context?model=provider%2Flarge': { context_window: 1048576 },
+    'GET /admin/model-context?model=provider%2Funknown': { context_window: null },
+  }
+  let model = 'provider/small'
+  mockProxy(on, { routes, model: () => model, env: { CLAUDE_CODE_MAX_CONTEXT_TOKENS: '256000', CLAUDE_CODE_AUTO_COMPACT_WINDOW: '110000' } })
+  const writes: { name: string; value: unknown }[] = []
+  on('env.set', ($, e) => { writes.push({ name: e.name, value: e.value }); return { value: undefined } })
+  await start($)
+  expect(writes.at(-1)).toEqual({ name: 'CLAUDE_CODE_MAX_CONTEXT_TOKENS', value: '128000' })
+  for (const { selected, expected } of [{ selected: 'provider/medium', expected: '400000' }, { selected: 'provider/large', expected: '1048576' }, { selected: 'provider/unknown', expected: '256000' }]) {
+    model = selected
+    await $.prompt.submit({ text: 'hi', origin: { kind: 'composer' } } as never)
+    expect(writes.at(-1)).toEqual({ name: 'CLAUDE_CODE_MAX_CONTEXT_TOKENS', value: expected })
+  }
+  expect(writes.every(write => write.name === 'CLAUDE_CODE_MAX_CONTEXT_TOKENS')).toBe(true)
+})
+
+test('an unavailable context lookup removes the previous model limit', async ($, on) => {
+  let model = 'provider/small'
+  let down = false
+  mockProxy(on, { model: () => model, contextDown: () => down, routes: { ...ROUTES, 'GET /admin/model-context?model=provider%2Fsmall': { context_window: 128000 } } })
+  const writes: unknown[] = []
+  on('env.set', ($, e) => { writes.push(e.value); return { value: undefined } })
+  await start($)
+  expect(writes.at(-1)).toBe('128000')
+  model = 'unknown'
+  down = true
+  await $.prompt.submit({ text: 'hi', origin: { kind: 'composer' } } as never)
+  expect(writes.at(-1)).toBeUndefined()
+})
 
 test('/proxy <args> runs the CLI and returns its output', async ($, on) => {
   mockProxy(on)

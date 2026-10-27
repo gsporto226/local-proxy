@@ -142,6 +142,9 @@ impl Router {
         is_connected: &dyn Fn(&str) -> bool,
         strict: bool,
     ) -> Result<ResolvedRoute, RouterError> {
+        // Claude Code strips this hint before sending requests. Accept it
+        // here too for CLI selections and clients that preserve the suffix.
+        let model = model.strip_suffix("[1m]").unwrap_or(model);
         if let Some(&route_idx) = self.exact.get(model) {
             return Ok(self.resolve_route(route_idx, model));
         }
@@ -322,6 +325,7 @@ mod tests {
                     base_url: "https://api.anthropic.com".to_string(),
                     format: ProviderFormat::Anthropic,
                     models: vec!["claude-native-1".to_string()],
+                    context_windows: std::collections::HashMap::new(),
                     auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
@@ -333,6 +337,7 @@ mod tests {
                     base_url: "https://api.openai.com/v1".to_string(),
                     format: ProviderFormat::Openai,
                     models: vec!["gpt-native-1".to_string()],
+                    context_windows: std::collections::HashMap::new(),
                     auto_model: None,
                     headers: std::collections::HashMap::new(),
                     session_header: None,
@@ -601,6 +606,21 @@ mod tests {
         });
         let err = Router::new(Arc::new(c)).unwrap_err();
         assert!(matches!(err, RouterError::ProviderNotFound { .. }));
+    }
+
+    #[test]
+    fn context_hint_preserves_provider_route_and_upstream_model() {
+        let router = router_for(config());
+        for (hinted, plain) in [
+            ("openai/gpt-native-1[1m]", "openai/gpt-native-1"),
+            ("gpt-4o[1m]", "gpt-4o"),
+        ] {
+            let route = router.resolve_client_model(hinted, &|_| true).unwrap();
+            let expected = router.resolve_client_model(plain, &|_| true).unwrap();
+            assert_eq!(route.provider.name, expected.provider.name);
+            assert_eq!(route.upstream_model, expected.upstream_model);
+            assert_eq!(route.reasoning_effort, expected.reasoning_effort);
+        }
     }
 
     #[test]

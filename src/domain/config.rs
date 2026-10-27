@@ -158,6 +158,9 @@ pub struct Provider {
     pub format: ProviderFormat,
     /// Native model IDs the provider can serve.
     pub models: Vec<String>,
+    /// Context windows in tokens, keyed by native model ID. Discovery fills
+    /// missing windows; explicit configuration values take precedence.
+    pub context_windows: HashMap<String, u64>,
     /// Model sent upstream when a request asks for `auto` (bare, or as
     /// `<provider>/auto`). When unset, `auto` is not available for this
     /// provider.

@@ -23,6 +23,87 @@ use crate::ports::{
 
 const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+#[derive(Debug, PartialEq, Eq)]
+struct DiscoveredModel {
+    id: String,
+    context_window: Option<u64>,
+}
+
+fn positive_tokens(value: &Value) -> Option<u64> {
+    value.as_u64().filter(|tokens| *tokens > 0)
+}
+
+fn discovered_models(body: &Value) -> Vec<DiscoveredModel> {
+    body["data"]
+        .as_array()
+        .into_iter()
+        .flatten()
+        .filter_map(|model| {
+            let id = model["id"].as_str()?.to_string();
+            let context_window = [
+                "/top_provider/context_length",
+                "/context_length",
+                "/context_window",
+                "/max_input_tokens",
+                "/limit/context",
+            ]
+            .iter()
+            .find_map(|path| model.pointer(path).and_then(positive_tokens));
+            Some(DiscoveredModel { id, context_window })
+        })
+        .collect()
+}
+
+fn catalog_context(catalog: &Value, provider: &str, model: &str) -> Option<u64> {
+    // These are provider aliases, not a list of models or context sizes.
+    let provider = match provider {
+        "zen" => "opencode",
+        "claude" => "anthropic",
+        "chatgpt" => "openai",
+        other => other,
+    };
+    catalog
+        .get(provider)?
+        .get("models")?
+        .get(model)?
+        .get("limit")?
+        .get("context")
+        .and_then(positive_tokens)
+}
+
+async fn context_catalog() -> Value {
+    static CACHE: std::sync::OnceLock<std::sync::Mutex<Option<(std::time::Instant, Value)>>> =
+        std::sync::OnceLock::new();
+    let cache = CACHE.get_or_init(|| std::sync::Mutex::new(None));
+    if let Ok(guard) = cache.lock() {
+        if let Some((at, value)) = guard.as_ref() {
+            if at.elapsed() < Duration::from_secs(3600) {
+                return value.clone();
+            }
+        }
+    }
+    let result = reqwest::Client::new()
+        .get("https://models.dev/api.json")
+        .timeout(Duration::from_secs(5))
+        .send()
+        .await;
+    let value = match result {
+        Ok(response) if response.status().is_success() => response.json::<Value>().await.ok(),
+        _ => None,
+    };
+    if let Ok(mut guard) = cache.lock() {
+        if let Some(value) = value {
+            *guard = Some((std::time::Instant::now(), value.clone()));
+            return value;
+        }
+        if let Some((_, value)) = guard.as_ref() {
+            return value.clone();
+        }
+    }
+    tracing::warn!(target: crate::LOG_TARGET, "context catalog unavailable; models without upstream context metadata keep their original IDs");
+    Value::Null
+}
+
 fn usage_endpoint(provider: &str) -> Option<&'static str> {
     match provider {
         "chatgpt" => Some("https://chatgpt.com/backend-api/wham/usage"),
@@ -117,11 +198,10 @@ impl UpstreamConnector for HttpUpstreamConnector {
     }
 
     fn discover_models(&self, config: &mut Config, accounts: &AuthMap) {
-        let targets: Vec<(usize, ProviderClient)> = config
+        let targets: Vec<(usize, ProviderClient, Vec<String>)> = config
             .providers
             .iter()
             .enumerate()
-            .filter(|(_, p)| p.models.is_empty())
             .filter_map(|(i, p)| {
                 // Any usable account can answer the models query; sort for a
                 // deterministic pick across runs.
@@ -130,7 +210,7 @@ impl UpstreamConnector for HttpUpstreamConnector {
                 aliases.sort_unstable_by(|a, b| a.0.cmp(b.0));
                 let (alias, entry) = aliases.into_iter().find(|(_, entry)| entry.usable())?;
                 let client = self.client(p, alias, false, Some(entry.clone())).ok()?;
-                Some((i, client))
+                Some((i, client, p.models.clone()))
             })
             .collect();
         if targets.is_empty() {
@@ -143,20 +223,59 @@ impl UpstreamConnector for HttpUpstreamConnector {
                 .enable_all()
                 .build()
                 .ok()?;
-            Some(
-                rt.block_on(futures_util::future::join_all(
-                    targets
-                        .into_iter()
-                        .map(|(i, c)| async move { (i, c.list_models().await) }),
-                )),
-            )
+            Some(rt.block_on(async move {
+                let mut found = futures_util::future::join_all(targets.into_iter().map(
+                    |(i, c, configured)| async move {
+                        let models = if configured.is_empty() {
+                            c.list_models().await
+                        } else {
+                            configured
+                                .into_iter()
+                                .map(|id| DiscoveredModel {
+                                    id,
+                                    context_window: None,
+                                })
+                                .collect()
+                        };
+                        (i, c.name, c.base_url.starts_with("https://"), models)
+                    },
+                ))
+                .await;
+                // Fetch once per batch. Local model servers use their own
+                // metadata and do not cause public catalog requests.
+                if found.iter().any(|(_, _, remote, models)| {
+                    *remote && models.iter().any(|m| m.context_window.is_none())
+                }) {
+                    let catalog = context_catalog().await;
+                    for (_, name, remote, models) in &mut found {
+                        if *remote {
+                            for model in models {
+                                if model.context_window.is_none() {
+                                    model.context_window =
+                                        catalog_context(&catalog, name, &model.id);
+                                }
+                            }
+                        }
+                    }
+                }
+                found
+                    .into_iter()
+                    .map(|(i, _, _, models)| (i, models))
+                    .collect::<Vec<_>>()
+            }))
         })
         .join()
         .ok()
         .flatten()
         .unwrap_or_default();
         for (i, models) in found {
-            config.providers[i].models = models;
+            let provider = &mut config.providers[i];
+            provider.models = models.iter().map(|model| model.id.clone()).collect();
+            for model in models {
+                if let Some(tokens) = model.context_window {
+                    provider.context_windows.entry(model.id).or_insert(tokens);
+                }
+            }
         }
     }
 }
@@ -687,7 +806,7 @@ impl ProviderClient {
 
     /// Model IDs from the upstream's `GET /v1/models` (both `OpenAI` and
     /// Anthropic return `{"data": [{"id": ...}]}`). Empty on any failure.
-    async fn list_models(&self) -> Vec<String> {
+    async fn list_models(&self) -> Vec<DiscoveredModel> {
         let is_oauth = matches!(self.auth, Some(AuthEntry::OAuth(_)));
         let oauth_access = if is_oauth {
             self.oauth_access().await
@@ -733,12 +852,7 @@ impl ProviderClient {
                 return Vec::new();
             }
         };
-        body["data"]
-            .as_array()
-            .into_iter()
-            .flatten()
-            .filter_map(|m| m["id"].as_str().map(str::to_string))
-            .collect()
+        discovered_models(&body)
     }
 }
 
@@ -841,6 +955,7 @@ mod tests {
             base_url: "http://127.0.0.1:9".to_string(),
             format,
             models: Vec::new(),
+            context_windows: std::collections::HashMap::new(),
             auto_model: None,
             headers: std::collections::HashMap::new(),
             session_header: None,
@@ -1205,6 +1320,60 @@ mod tests {
         );
     }
 
+    #[test]
+    fn model_metadata_parses_context_without_inferring_from_names() {
+        let models = discovered_models(&json!({"data": [
+            {"id": "new-model", "context_length": 1_048_576},
+            {"id": "routed", "context_length": 1_048_576, "top_provider": {"context_length": 128_000}},
+            {"id": "anthropic", "max_input_tokens": 200_000},
+            {"id": "local", "context_window": 65_536},
+            {"id": "nested", "limit": {"context": 32_768}},
+            {"id": "looks-like-1m", "context_length": 0},
+            {"id": "invalid", "context_length": "1000000"},
+            {"id": "missing"},
+            {"context_length": 1_000_000}
+        ]}));
+        let windows: Vec<_> = models.iter().map(|model| model.context_window).collect();
+        assert_eq!(
+            windows,
+            vec![
+                Some(1_048_576),
+                Some(128_000),
+                Some(200_000),
+                Some(65_536),
+                Some(32_768),
+                None,
+                None,
+                None
+            ]
+        );
+    }
+
+    #[test]
+    fn catalog_context_matches_the_provider_and_exact_model_id() {
+        let catalog = json!({
+            "opencode-go": {"models": {"new-model": {"limit": {"context": 1_048_576}}}},
+            "opencode": {"models": {"new-model": {"limit": {"context": 128_000}}}}
+        });
+        assert_eq!(
+            catalog_context(&catalog, "opencode-go", "new-model"),
+            Some(1_048_576)
+        );
+        assert_eq!(catalog_context(&catalog, "zen", "new-model"), Some(128_000));
+        assert_eq!(
+            catalog_context(&catalog, "other-provider", "new-model"),
+            None
+        );
+        assert_eq!(
+            catalog_context(&catalog, "opencode-go", "unknown-model"),
+            None
+        );
+        assert_eq!(
+            catalog_context(&Value::Null, "opencode-go", "new-model"),
+            None
+        );
+    }
+
     #[tokio::test]
     async fn list_models_reads_upstream_ids() {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -1215,7 +1384,8 @@ mod tests {
             let mut buf = [0u8; 4096];
             let n = sock.read(&mut buf).await.unwrap();
             assert!(String::from_utf8_lossy(&buf[..n]).starts_with("GET /v1/models"));
-            let body = br#"{"data":[{"id":"new-model-1"},{"id":"new-model-2"}]}"#;
+            let body =
+                br#"{"data":[{"id":"new-model-1","context_length":1048576},{"id":"new-model-2"}]}"#;
             let head = format!(
                 "HTTP/1.1 200 OK
 content-length: {}
@@ -1234,7 +1404,16 @@ connection: close
             .unwrap();
         assert_eq!(
             client.list_models().await,
-            vec!["new-model-1", "new-model-2"]
+            vec![
+                DiscoveredModel {
+                    id: "new-model-1".to_string(),
+                    context_window: Some(1_048_576)
+                },
+                DiscoveredModel {
+                    id: "new-model-2".to_string(),
+                    context_window: None
+                },
+            ]
         );
     }
 

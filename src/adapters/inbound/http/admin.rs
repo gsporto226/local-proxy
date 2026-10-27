@@ -28,6 +28,7 @@ pub fn routes() -> Router<AppState> {
         .route("/admin/accounts", get(accounts))
         .route("/admin/providers", get(providers))
         .route("/admin/models", get(models))
+        .route("/admin/model-context", get(model_context))
         .route("/admin/stats", get(stats))
         .route("/admin/rate-limits", get(rate_limits))
         .route("/admin/account-usage", get(account_usage))
@@ -123,6 +124,25 @@ async fn models(State(app): State<AppState>) -> ApiResult {
     let ports = app.ports().clone();
     let models = blocking(move || settings::connected_models(&ports, &path)).await?;
     Ok(Json(json!(models)))
+}
+
+#[derive(Deserialize)]
+struct ModelContextQuery {
+    model: String,
+}
+
+async fn model_context(
+    State(app): State<AppState>,
+    Query(query): Query<ModelContextQuery>,
+) -> ApiResult {
+    let state = app.snapshot().await;
+    let (provider, model, _) = crate::application::proxy::resolve_model(&state, Some(&query.model))
+        .map_err(bad_request)?;
+    Ok(Json(json!({
+        "provider": provider.name,
+        "model": model,
+        "context_window": provider.context_windows.get(&model)
+    })))
 }
 
 #[derive(Deserialize)]
