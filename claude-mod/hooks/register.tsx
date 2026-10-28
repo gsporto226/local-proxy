@@ -87,6 +87,7 @@ const EFFORTS = ['low', 'medium', 'high', 'xhigh', 'max']
 
 const tab = atom({ plugin: 'local-proxy', key: 'tab' } as const, 'Accounts')
 const status = atom({ plugin: 'local-proxy', key: 'status' } as const, null)
+const sessionEffort = atom({ plugin: 'local-proxy', key: 'sessionEffort' } as const, null)
 const accounts = atom({ plugin: 'local-proxy', key: 'accounts' } as const, [])
 const models = atom({ plugin: 'local-proxy', key: 'models' } as const, [])
 const pins = atom({ plugin: 'local-proxy', key: 'pins' } as const, {})
@@ -220,20 +221,23 @@ let interactive = false
 
 // Published under id 'local-proxy' via `$.statusline.publish` for a status line mod to render.
 async function statusLine($: $) {
-  const [u, st, rl, acc, pinned] = await Promise.all([
+  const [u, modelId, effort, rl, acc, pinned] = await Promise.all([
     $.session.usage(),
-    read($, status),
+    $.session.model(),
+    read($, sessionEffort),
     read($, rate),
     read($, accounts),
     read($, pins),
   ])
   const usageRate = (kind: string) => u.rateLimits.find(r => r.kind === kind)?.percentUsed ?? null
-  const model = st?.model ?? (await $.session.model()) ?? null
+  const model = modelId?.replace(/^anthropic:/, '') ?? null
+  const currentEffort = effort?.model === modelId ? effort : null
   const provider = model?.split('/')[0]
   const alias = provider && (pinned[provider] ?? acc.find(a => a.provider === provider && a.is_default)?.alias)
   const value: ProxyStatusline = {
     model,
-    effort: st?.effort ?? null,
+    effort: currentEffort?.value ?? null,
+    effortSource: currentEffort?.source ?? null,
     account: provider && alias ? { provider, alias } : null,
     contextPercent: u.context.percent ?? null,
     rate5h: rl?.h5 ?? usageRate('five_hour'),
@@ -243,6 +247,21 @@ async function statusLine($: $) {
     try { await $.statusline.publish({ id: 'local-proxy', values: value }) }
     catch { /* the statusline mod is optional */ }
   }
+}
+
+async function selectSession($: $, command: 'model' | 'effort', value: string) {
+  const result = await $.command.run({ command, args: value, origin: { kind: 'composer' }, presentation: { isFullscreen: true, columns: screenColumns } })
+  await selectionChanged($, command, value)
+  await refresh($)
+  await $.ui.invalidate('ui.render')
+  return result
+}
+
+async function selectionChanged($: $, command: 'model' | 'effort', value: string) {
+  const model = await $.session.model()
+  await update($, sessionEffort, () => command === 'effort' && model && EFFORTS.includes(value) ? { model, value, source: 'selection' } : null)
+  if (command === 'model') await syncContextWindow($)
+  await statusLine($)
 }
 
 // ponytail: the runtime has no streaming HTTP; SSE rides a `curl -sN` child via $.process.spawn.
@@ -378,8 +397,23 @@ export const register: Register = (on, options) => {
 
   on('command.run', { command: 'model' }, async ($, e, next) => {
     const result = await next(e)
-    if (origin) await syncContextWindow($)
+    if (origin) await selectionChanged($, 'model', e.args.trim())
     return result
+  })
+
+  on('command.run', { command: 'effort' }, async ($, e, next) => {
+    const result = await next(e)
+    if (origin) await selectionChanged($, 'effort', e.args.trim())
+    return result
+  })
+
+  on('turn.step', async function* ($, e, next) {
+    if (origin && !e.agentId) {
+      const model = await $.session.model()
+      await update($, sessionEffort, () => model && e.effort != null ? { model, value: String(e.effort), source: 'request' } : null)
+      await statusLine($)
+    }
+    return yield* next(e)
   })
 
   on('command.run', { command: 'proxy' }, async ($, e) => {
@@ -404,12 +438,32 @@ export const register: Register = (on, options) => {
       }
     }
     try {
-      if ((args[0] === 'model' || args[0] === 'effort') && args.length === 2) {
+      if ((args[0] === 'model' || args[0] === 'effort') && args.length <= 2) {
         const field = args[0]
-        const result = await api<{ message: string }>($, 'PUT', `/admin/${field}`, { [field]: args[1] === 'clear' ? null : args[1] })
+        const value = args[1]
+        if (!value) {
+          const model = await $.session.model()
+          const effort = await read($, sessionEffort)
+          return { text: field === 'model' ? model ?? '(Claude Code default)' : effort?.model === model ? `${effort.value} (${effort.source})` : '(unknown until the next request)' }
+        }
+        const argument = value === 'clear' ? field === 'model' ? 'default' : 'auto' : value
+        $.clock.after(0, async () => {
+          try { await selectSession($, field, argument) }
+          catch (err) { await update($, error, () => `Session ${field} change failed: ${String(err)}`) }
+        })
+        return { text: `Changing session ${field} to ${argument}.` }
+      }
+      if (args[0] === 'default' && (args[1] === 'model' || args[1] === 'effort') && args.length <= 3) {
+        const field = args[1]
+        if (!args[2]) {
+          const defaults = await api<ProxyStatus>($, 'GET', '/admin/status')
+          return { text: `Proxy default ${field}: ${defaults[field] ?? '(unset)'}` }
+        }
+        const result = await api<{ message: string }>($, 'PUT', `/admin/${field}`, { [field]: args[2] === 'clear' ? null : args[2] })
         await refresh($, true)
         return { text: result.message }
       }
+      if (args[0] === 'model' || args[0] === 'effort' || args[0] === 'default') return { text: 'Usage: /proxy model|effort [value|clear], or /proxy default model|effort [value|clear].' }
       const { exitCode, stdout, stderr } = await $.process.run(['local-proxy', ...args], { timeoutMs: 60_000 })
       const out = [stdout.trimEnd(), stderr.trimEnd()].filter(Boolean).join('\n')
       return { text: exitCode === 0 ? out || '(no output)' : `${out}\n(exit ${exitCode})` }
@@ -508,7 +562,7 @@ export const register: Register = (on, options) => {
         </Box>
       )
     } else if (current === 'Status') {
-      const [acc, pinned] = await Promise.all([read($, accounts), read($, pins)])
+      const [acc, pinned, modelId, effort] = await Promise.all([read($, accounts), read($, pins), $.session.model(), read($, sessionEffort)])
       const active = Object.entries(pinned).map(([p, a]) => `${p}/${a} (pinned)`)
       const defaults = acc.filter(a => a.is_default && !pinned[a.provider]).map(a => `${a.provider}/${a.alias}`)
       body = st ? (
@@ -518,8 +572,10 @@ export const register: Register = (on, options) => {
           {kv('Version', st.version)}
           {kv('Address', `127.0.0.1:${st.port}`)}
           {kv('PID', st.pid)}
-          {kv('Model', st.model ?? '(default)')}
-          {kv('Effort', st.effort ?? '(default)')}
+          {kv('Session model', modelId?.replace(/^anthropic:/, '') ?? '(Claude Code default)')}
+          {kv('Session effort', effort?.model === modelId ? `${effort.value} (${effort.source})` : '(unknown until the next request)')}
+          {kv('Proxy default model', st.model ?? '(first available)')}
+          {kv('Proxy default effort', st.effort ?? '(client decides)')}
           {kv('Accounts', [...active, ...defaults].join(', ') || '(none)')}
         </Box>
       ) : (
@@ -699,22 +755,31 @@ export const register: Register = (on, options) => {
         </Box>
       )
     } else {
-      const [acc, mods] = await Promise.all([read($, accounts), read($, models)])
+      const [acc, mods, modelId, effort] = await Promise.all([read($, accounts), read($, models), $.session.model(), read($, sessionEffort)])
       const def = acc.find(a => a.is_default)
-      const modelChoices = ['(clear)', ...mods]
+      const modelChoices = ['(Claude Code default)', ...mods]
       body = (
         <Box flexDirection="column" gap={0}>
-          <Button key="model" label={`Model: ${st?.model ?? '(default)'}`} autoFocus onPress={async () => {
+          <Button key="session-model" label={`Session model: ${modelId?.replace(/^anthropic:/, '') ?? '(Claude Code default)'}`} autoFocus onPress={async () => {
             const selected = await choose($, 'Choose a model', modelChoices)
-            if (selected === '(clear)') await ask($, { label: 'Clear model', method: 'PUT', path: '/admin/model', body: { model: null } })
-            else if (selected) await act($, 'PUT', '/admin/model', { model: selected })
+            if (selected) await selectSession($, 'model', selected === '(Claude Code default)' ? 'default' : selected)
             await $.ui.invalidate('ui.render')
           }} />
-          <Button key="effort" label={`Effort: ${st?.effort ?? '(default)'}`} onPress={async () => {
-            const selected = await choose($, 'Choose effort', ['(clear)', ...EFFORTS])
-            if (selected === '(clear)') await ask($, { label: 'Clear effort', method: 'PUT', path: '/admin/effort', body: { effort: null } })
-            else if (selected) await act($, 'PUT', '/admin/effort', { effort: selected })
+          <Button key="session-effort" label={`Session effort: ${effort?.model === modelId ? `${effort.value} (${effort.source})` : '(unknown)'}`} onPress={async () => {
+            const selected = await choose($, 'Choose session effort', ['(auto)', ...EFFORTS])
+            if (selected) await selectSession($, 'effort', selected === '(auto)' ? 'auto' : selected)
             await $.ui.invalidate('ui.render')
+          }} />
+          <Text dimColor>Proxy defaults apply to new sessions when the client omits a value.</Text>
+          <Button key="model" label={`Proxy default model: ${st?.model ?? '(first available)'}`} onPress={async () => {
+            const selected = await choose($, 'Choose proxy default model', ['(clear)', ...mods])
+            if (selected === '(clear)') await ask($, { label: 'Clear proxy default model', method: 'PUT', path: '/admin/model', body: { model: null } })
+            else if (selected) await act($, 'PUT', '/admin/model', { model: selected })
+          }} />
+          <Button key="effort" label={`Proxy default effort: ${st?.effort ?? '(client decides)'}`} onPress={async () => {
+            const selected = await choose($, 'Choose proxy default effort', ['(clear)', ...EFFORTS])
+            if (selected === '(clear)') await ask($, { label: 'Clear proxy default effort', method: 'PUT', path: '/admin/effort', body: { effort: null } })
+            else if (selected) await act($, 'PUT', '/admin/effort', { effort: selected })
           }} />
           <Button key="default" label={`Default account: ${def ? `${def.provider}/${def.alias}` : '(none)'}`} onPress={async () => {
             const selected = await choose($, 'Choose the default account', acc.map(a => `${a.provider}/${a.alias}`))

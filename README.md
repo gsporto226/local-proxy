@@ -397,6 +397,20 @@ The `claude-mod/` folder is a Claude Code plugin (mod), and this repository is i
 
 - `/proxy <args>`: runs the `local-proxy` CLI inside the session (for example `/proxy model kimi-k2.6`).
 - `/proxy` with no arguments: opens a panel with status, per-account upstream quotas, accounts, models, stats and logs, fed by the `/admin` API.
+- `/proxy model <provider/model>` and `/proxy effort <level>` select the current
+  Claude Code conversation's model and effort through its native commands.
+  `clear` uses Claude Code's default model or automatic effort. With no value,
+  these commands report the session selection. Native commands retain their
+  normal Claude Code persistence behavior.
+- The Config tab separates **Session model / effort** from **Proxy default
+  model / effort**. To change proxy defaults by command, use
+  `/proxy default model <provider/model>` or `/proxy default effort <level>`;
+  `clear` removes that default. These defaults fill missing request values for
+  new proxy sessions; existing sessions retain their snapshot.
+- The published model comes from the Claude Code session. Effort carries an
+  `effortSource` of `selection` after a native command or `request` after a main
+  conversation request. It is unknown before either is available and after a
+  model change. Subagent requests do not replace the main conversation's effort.
 - Status line data, published for a status line mod with `$.statusline.publish({ id: "local-proxy", values })` (`model`, `effort`, `account`, `contextPercent`, `rate5h`, `rateWeek`; see `claude-mod/types/index.d.ts`). The mod draws no row itself: it publishes the values under `id: "local-proxy"` and a status line mod renders them.
 
 Install it from a terminal session of Claude Code:

@@ -1,4 +1,5 @@
 export type ProxyStatus = { version: string; port: number; pid: number; model: string | null; effort: string | null }
+export type SessionEffort = { model: string; value: string; source: 'selection' | 'request' } | null
 export type ProxyAccount = { provider: string; alias: string; is_default: boolean }
 export type ProxyRateLimits = { h5: number | null; week: number | null }
 export type ProxyStatsWindow = 'session' | 'day' | 'week' | 'month' | 'all'
@@ -70,6 +71,7 @@ export type AccountUsageResult =
 export type ProxyStatusline = {
   model: string | null
   effort: string | null
+  effortSource: 'selection' | 'request' | null
   /** the session pin, else the provider's default account */
   account: { provider: string; alias: string } | null
   contextPercent: number | null
@@ -92,6 +94,7 @@ declare module 'claude-code' {
     'local-proxy': {
       tab: string
       status: ProxyStatus | null
+      sessionEffort: SessionEffort
       accounts: ProxyAccount[]
       models: string[]
       /** provider -> alias pinned for this session */

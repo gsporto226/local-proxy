@@ -59,10 +59,12 @@ const ROUTES: Record<string, unknown> = {
 function mockProxy(on: On, opts: { sse?: string[]; baseUrl?: string; routes?: Record<string, unknown>; env?: Record<string, string>; model?: () => string; contextDown?: () => boolean } = {}) {
   const calls: string[] = []
   const commands: string[] = []
+  const nativeCommands: string[] = []
+  let selectedModel = 'anthropic:openai/gpt-x'
   const opened: string[] = []
   const openArgs: unknown[] = []
   const routes = { ...(opts.routes ?? ROUTES) }
-  mock.clock(on)
+  const clock = mock.clock(on)
   mock.env(on, { ...(opts.baseUrl === undefined ? { ANTHROPIC_BASE_URL: BASE } : opts.baseUrl ? { ANTHROPIC_BASE_URL: opts.baseUrl } : {}), ...opts.env })
   on('http.fetch', ($, e) => {
     const key = `${e.init?.method ?? 'GET'} ${e.url.replace(BASE, '')}`
@@ -77,7 +79,16 @@ function mockProxy(on: On, opts: { sse?: string[]; baseUrl?: string; routes?: Re
     return { value: { status: 200, ok: true, headers: {}, text: JSON.stringify(routes[key] ?? {}) } }
   })
   on('session.id', () => ({ value: 'sess-1' }))
-  on('session.model', () => ({ value: opts.model?.() ?? 'claude-x' }))
+  on('session.model', () => ({ value: opts.model?.() ?? selectedModel }))
+  on('command.run', { command: 'model' }, ($, e) => {
+    nativeCommands.push(`model ${e.args}`)
+    selectedModel = e.args === 'default' ? 'claude-x' : e.args
+    return { text: 'model updated' }
+  })
+  on('command.run', { command: 'effort' }, ($, e) => {
+    nativeCommands.push(`effort ${e.args}`)
+    return { text: 'effort updated' }
+  })
   on('session.usage', () => ({ value: { startedAt: 0, context: { window: 100, percent: 42 }, rateLimits: [], cost: { usd: 1.5 } } }))
   on('session.start', ($, e) => ({ cwd: e.cwd }))
   // Stand-ins for the engine beneath: a submitted prompt passes, an empty band draws nothing.
@@ -103,7 +114,7 @@ function mockProxy(on: On, opts: { sse?: string[]; baseUrl?: string; routes?: Re
     for (const text of opts.sse ?? []) yield { stream: 'stdout' as const, text }
     return { value: { code: 0, signal: null } }
   })
-  return { calls, commands, opened, openArgs }
+  return { calls, commands, nativeCommands, opened, openArgs, clock }
 }
 
 type Dollar = Parameters<Parameters<typeof test>[1] & (($: any, on: On) => unknown)>[0]
@@ -185,8 +196,8 @@ test('/proxy <args> runs the CLI and returns its output', async ($, on) => {
   expect(text).toBe('local-proxy 0.25.2')
 })
 
-test('/proxy model updates the running proxy, the exported status and the panel', { plugins: [STATUSLINE] }, async ($, on) => {
-  const { calls } = mockProxy(on)
+test('/proxy model updates Claude Code and the displayed session without changing proxy defaults', { plugins: [STATUSLINE] }, async ($, on) => {
+  const { calls, nativeCommands, clock } = mockProxy(on)
   const out = exported(on)
   await start($)
   await $.command.run(run(''))
@@ -194,24 +205,67 @@ test('/proxy model updates the running proxy, the exported status and the panel'
   await pane.press({ key: 'tab-Status' })
   expect(out.value?.values?.model).toBe('openai/gpt-x')
   const { text } = await $.command.run(run('model chatgpt/gpt-6-sol'))
-  expect(text).toBe('model updated')
-  expect(calls).toContain('PUT /admin/model {"model":"chatgpt/gpt-6-sol"}')
+  expect(text).toBe('Changing session model to chatgpt/gpt-6-sol.')
+  await clock.advance(1)
+  await clock.settle()
+  expect(nativeCommands).toContain('model chatgpt/gpt-6-sol')
+  expect(calls.some(call => call.startsWith('PUT /admin/model'))).toBe(false)
   expect(out.value?.values?.model).toBe('chatgpt/gpt-6-sol')
   expect(await pane.find({ text: 'chatgpt/gpt-6-sol' })).toBeDefined()
 })
 
-test('/proxy effort and model clear update the running proxy', async ($, on) => {
-  const { calls } = mockProxy(on)
+test('/proxy effort and model clear call the native session commands', { plugins: [STATUSLINE] }, async ($, on) => {
+  const { calls, nativeCommands, clock } = mockProxy(on)
+  const out = exported(on)
   await start($)
   await $.command.run(run(''))
   await $.command.run(run('effort medium'))
+  await clock.advance(1)
+  await clock.settle()
+  expect(out.value?.values).toMatchObject({ effort: 'medium', effortSource: 'selection' })
+  await $.command.run(run('effort clear'))
+  await clock.advance(1)
+  await clock.settle()
+  expect(out.value?.values).toMatchObject({ effort: null, effortSource: null })
   await $.command.run(run('model clear'))
+  await clock.advance(1)
+  await clock.settle()
+  expect(nativeCommands).toEqual(['effort medium', 'effort auto', 'model default'])
+  expect(calls.some(call => call.startsWith('PUT /admin/'))).toBe(false)
+  expect(out.value?.values).toMatchObject({ model: 'claude-x', effort: null, effortSource: null })
+})
+
+test('panel session controls call Claude Code while proxy defaults remain separate', { plugins: [STATUSLINE] }, async ($, on) => {
+  const { calls, nativeCommands } = mockProxy(on)
+  const out = exported(on)
+  on('tool.call', { tool: 'AskUserQuestion' }, () => ({ result: { answers: { 'Choose a model': 'gpt-y', 'Choose session effort': 'medium' } } }))
+  await start($)
+  await $.command.run(run(''))
+  const pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await pane.press({ key: 'tab-Config' })
+  expect(await pane.find({ text: /Proxy defaults apply to new sessions/ })).toBeDefined()
+  await pane.press({ key: 'session-model' })
+  expect(nativeCommands).toContain('model gpt-y')
+  expect(calls.some(call => call.startsWith('PUT /admin/model'))).toBe(false)
+  expect(out.value?.values?.model).toBe('gpt-y')
+  await pane.press({ key: 'session-effort' })
+  expect(nativeCommands).toContain('effort medium')
+  expect(out.value?.values).toMatchObject({ effort: 'medium', effortSource: 'selection' })
+  expect(calls.some(call => call.startsWith('PUT /admin/effort'))).toBe(false)
+})
+
+test('explicit default commands update the proxy defaults', async ($, on) => {
+  const { calls, nativeCommands } = mockProxy(on)
+  await start($)
+  await $.command.run(run('default effort medium'))
+  await $.command.run(run('default model clear'))
   expect(calls).toContain('PUT /admin/effort {"effort":"medium"}')
   expect(calls).toContain('PUT /admin/model {"model":null}')
+  expect(nativeCommands).toEqual([])
   const pane = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await pane.press({ key: 'tab-Status' })
   expect(await pane.find({ text: 'medium' })).toBeDefined()
-  expect(await pane.find({ text: '(default)' })).toBeDefined()
+  expect(await pane.find({ text: '(first available)' })).toBeDefined()
 })
 
 test('/proxy opens a focused pane; every tab renders on terminal and desktop', async ($, on) => {
@@ -367,7 +421,7 @@ test('publishes status line data for a status line mod', { plugins: [STATUSLINE]
   expect(out.value).toEqual({
     id: 'local-proxy',
     values: {
-      model: 'openai/gpt-x', effort: 'high', account: { provider: 'openai', alias: 'work' },
+      model: 'openai/gpt-x', effort: null, effortSource: null, account: { provider: 'openai', alias: 'work' },
       contextPercent: 42, rate5h: 12, rateWeek: 40,
     },
   })
