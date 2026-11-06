@@ -1805,6 +1805,7 @@ mod tests {
             routes: Vec::new(),
             defaults: Defaults::default(),
             exec: crate::domain::config::Exec::default(),
+            auto_router: crate::domain::autorouter::AutoRouter::default(),
         }
     }
 

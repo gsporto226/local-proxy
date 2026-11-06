@@ -356,6 +356,7 @@ async fn send_one(
             client_key: None,
             session_id: session_id.to_string(),
             hints: hints.clone(),
+            ..UpstreamRequest::default()
         })
         .await?;
     let status = response.status;

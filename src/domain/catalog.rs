@@ -72,6 +72,11 @@ pub fn effective_config(base: Config, overlay: Config) -> Config {
         routes,
         defaults,
         exec: overlay.exec,
+        auto_router: if overlay.auto_router.model.is_empty() {
+            base.auto_router
+        } else {
+            overlay.auto_router
+        },
     }
 }
 

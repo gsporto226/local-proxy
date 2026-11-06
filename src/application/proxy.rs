@@ -10,7 +10,7 @@ use crate::application::commands;
 use crate::application::runtime::{AppState, RuntimeState};
 use crate::application::streams::{self, EventStream};
 use crate::application::usage::{RequestMeta, StreamCapture};
-use crate::domain::config::{qualified_id, Provider};
+use crate::domain::config::{qualified_id, Provider, ProviderFormat};
 use crate::domain::error::ApiError;
 use crate::domain::exec;
 use crate::domain::ir::{self, Format};
@@ -271,6 +271,126 @@ fn active_model_or_default(state: &RuntimeState) -> String {
         .unwrap_or_else(|| "local-proxy".to_string())
 }
 
+/// The provider, account and upstream model a request routes to, including the
+/// auto-router choice and the per-session account.
+fn target(
+    app: &AppState,
+    state: &RuntimeState,
+    session_id: &str,
+    client_model: Option<&str>,
+    body: &Value,
+    account_alias: Option<&str>,
+    endpoint: &str,
+) -> Result<(Arc<Provider>, Account, String, Option<String>), ApiError> {
+    let auto = (!state.enforce_active_model)
+        .then(|| {
+            state
+                .config
+                .auto_router
+                .choice(client_model.unwrap_or_default(), body)
+        })
+        .flatten();
+    if let Some(choice) = &auto {
+        tracing::info!(
+            target: crate::LOG_TARGET,
+            endpoint,
+            requested = client_model.unwrap_or_default(),
+            model = %choice.model,
+            tier = choice.tier.as_str(),
+            // Two decimals: f32 promotes to f64 with visible noise otherwise.
+            score = (f64::from(choice.score) * 100.0).round() / 100.0,
+            signals = %choice.signals.join(","),
+            "auto-router chose tier model"
+        );
+    }
+    let client_model = auto.as_ref().map_or(client_model, |c| Some(c.model.as_str()));
+    let (provider, upstream_model, reasoning_effort) = resolve_model(state, client_model)?;
+    tracing::info!(
+        target: crate::LOG_TARGET,
+        endpoint,
+        provider = %provider.name,
+        upstream_model,
+        "resolved route"
+    );
+    // A provider without stored accounts has nothing to choose (passthrough).
+    let has_accounts = state
+        .accounts
+        .get(&provider.name)
+        .is_some_and(|accounts| accounts.values().any(|a| a.has_credentials()));
+    let chosen = if account_alias.is_none() && has_accounts {
+        app.request_account(session_id, &provider.name)
+            .map_err(|e| ApiError::internal(e.to_string()))?
+    } else {
+        None
+    };
+    let account = account_for(state, &provider, account_alias, chosen.as_deref())?;
+    Ok((provider, account, upstream_model, reasoning_effort))
+}
+
+/// Serve `/v1/messages/count_tokens`.
+///
+/// The provider's own counter is authoritative (it counts tools and images, and
+/// the local estimate does not), so it is forwarded when the route speaks
+/// Anthropic. The estimate stays as the fallback for other formats and for
+/// upstream failures, so a client is never left without a count.
+///
+/// # Errors
+///
+/// Returns an [`ApiError`] only for an unparseable body.
+pub async fn handle_count_tokens(app: &AppState, req: ChatRequest<'_>) -> Result<Value, ApiError> {
+    let state = app.session_state(req.session_id).await;
+    let body: Value =
+        serde_json::from_slice(req.body).map_err(|_| ApiError::bad_request("invalid JSON body"))?;
+    let estimate = json!({"input_tokens": request::estimate_tokens(&body)});
+    let client_model = body.get("model").and_then(Value::as_str);
+    let Ok((provider, account, upstream_model, _)) = target(
+        app,
+        &state,
+        req.session_id,
+        client_model,
+        &body,
+        req.account_alias,
+        req.endpoint,
+    )
+    else {
+        return Ok(estimate);
+    };
+    if provider.format != ProviderFormat::Anthropic {
+        return Ok(estimate);
+    }
+    let sent = UpstreamRequest {
+        body: request::count_tokens_body(body, &upstream_model),
+        path: Some("/v1/messages/count_tokens".to_string()),
+        client_key: req.client_key.map(str::to_string),
+        session_id: req.session_id.to_string(),
+        hints: req.hints,
+    };
+    match account.send(sent).await {
+        Ok(resp) if resp.status < 400 => {
+            let raw = sse::collect(resp.body).await;
+            Ok(serde_json::from_slice(&raw).unwrap_or(estimate))
+        }
+        Ok(resp) => {
+            tracing::warn!(
+                target: crate::LOG_TARGET,
+                endpoint = req.endpoint,
+                status = resp.status,
+                "count_tokens fell back to the local estimate"
+            );
+            Ok(estimate)
+        }
+        Err(e) => {
+            tracing::warn!(
+                target: crate::LOG_TARGET,
+                endpoint = req.endpoint,
+                error = %e,
+                "count_tokens fell back to the local estimate"
+            );
+            Ok(estimate)
+        }
+    }
+}
+
 /// Serve one chat request: answer a `$proxy` command locally, or resolve the
 /// route, translate through the IR when the upstream speaks another format,
 /// and translate the response (or stream) back.
@@ -309,27 +429,15 @@ pub async fn handle_chat(app: &AppState, req: ChatRequest<'_>) -> Result<ChatRep
 
     let streaming = request::wants_stream(&body);
     let client_model = body.get("model").and_then(Value::as_str);
-    let (provider, upstream_model, reasoning_effort) = resolve_model(&state, client_model)?;
-    tracing::info!(
-        target: crate::LOG_TARGET,
+    let (provider, account, upstream_model, reasoning_effort) = target(
+        app,
+        &state,
+        session_id,
+        client_model,
+        &body,
+        req.account_alias,
         endpoint,
-        provider = %provider.name,
-        upstream_model,
-        streaming,
-        "resolved route"
-    );
-    // A provider without stored accounts has nothing to choose (passthrough).
-    let has_accounts = state
-        .accounts
-        .get(&provider.name)
-        .is_some_and(|accounts| accounts.values().any(|a| a.has_credentials()));
-    let chosen = if req.account_alias.is_none() && has_accounts {
-        app.request_account(session_id, &provider.name)
-            .map_err(|e| ApiError::internal(e.to_string()))?
-    } else {
-        None
-    };
-    let account = account_for(&state, &provider, req.account_alias, chosen.as_deref())?;
+    )?;
     let upstream_format = Format::from(provider.format);
     let same = upstream_format == client_format;
     let upstream_body = request::prepare_upstream_body(
@@ -364,6 +472,7 @@ pub async fn handle_chat(app: &AppState, req: ChatRequest<'_>) -> Result<ChatRep
             client_key: req.client_key.map(str::to_string),
             session_id: session_id.to_string(),
             hints: req.hints,
+            ..UpstreamRequest::default()
         })
         .await
         .map_err(ApiError::from)?;
@@ -463,6 +572,7 @@ mod tests {
                 ..Defaults::default()
             },
             exec: crate::domain::config::Exec::default(),
+            auto_router: crate::domain::autorouter::AutoRouter::default(),
         }
     }
 

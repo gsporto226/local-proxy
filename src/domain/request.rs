@@ -84,7 +84,7 @@ pub fn prepare_upstream_body(
 
     let upstream_format = Format::from(provider.format);
     let mut upstream_body = if upstream_format == client_format {
-        same_format_request(client_format, body)
+        same_format_request(client_format, provider, body)
     } else {
         ir::translate_request(client_format, upstream_format, body)?
     };
@@ -117,9 +117,11 @@ pub fn request_effort(body: &[u8]) -> Option<String> {
 
 /// Body for an upstream of the client's own format: no translation, only the
 /// per-format hygiene the passthrough has always applied.
-fn same_format_request(format: Format, body: Value) -> Value {
+fn same_format_request(format: Format, provider: &Provider, body: Value) -> Value {
     match format {
-        Format::Anthropic => translate::normalize_anthropic_request(&body),
+        Format::Anthropic => {
+            translate::normalize_anthropic_request(&body, provider.is_native_anthropic())
+        }
         Format::Openai => body,
         // The ChatGPT backend rejects stored responses; make `store` explicit
         // when the client omitted it.
@@ -134,6 +136,9 @@ fn same_format_request(format: Format, body: Value) -> Value {
 }
 
 /// Heuristic token estimate: ceil(total chars of system + messages / 4).
+///
+/// Used for `/v1/messages/count_tokens` when the upstream cannot be asked; it
+/// ignores `tools`, so it undercounts real harness requests.
 #[must_use]
 pub fn estimate_tokens(body: &Value) -> u64 {
     let mut chars = 0usize;
@@ -159,6 +164,21 @@ fn text_len(value: &Value) -> usize {
     }
 }
 
+/// Body for an Anthropic `/v1/messages/count_tokens` call: the client's own
+/// body with the model rewritten upstream and the generation-only fields the
+/// endpoint rejects (`max_tokens`, `stream`) dropped.
+#[must_use]
+pub fn count_tokens_body(body: Value, upstream_model: &str) -> Value {
+    let mut out = body;
+    out["model"] = json!(upstream_model);
+    if let Some(object) = out.as_object_mut() {
+        for key in ["max_tokens", "stream", "stream_options"] {
+            object.remove(key);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -177,6 +197,25 @@ mod tests {
             "messages": [{"role": "user", "content": "how are you today"}]
         });
         assert!(estimate_tokens(&body) > 0);
+    }
+
+    #[test]
+    fn count_tokens_body_rewrites_the_model_and_drops_generation_fields() {
+        let body = json!({
+            "model": "claude-auto",
+            "max_tokens": 64,
+            "stream": false,
+            "system": "s",
+            "tools": [{"name": "t"}],
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let out = count_tokens_body(body, "claude-sonnet-4-5");
+        assert_eq!(out["model"], "claude-sonnet-4-5");
+        assert!(out.get("max_tokens").is_none());
+        assert!(out.get("stream").is_none());
+        // the parts the provider counts must survive
+        assert_eq!(out["tools"][0]["name"], "t");
+        assert_eq!(out["messages"][0]["content"], "hi");
     }
 
     #[test]
@@ -284,6 +323,42 @@ mod tests {
         assert_eq!(prepared["system"][0]["cache_control"]["type"], "ephemeral");
         assert!(prepared.get("context_management").is_none());
         assert!(prepared.get("output_config").is_none());
+    }
+
+    #[test]
+    fn prepare_upstream_body_keeps_thinking_for_native_anthropic() {
+        let provider = crate::domain::config::Provider {
+            name: "claude".to_string(),
+            base_url: "https://api.anthropic.com".to_string(),
+            format: ProviderFormat::Anthropic,
+            ..crate::domain::config::Provider::default()
+        };
+        let body = json!({
+            "model": "claude-sonnet-4-5",
+            "thinking": {"type": "enabled", "budget_tokens": 2048},
+            "context_management": {"edits": [{"type": "clear_tool_uses"}]},
+            "messages": [{"role": "user", "content": "hi"}]
+        });
+        let prepared = prepare_upstream_body(
+            crate::domain::ir::Format::Anthropic,
+            &provider,
+            "claude-sonnet-4-5",
+            body,
+            Some("high"),
+            None,
+            "",
+            false,
+        )
+        .unwrap();
+        // Claude Code's own feature fields now reach Anthropic...
+        assert_eq!(prepared["thinking"]["budget_tokens"], 2048);
+        assert_eq!(
+            prepared["context_management"]["edits"][0]["type"],
+            "clear_tool_uses"
+        );
+        // ...and so does the proxy's effort default, which used to be stripped
+        // right after being injected.
+        assert_eq!(prepared["output_config"]["effort"], "high");
     }
 
     #[test]
