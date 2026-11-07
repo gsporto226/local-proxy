@@ -119,6 +119,9 @@ pub struct ClientHints {
 pub struct UpstreamRequest {
     /// The body, already in the provider's format.
     pub body: Value,
+    /// Endpoint path to POST to, overriding the provider format's default
+    /// (`/v1/messages`, `/v1/chat/completions`, `/responses`).
+    pub path: Option<String>,
     /// The key the client presented (used when passthrough is enabled).
     pub client_key: Option<String>,
     /// The client session id, or `""`.

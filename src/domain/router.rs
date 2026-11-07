@@ -223,6 +223,10 @@ impl Router {
     #[must_use]
     pub fn list_models(&self) -> Vec<String> {
         let mut models: Vec<String> = Vec::new();
+        let auto_router = &self.config.auto_router.model;
+        if !auto_router.is_empty() {
+            models.push(auto_router.clone());
+        }
         for route in &self.config.routes {
             if !route.prefix && !models.contains(&route.model) {
                 models.push(route.model.clone());
@@ -375,6 +379,7 @@ mod tests {
                 active_accounts: HashMap::new(),
             },
             exec: crate::domain::config::Exec::default(),
+            auto_router: crate::domain::autorouter::AutoRouter::default(),
         }
     }
 

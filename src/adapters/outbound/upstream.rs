@@ -687,6 +687,7 @@ impl ProviderClient {
     async fn post(&self, request: UpstreamRequest) -> Result<UpstreamResponse, UpstreamError> {
         let UpstreamRequest {
             mut body,
+            path,
             client_key,
             session_id,
             hints,
@@ -703,7 +704,11 @@ impl ProviderClient {
                 provider: self.name.clone(),
             });
         }
-        let url = format!("{}{}", self.base_url, self.default_path());
+        let url = format!(
+            "{}{}",
+            self.base_url,
+            path.as_deref().unwrap_or_else(|| self.default_path())
+        );
         tracing::debug!(
             target: crate::LOG_TARGET,
             provider = %self.name,
@@ -946,6 +951,7 @@ mod tests {
             client_key: client_key.map(str::to_string),
             session_id: session_id.to_string(),
             hints: ClientHints::default(),
+            ..UpstreamRequest::default()
         }
     }
 

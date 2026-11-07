@@ -303,25 +303,34 @@ pub fn responses_usage(u: &TokenUsage) -> Value {
 // anthropic -> anthropic normalization (passthrough hygiene)
 // ---------------------------------------------------------------------------
 
-/// Strip the fields some Anthropic-format upstreams reject.
+/// Strip the fields some Anthropic-compatible upstreams reject.
 ///
 /// `cache_control` markers are kept: stripping them turns prompt caching off.
+/// Fields that are not part of Anthropic's schema at all are always dropped;
+/// `thinking`, `output_config` and `context_management` are kept for Anthropic
+/// itself (Claude Code sends all three to `api.anthropic.com`) and dropped for
+/// compatible hosts.
 #[must_use]
-pub fn normalize_anthropic_request(body: &Value) -> Value {
+pub fn normalize_anthropic_request(body: &Value, native: bool) -> Value {
     let mut out = body.clone();
-    for key in [
-        "thinking",
+    let mut strip = vec![
         "reasoning",
         "reasoning_effort",
         "effort",
         "level",
         "depth",
-        "output_config",
-        // Claude Code sends this on every request; upstreams that do not
-        // implement context editing reject the whole body with
-        // "400 context_management: Extra inputs are not permitted".
-        "context_management",
-    ] {
+    ];
+    if !native {
+        strip.extend([
+            "thinking",
+            "output_config",
+            // Claude Code sends this on every request; upstreams that do not
+            // implement context editing reject the whole body with
+            // "400 context_management: Extra inputs are not permitted".
+            "context_management",
+        ]);
+    }
+    for key in strip {
         remove(&mut out, key);
     }
     out
@@ -481,17 +490,30 @@ mod tests {
             "thinking": {"type": "enabled"},
             "effort": "high",
             "context_management": {"edits": []},
+            "output_config": {"effort": "high"},
             "messages": [{"role": "user", "content": [{"type": "text", "text": "x", "cache_control": {"type": "ephemeral"}}]}]
         });
-        let out = normalize_anthropic_request(&body);
+        let out = normalize_anthropic_request(&body, false);
         assert!(out.get("thinking").is_none());
         assert!(out.get("effort").is_none());
         // a backend without context editing 400s the whole body on this
         assert!(out.get("context_management").is_none());
+        assert!(out.get("output_config").is_none());
         let text = serde_json::to_string(&out).unwrap();
         // prompt caching stays on for the passthrough
         assert!(text.contains("cache_control"));
         assert_eq!(out["messages"][0]["content"][0]["text"], "x");
+
+        // Anthropic itself implements all three, and Claude Code sends them
+        // there: stripping them would silently disable thinking and effort.
+        let kept = normalize_anthropic_request(&body, true);
+        assert_eq!(kept["thinking"]["type"], "enabled");
+        assert_eq!(kept["context_management"]["edits"], json!([]));
+        assert_eq!(kept["output_config"]["effort"], "high");
+        // ...but the non-Anthropic knobs still go
+        let kept = normalize_anthropic_request(&json!({"level": 1, "depth": 2}), true);
+        assert!(kept.get("level").is_none());
+        assert!(kept.get("depth").is_none());
     }
 
     #[test]

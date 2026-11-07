@@ -182,6 +182,31 @@ pub struct Provider {
     pub prompt_cache: PromptCachePolicy,
 }
 
+impl Provider {
+    /// Whether this is Anthropic's own API, as opposed to an
+    /// Anthropic-compatible host (Kimi, GLM, a gateway).
+    ///
+    /// Anthropic accepts the client's `thinking`, `output_config` and
+    /// `context_management` fields; compatible hosts reject the whole body with
+    /// "Extra inputs are not permitted", so those fields are stripped for them.
+    #[must_use]
+    pub fn is_native_anthropic(&self) -> bool {
+        self.format == ProviderFormat::Anthropic && host_matches(&self.base_url, "anthropic.com")
+    }
+}
+
+/// Whether `url`'s host is `domain` or a subdomain of it.
+fn host_matches(url: &str, domain: &str) -> bool {
+    let after_scheme = url.split("://").nth(1).unwrap_or(url);
+    let host = after_scheme
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default();
+    let host = host.rsplit('@').next().unwrap_or(host);
+    let host = host.split(':').next().unwrap_or(host);
+    host == domain || host.ends_with(&format!(".{domain}"))
+}
+
 /// Maps a requested model to a provider (exact match or prefix).
 #[derive(Debug, Clone, Default, Deserialize, Serialize)]
 #[serde(default)]
@@ -268,6 +293,9 @@ pub struct Config {
     pub defaults: Defaults,
     /// `$proxy` local-command-execution settings.
     pub exec: Exec,
+    /// Complexity auto-router: one virtual model name that fans out to a
+    /// per-tier model. Disabled while `model` is empty.
+    pub auto_router: crate::domain::autorouter::AutoRouter,
 }
 
 /// Errors that can occur while loading, parsing, or creating configuration.
@@ -563,6 +591,40 @@ mod tests {
         assert_eq!(
             oauth.account_id_header.as_deref(),
             Some("chatgpt-account-id")
+        );
+    }
+
+    #[test]
+    fn native_anthropic_is_detected_by_host() {
+        let provider = |base_url: &str| Provider {
+            base_url: base_url.to_string(),
+            format: ProviderFormat::Anthropic,
+            ..Provider::default()
+        };
+        for native in [
+            "https://api.anthropic.com",
+            "https://api.anthropic.com/v1",
+            "https://anthropic.com:443/messages",
+        ] {
+            assert!(provider(native).is_native_anthropic(), "{native}");
+        }
+        for compatible in [
+            // Anthropic-compatible hosts reject the client's thinking fields
+            "https://api.moonshot.ai/anthropic",
+            "https://openrouter.ai/api",
+            "https://evil.example/?next=anthropic.com",
+            "http://127.0.0.1:8765",
+        ] {
+            assert!(!provider(compatible).is_native_anthropic(), "{compatible}");
+        }
+        // a non-Anthropic-format provider is never native
+        assert!(
+            !Provider {
+                base_url: "https://api.anthropic.com".to_string(),
+                format: ProviderFormat::Openai,
+                ..Provider::default()
+            }
+            .is_native_anthropic()
         );
     }
 

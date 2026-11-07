@@ -19,7 +19,6 @@ use crate::application::runtime::AppState;
 use crate::application::streams::EventStream;
 use crate::domain::error::ApiError;
 use crate::domain::ir::Format;
-use crate::domain::request::estimate_tokens;
 use crate::ports::ClientHints;
 
 pub(super) async fn health() -> &'static str {
@@ -256,12 +255,37 @@ pub(super) async fn count_tokens(
     body: Bytes,
 ) -> Response {
     let state = app.snapshot().await;
-    if let Err(e) = proxy::authenticate(&state, extract_client_key(&headers)) {
+    let client_key = match proxy::authenticate(&state, extract_client_key(&headers)) {
+        Ok(k) => k,
+        Err(e) => return error_response(&e, true),
+    };
+    let Ok(account_alias) = extract_account_alias(&headers) else {
+        let e = ApiError::bad_request("invalid X-Local-Proxy-Account header");
         return error_response(&e, true);
-    }
-    serde_json::from_slice::<Value>(&body).map_or_else(
-        |_| {
-            let e = ApiError::bad_request("invalid JSON body");
+    };
+    let session_id = extract_session_id(&headers);
+    let request = ChatRequest {
+        format: Format::Anthropic,
+        endpoint: "/v1/messages/count_tokens",
+        body: &body,
+        client_key: client_key.as_deref(),
+        account_alias,
+        session_id: &session_id,
+        hints: extract_hints(&headers),
+    };
+    match proxy::handle_count_tokens(&app, request).await {
+        Ok(count) => {
+            tracing::info!(
+                target: crate::LOG_TARGET,
+                endpoint = "/v1/messages/count_tokens",
+                input_tokens = count
+                    .get("input_tokens")
+                    .and_then(serde_json::Value::as_u64),
+                "counted tokens"
+            );
+            json_response(StatusCode::OK, count)
+        }
+        Err(e) => {
             tracing::warn!(
                 target: crate::LOG_TARGET,
                 endpoint = "/v1/messages/count_tokens",
@@ -271,18 +295,8 @@ pub(super) async fn count_tokens(
                 "request failed"
             );
             error_response(&e, true)
-        },
-        |body| {
-            let n = estimate_tokens(&body);
-            tracing::info!(
-                target: crate::LOG_TARGET,
-                endpoint = "/v1/messages/count_tokens",
-                input_tokens = n,
-                "counted tokens"
-            );
-            json_response(StatusCode::OK, json!({"input_tokens": n}))
-        },
-    )
+        }
+    }
 }
 
 #[cfg(test)]
