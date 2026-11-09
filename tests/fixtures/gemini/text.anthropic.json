@@ -1,3 +1,0 @@
-{"model":"claude","max_tokens":256,"temperature":0.5,"stop_sequences":["END"],
- "system":[{"type":"text","text":"Be brief."}],
- "messages":[{"role":"user","content":"Say hi."}]}
