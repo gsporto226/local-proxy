@@ -106,6 +106,40 @@ providers:
   - name: google
     base_url: https://generativelanguage.googleapis.com/v1beta/openai
     format: openai
+  # Google AI Pro/Ultra (or free Gemini Code Assist) subscription over
+  # OAuth, the way the Gemini CLI uses it: the Code Assist backend speaks
+  # native Gemini wrapped as `{model, project, request}`. The project comes
+  # from `loadCodeAssist` on first use and is stored with the tokens.
+  # `local-proxy connect gemini --account <alias> --oauth` runs the login.
+  - name: gemini
+    base_url: https://cloudcode-pa.googleapis.com
+    format: gemini
+    oauth:
+      flow: callback
+      authorize_url: https://accounts.google.com/o/oauth2/v2/auth
+      token_url: https://oauth2.googleapis.com/token
+      # Public Gemini CLI installed-app client; Google requires the secret
+      # even though it is not confidential.
+      client_id: 681255809395-oo8ft2oprdrnp9e3aqf6av3hmdib135j.apps.googleusercontent.com
+      scopes:
+        - https://www.googleapis.com/auth/cloud-platform
+        - https://www.googleapis.com/auth/userinfo.email
+        - https://www.googleapis.com/auth/userinfo.profile
+      redirect_uri: http://localhost:8085/oauth2callback
+      authorize_params:
+        access_type: offline
+        prompt: consent
+      token_params:
+        client_secret: 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
+      token_encoding: form
+    # No `/v1/models` on this backend; override in config.yaml as Google
+    # ships new ones.
+    models:
+      - gemini-3-pro-preview
+      - gemini-3-flash-preview
+      - gemini-2.5-pro
+      - gemini-2.5-flash
+      - gemini-2.5-flash-lite
   - name: deepseek
     base_url: https://api.deepseek.com
     format: openai

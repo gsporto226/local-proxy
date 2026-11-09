@@ -115,11 +115,11 @@ defaults:
         assert!(!config.providers.is_empty());
         assert!(config.providers.iter().any(|p| p.name == "opencode-go"));
         assert!(config.providers.iter().any(|p| p.name == "anthropic"));
-        // Models are discovered live; only chatgpt pins them (no `/v1/models`).
+        // Models are discovered live; only backends without `/v1/models` pin them.
         assert!(config
             .providers
             .iter()
-            .all(|p| p.models.is_empty() == (p.name != "chatgpt")));
+            .all(|p| p.models.is_empty() == !matches!(p.name.as_str(), "chatgpt" | "gemini")));
         assert!(
             config.defaults.provider.is_empty(),
             "catalog defaults.provider should be empty"

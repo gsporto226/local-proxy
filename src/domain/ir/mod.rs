@@ -26,6 +26,8 @@ pub enum Format {
     Openai,
     /// `OpenAI` Responses API.
     Responses,
+    /// Gemini `generateContent` via Code Assist (upstream-only).
+    Gemini,
 }
 
 /// A chat request.
@@ -334,6 +336,7 @@ pub enum BlockKind {
 // ---------------------------------------------------------------------------
 
 pub mod anthropic;
+pub mod gemini;
 pub mod openai;
 pub mod responses;
 
@@ -346,6 +349,7 @@ impl From<crate::domain::config::ProviderFormat> for Format {
             crate::domain::config::ProviderFormat::Anthropic => Self::Anthropic,
             crate::domain::config::ProviderFormat::Openai => Self::Openai,
             crate::domain::config::ProviderFormat::OpenaiResponses => Self::Responses,
+            crate::domain::config::ProviderFormat::Gemini => Self::Gemini,
         }
     }
 }
@@ -361,6 +365,10 @@ pub fn decode_request(f: Format, body: Value) -> Result<Request, TranslateError>
         Format::Anthropic => anthropic::decode_request(body),
         Format::Openai => openai::decode_request(body),
         Format::Responses => responses::decode_request(body),
+        Format::Gemini => Err(TranslateError::Invalid {
+            field: "format",
+            detail: "gemini is an upstream-only format".to_string(),
+        }),
     }
 }
 
@@ -371,6 +379,7 @@ pub fn encode_request(f: Format, req: &Request) -> Value {
         Format::Anthropic => anthropic::encode_request(req),
         Format::Openai => openai::encode_request(req),
         Format::Responses => responses::encode_request(req),
+        Format::Gemini => gemini::encode_request(req),
     }
 }
 
@@ -390,6 +399,7 @@ pub fn decode_response(f: Format, body: &Value) -> Response {
         Format::Anthropic => anthropic::decode_response(body),
         Format::Openai => openai::decode_response(body),
         Format::Responses => responses::decode_response(body),
+        Format::Gemini => gemini::decode_response(body),
     }
 }
 
@@ -400,6 +410,7 @@ pub fn encode_response(f: Format, resp: &Response) -> Value {
         Format::Anthropic => anthropic::encode_response(resp),
         Format::Openai => openai::encode_response(resp),
         Format::Responses => responses::encode_response(resp),
+        Format::Gemini => unreachable!("gemini is never a client format"),
     }
 }
 
@@ -426,6 +437,7 @@ pub fn stream_decoder(f: Format) -> Box<dyn StreamDecoder> {
         Format::Anthropic => Box::new(anthropic::Decoder::default()),
         Format::Openai => Box::new(openai::Decoder::default()),
         Format::Responses => Box::new(responses::Decoder::default()),
+        Format::Gemini => Box::new(gemini::Decoder::default()),
     }
 }
 
@@ -436,6 +448,7 @@ pub fn stream_encoder(f: Format, model: &str) -> Box<dyn StreamEncoder> {
         Format::Anthropic => Box::new(anthropic::Encoder::new(model)),
         Format::Openai => Box::new(openai::Encoder::new(model)),
         Format::Responses => Box::new(responses::Encoder::new(model)),
+        Format::Gemini => unreachable!("gemini is never a client format"),
     }
 }
 

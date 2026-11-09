@@ -135,29 +135,129 @@ impl AutoRouter {
 // LiteLLM's `DEFAULT_*_KEYWORDS`. Single-word entries match whole words only
 // (so `api` does not match `capital`); multi-word entries match as phrases.
 const CODE_KEYWORDS: &[&str] = &[
-    "function", "class", "def", "const", "let", "var", "import", "export", "return", "async",
-    "await", "try", "catch", "exception", "error", "debug", "api", "endpoint", "request",
-    "response", "database", "sql", "query", "schema", "algorithm", "implement", "refactor",
-    "optimize", "python", "javascript", "typescript", "java", "rust", "golang", "react", "vue",
-    "angular", "node", "docker", "kubernetes", "git", "commit", "merge", "branch", "pull request",
+    "function",
+    "class",
+    "def",
+    "const",
+    "let",
+    "var",
+    "import",
+    "export",
+    "return",
+    "async",
+    "await",
+    "try",
+    "catch",
+    "exception",
+    "error",
+    "debug",
+    "api",
+    "endpoint",
+    "request",
+    "response",
+    "database",
+    "sql",
+    "query",
+    "schema",
+    "algorithm",
+    "implement",
+    "refactor",
+    "optimize",
+    "python",
+    "javascript",
+    "typescript",
+    "java",
+    "rust",
+    "golang",
+    "react",
+    "vue",
+    "angular",
+    "node",
+    "docker",
+    "kubernetes",
+    "git",
+    "commit",
+    "merge",
+    "branch",
+    "pull request",
 ];
 const REASONING_KEYWORDS: &[&str] = &[
-    "step by step", "think through", "let's think", "reason through", "analyze this",
-    "break down", "explain your reasoning", "show your work", "chain of thought",
-    "think carefully", "consider all", "evaluate", "pros and cons", "compare and contrast",
-    "weigh the options", "logical", "deduce", "infer", "conclude",
+    "step by step",
+    "think through",
+    "let's think",
+    "reason through",
+    "analyze this",
+    "break down",
+    "explain your reasoning",
+    "show your work",
+    "chain of thought",
+    "think carefully",
+    "consider all",
+    "evaluate",
+    "pros and cons",
+    "compare and contrast",
+    "weigh the options",
+    "logical",
+    "deduce",
+    "infer",
+    "conclude",
 ];
 const TECHNICAL_KEYWORDS: &[&str] = &[
-    "architecture", "distributed", "scalable", "microservice", "machine learning",
-    "neural network", "deep learning", "encryption", "authentication", "authorization",
-    "performance", "latency", "throughput", "benchmark", "concurrency", "parallel", "threading",
-    "memory", "cpu", "gpu", "optimization", "protocol", "tcp", "http", "grpc", "websocket",
-    "container", "orchestration",
+    "architecture",
+    "distributed",
+    "scalable",
+    "microservice",
+    "machine learning",
+    "neural network",
+    "deep learning",
+    "encryption",
+    "authentication",
+    "authorization",
+    "performance",
+    "latency",
+    "throughput",
+    "benchmark",
+    "concurrency",
+    "parallel",
+    "threading",
+    "memory",
+    "cpu",
+    "gpu",
+    "optimization",
+    "protocol",
+    "tcp",
+    "http",
+    "grpc",
+    "websocket",
+    "container",
+    "orchestration",
 ];
 const SIMPLE_KEYWORDS: &[&str] = &[
-    "what is", "what's", "define", "definition of", "who is", "who was", "when did", "when was",
-    "where is", "where was", "how many", "how much", "yes or no", "true or false", "simple",
-    "brief", "short", "quick", "hello", "hi", "hey", "thanks", "thank you", "goodbye", "bye",
+    "what is",
+    "what's",
+    "define",
+    "definition of",
+    "who is",
+    "who was",
+    "when did",
+    "when was",
+    "where is",
+    "where was",
+    "how many",
+    "how much",
+    "yes or no",
+    "true or false",
+    "simple",
+    "brief",
+    "short",
+    "quick",
+    "hello",
+    "hi",
+    "hey",
+    "thanks",
+    "thank you",
+    "goodbye",
+    "bye",
     "okay",
 ];
 
@@ -181,13 +281,42 @@ pub fn classify(body: &Value) -> (Tier, f32, Vec<String>) {
         0.0
     };
 
-    let (code, _) = keyword_score(&text, &words, CODE_KEYWORDS, (1, 2), (0.0, 0.5, 1.0), "code", &mut signals);
-    let (reasoning, reasoning_hits) =
-        keyword_score(&text, &words, REASONING_KEYWORDS, (1, 2), (0.0, 0.7, 1.0), "reasoning", &mut signals);
-    let (technical, _) =
-        keyword_score(&text, &words, TECHNICAL_KEYWORDS, (2, 4), (0.0, 0.5, 1.0), "technical", &mut signals);
-    let (simple, _) =
-        keyword_score(&text, &words, SIMPLE_KEYWORDS, (1, 2), (0.0, -1.0, -1.0), "simple", &mut signals);
+    let (code, _) = keyword_score(
+        &text,
+        &words,
+        CODE_KEYWORDS,
+        (1, 2),
+        (0.0, 0.5, 1.0),
+        "code",
+        &mut signals,
+    );
+    let (reasoning, reasoning_hits) = keyword_score(
+        &text,
+        &words,
+        REASONING_KEYWORDS,
+        (1, 2),
+        (0.0, 0.7, 1.0),
+        "reasoning",
+        &mut signals,
+    );
+    let (technical, _) = keyword_score(
+        &text,
+        &words,
+        TECHNICAL_KEYWORDS,
+        (2, 4),
+        (0.0, 0.5, 1.0),
+        "technical",
+        &mut signals,
+    );
+    let (simple, _) = keyword_score(
+        &text,
+        &words,
+        SIMPLE_KEYWORDS,
+        (1, 2),
+        (0.0, -1.0, -1.0),
+        "simple",
+        &mut signals,
+    );
     let multi_step = if is_multi_step(&text) {
         signals.push("multi_step".to_string());
         0.5
@@ -212,7 +341,10 @@ pub fn classify(body: &Value) -> (Tier, f32, Vec<String>) {
         (multi_step, 0.03),
         (question, 0.02),
     ];
-    let score = dimensions.iter().map(|(score, weight)| score * weight).sum();
+    let score = dimensions
+        .iter()
+        .map(|(score, weight)| score * weight)
+        .sum();
 
     // Two reasoning markers promote the request unless the mapping would call
     // it SIMPLE anyway.
@@ -282,7 +414,8 @@ fn is_multi_step(text: &str) -> bool {
                 chars.get(j) == Some(&'.') && chars.get(j + 1).is_some_and(|c| c.is_whitespace())
             }
             c if c.is_ascii_lowercase() => {
-                chars.get(i + 1) == Some(&')') && chars.get(i + 2).is_some_and(|c| c.is_whitespace())
+                chars.get(i + 1) == Some(&')')
+                    && chars.get(i + 2).is_some_and(|c| c.is_whitespace())
             }
             _ => false,
         }
@@ -328,7 +461,9 @@ fn strip_reminders(text: &str) -> String {
     while let Some(start) = rest.find(OPEN) {
         out.push_str(&rest[..start]);
         rest = &rest[start + OPEN.len()..];
-        rest = rest.find(CLOSE).map_or("", |end| &rest[end + CLOSE.len()..]);
+        rest = rest
+            .find(CLOSE)
+            .map_or("", |end| &rest[end + CLOSE.len()..]);
     }
     out.push_str(rest);
     out
@@ -410,7 +545,10 @@ mod tests {
     fn unset_tier_uses_fallback_and_other_models_are_ignored() {
         let router = router();
         let reasoning = router
-            .choice("claude-auto", &ask("think step by step and analyze this carefully please"))
+            .choice(
+                "claude-auto",
+                &ask("think step by step and analyze this carefully please"),
+            )
             .expect("reasoning tier has no model, fallback applies");
         assert_eq!(reasoning.model, "mid");
         assert_eq!(reasoning.tier, Tier::Reasoning);

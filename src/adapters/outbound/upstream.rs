@@ -562,6 +562,7 @@ impl ProviderClient {
             ProviderFormat::Anthropic => "/v1/messages",
             ProviderFormat::Openai => "/v1/chat/completions",
             ProviderFormat::OpenaiResponses => "/responses",
+            ProviderFormat::Gemini => "/v1internal:streamGenerateContent?alt=sse",
         }
     }
 
@@ -662,6 +663,79 @@ impl ProviderClient {
         }
     }
 
+    /// The Code Assist project for this account: the stored account id, else
+    /// `loadCodeAssist` (onboarding to the default tier on first use). Kept in
+    /// the OAuth state, so it is persisted with the next token refresh.
+    async fn code_assist_project(&self, access: &str) -> Option<String> {
+        if let Some(project) = self.oauth_account().await {
+            return Some(project);
+        }
+        let metadata = serde_json::json!({
+            "ideType": "IDE_UNSPECIFIED",
+            "platform": "PLATFORM_UNSPECIFIED",
+            "pluginType": "GEMINI",
+        });
+        let call = |method: &str, body: Value| {
+            self.http
+                .post(format!("{}/v1internal:{method}", self.base_url))
+                .bearer_auth(access)
+                .json(&body)
+                .timeout(Duration::from_secs(30))
+                .send()
+        };
+        let loaded: Value = call("loadCodeAssist", serde_json::json!({"metadata": metadata}))
+            .await
+            .ok()?
+            .json()
+            .await
+            .ok()?;
+        let mut project = loaded
+            .get("cloudaicompanionProject")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        if project.is_none() || loaded.get("currentTier").is_none() {
+            let tier = loaded
+                .get("allowedTiers")
+                .and_then(Value::as_array)
+                .and_then(|tiers| {
+                    tiers
+                        .iter()
+                        .find(|t| t.get("isDefault").and_then(Value::as_bool) == Some(true))
+                })
+                .and_then(|t| t.get("id"))
+                .and_then(Value::as_str)
+                .unwrap_or("free-tier")
+                .to_string();
+            // ponytail: fixed 10 x 2s poll of the onboarding operation; make
+            // it configurable if real onboarding ever takes longer.
+            for _ in 0..10 {
+                let op: Value = call(
+                    "onboardUser",
+                    serde_json::json!({"tierId": tier, "metadata": metadata}),
+                )
+                .await
+                .ok()?
+                .json()
+                .await
+                .ok()?;
+                if op.get("done").and_then(Value::as_bool) == Some(true) {
+                    project = op
+                        .pointer("/response/cloudaicompanionProject/id")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                        .or(project);
+                    break;
+                }
+                tokio::time::sleep(Duration::from_secs(2)).await;
+            }
+        }
+        let project = project?;
+        if let Some(state) = &self.oauth_state {
+            state.lock().await.tokens.account_id = Some(project.clone());
+        }
+        Some(project)
+    }
+
     /// Insert the provider's OAuth-only headers (beta flags, app identity).
     fn insert_oauth_headers(&self, headers: &mut HeaderMap) {
         for (name, value) in &self.oauth_headers {
@@ -743,6 +817,11 @@ impl ProviderClient {
                     Self::header_value(&account)?,
                 );
             }
+            if self.format == ProviderFormat::Gemini {
+                if let Some(project) = self.code_assist_project(access).await {
+                    body["project"] = Value::String(project);
+                }
+            }
             if self.format == ProviderFormat::Anthropic {
                 if let Some(identity) = &self.identity {
                     inject_identity(&mut body, identity);
@@ -759,6 +838,9 @@ impl ProviderClient {
                 }
                 ProviderFormat::Openai | ProviderFormat::OpenaiResponses => {
                     headers.insert(AUTHORIZATION, Self::header_value(&format!("Bearer {key}"))?);
+                }
+                ProviderFormat::Gemini => {
+                    headers.insert("x-goog-api-key", Self::header_value(&key)?);
                 }
             }
         }
@@ -830,6 +912,7 @@ impl ProviderClient {
             req = match self.format {
                 ProviderFormat::Anthropic => req.header("x-api-key", key),
                 ProviderFormat::Openai | ProviderFormat::OpenaiResponses => req.bearer_auth(key),
+                ProviderFormat::Gemini => req.header("x-goog-api-key", key),
             };
         }
         if self.format == ProviderFormat::Anthropic {

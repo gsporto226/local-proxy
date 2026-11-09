@@ -35,6 +35,8 @@ pub enum ProviderFormat {
     /// `OpenAI` Responses API format (used by the `ChatGPT` backend).
     #[serde(rename = "openai-responses")]
     OpenaiResponses,
+    /// Gemini via the Code Assist backend (Google AI Pro/Ultra subscriptions).
+    Gemini,
 }
 
 /// Optional cache breakpoints added to Anthropic requests without client markers.
@@ -462,6 +464,7 @@ impl fmt::Display for ProviderFormat {
             Self::Anthropic => write!(f, "anthropic"),
             Self::Openai => write!(f, "openai"),
             Self::OpenaiResponses => write!(f, "openai-responses"),
+            Self::Gemini => write!(f, "gemini"),
         }
     }
 }
@@ -618,14 +621,12 @@ mod tests {
             assert!(!provider(compatible).is_native_anthropic(), "{compatible}");
         }
         // a non-Anthropic-format provider is never native
-        assert!(
-            !Provider {
-                base_url: "https://api.anthropic.com".to_string(),
-                format: ProviderFormat::Openai,
-                ..Provider::default()
-            }
-            .is_native_anthropic()
-        );
+        assert!(!Provider {
+            base_url: "https://api.anthropic.com".to_string(),
+            format: ProviderFormat::Openai,
+            ..Provider::default()
+        }
+        .is_native_anthropic());
     }
 
     #[test]

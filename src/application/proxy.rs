@@ -303,7 +303,9 @@ fn target(
             "auto-router chose tier model"
         );
     }
-    let client_model = auto.as_ref().map_or(client_model, |c| Some(c.model.as_str()));
+    let client_model = auto
+        .as_ref()
+        .map_or(client_model, |c| Some(c.model.as_str()));
     let (provider, upstream_model, reasoning_effort) = resolve_model(state, client_model)?;
     tracing::info!(
         target: crate::LOG_TARGET,
@@ -351,8 +353,7 @@ pub async fn handle_count_tokens(app: &AppState, req: ChatRequest<'_>) -> Result
         &body,
         req.account_alias,
         req.endpoint,
-    )
-    else {
+    ) else {
         return Ok(estimate);
     };
     if provider.format != ProviderFormat::Anthropic {
@@ -526,6 +527,14 @@ pub async fn handle_chat(app: &AppState, req: ChatRequest<'_>) -> Result<ChatRep
     // A Responses upstream only streams; fold its events into one response.
     if upstream_format == Format::Responses {
         let mut folded = streams::aggregate_responses(resp.body).await;
+        let usage = json!({"usage": translate::responses_usage(&folded.usage)});
+        recorder.record_parsed(&meta, status, Some(&usage), folded.usage);
+        folded.model.clone_from(&upstream_model);
+        return Ok(ChatReply::Json(ir::encode_response(client_format, &folded)));
+    }
+    // Gemini is requested as a stream too; fold its events the same way.
+    if upstream_format == Format::Gemini {
+        let mut folded = streams::aggregate(resp.body, upstream_format).await;
         let usage = json!({"usage": translate::responses_usage(&folded.usage)});
         recorder.record_parsed(&meta, status, Some(&usage), folded.usage);
         folded.model.clone_from(&upstream_model);

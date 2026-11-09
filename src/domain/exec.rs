@@ -218,6 +218,7 @@ pub fn local_reply(format: Format, text: &str, model: &str) -> Value {
             "parallel_tool_calls": true,
             "usage": translate::responses_usage(&usage)
         }),
+        Format::Gemini => unreachable!("gemini is never a client format"),
     }
 }
 
