@@ -1,0 +1,1 @@
+{"responseId":"r2","modelVersion":"gemini-3-pro-preview","candidates":[{"content":{"role":"model","parts":[{"text":"Let me think.","thought":true},{"text":"42"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":20,"candidatesTokenCount":1,"thoughtsTokenCount":7,"totalTokenCount":28}}

@@ -313,13 +313,7 @@ pub fn responses_usage(u: &TokenUsage) -> Value {
 #[must_use]
 pub fn normalize_anthropic_request(body: &Value, native: bool) -> Value {
     let mut out = body.clone();
-    let mut strip = vec![
-        "reasoning",
-        "reasoning_effort",
-        "effort",
-        "level",
-        "depth",
-    ];
+    let mut strip = vec!["reasoning", "reasoning_effort", "effort", "level", "depth"];
     if !native {
         strip.extend([
             "thinking",

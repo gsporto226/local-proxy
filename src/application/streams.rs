@@ -242,6 +242,19 @@ pub async fn aggregate_responses(body: ByteStream) -> ir::Response {
     ir::responses::aggregate(&events)
 }
 
+/// Fold an SSE body of upstream format `f` into one response through its
+/// stream decoder. A transport error ends the read early.
+pub async fn aggregate(body: ByteStream, f: Format) -> ir::Response {
+    let mut frames = Box::pin(sse_frames(body));
+    let mut decoder = ir::stream_decoder(f);
+    let mut events = Vec::new();
+    while let Some(Ok(frame)) = frames.next().await {
+        events.extend(decoder.frame(&frame));
+    }
+    events.extend(decoder.finish());
+    ir::fold(&events)
+}
+
 /// Cumulative token usage reported anywhere in an SSE body, or `None` when no
 /// frame carried any.
 pub async fn stream_usage(body: ByteStream) -> Option<TokenUsage> {

@@ -607,6 +607,14 @@ fn cache_fixture(format: Format, model: &str, prefix_tokens: u32) -> Value {
             "instructions": prefix, "prompt_cache_key": "{{compare_tag}}",
             "input": [{"role": "user", "content": [{"type": "input_text", "text": "Reply only OK."}]}]
         }),
+        Format::Gemini => serde_json::json!({
+            "model": model,
+            "request": {
+                "systemInstruction": {"parts": [{"text": prefix}]},
+                "contents": [{"role": "user", "parts": [{"text": "Reply only OK."}]}],
+                "generationConfig": {"maxOutputTokens": 64}
+            }
+        }),
     }
 }
 
@@ -776,6 +784,7 @@ mod tests {
                 Format::Anthropic => fixture["system"][0]["text"].as_str().unwrap(),
                 Format::Openai => fixture["messages"][0]["content"].as_str().unwrap(),
                 Format::Responses => fixture["instructions"].as_str().unwrap(),
+                Format::Gemini => unreachable!(),
             };
             assert!(prefix.len() >= 8192 * 4);
             assert!(prefix[..100].contains("{{compare_tag}}"));

@@ -122,7 +122,8 @@ fn same_format_request(format: Format, provider: &Provider, body: Value) -> Valu
         Format::Anthropic => {
             translate::normalize_anthropic_request(&body, provider.is_native_anthropic())
         }
-        Format::Openai => body,
+        // Gemini is upstream-only, so it never reaches here as a client format.
+        Format::Openai | Format::Gemini => body,
         // The ChatGPT backend rejects stored responses; make `store` explicit
         // when the client omitted it.
         Format::Responses => {
