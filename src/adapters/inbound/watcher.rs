@@ -34,8 +34,7 @@ fn is_reload_path(path: &Path, config_file: &std::ffi::OsStr) -> bool {
 pub fn spawn(config_path: &Path, dirs: Vec<PathBuf>, app: &AppState) -> Result<(), WatchError> {
     let config_file = config_path
         .file_name()
-        .map(std::ffi::OsStr::to_os_string)
-        .unwrap_or_default();
+        .map_or_else(Default::default, std::ffi::OsStr::to_os_string);
     let (tx, rx) = std::sync::mpsc::channel();
     let mut debouncer = notify_debouncer_full::new_debouncer(
         Duration::from_millis(300),
