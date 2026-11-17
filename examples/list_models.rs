@@ -74,13 +74,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             let efforts: Vec<&str> = model
                 .get("supported_reasoning_levels")
                 .and_then(serde_json::Value::as_array)
-                .map(|levels| {
+                .map_or_else(Vec::new, |levels| {
                     levels
                         .iter()
                         .filter_map(|l| l.get("effort").and_then(serde_json::Value::as_str))
                         .collect()
-                })
-                .unwrap_or_default();
+                });
             println!(
                 "{slug}\tvisibility={visibility}\tefforts={}",
                 efforts.join(",")
