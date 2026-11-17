@@ -988,10 +988,13 @@ fn merge_betas(ours: Option<&str>, client: Option<&str>) -> Option<String> {
     Some(out.join(","))
 }
 
-/// Ensure `identity` is the first `system` block, preserving the caller's
-/// prompt as the next block. Anthropic rejects OAuth-authenticated requests on
+/// Ensure `identity` leads the `system` blocks (after Claude Code's billing
+/// block, when present), preserving the caller's prompt after it. Anthropic rejects OAuth-authenticated requests on
 /// all models except Haiku when the request does not lead with this exact
 /// block, so it is prepended verbatim and never merged with other text.
+/// Claude Code's per-request billing block; the upstream expects it first.
+const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
+
 fn inject_identity(body: &mut Value, identity: &str) {
     let block = json!({"type": "text", "text": identity});
     match body.get_mut("system") {
@@ -1002,13 +1005,23 @@ fn inject_identity(body: &mut Value, identity: &str) {
             body["system"] = Value::Array(vec![block, original]);
         }
         Some(Value::Array(blocks)) => {
-            let first_matches = blocks
-                .first()
-                .and_then(|b| b.get("text"))
-                .and_then(Value::as_str)
-                == Some(identity);
-            if !first_matches {
-                blocks.insert(0, block);
+            // Claude Code leads with its per-request billing block, then the
+            // identity; prepending again would push that volatile block into
+            // the cached prefix and miss the cache on every turn.
+            let present = blocks
+                .iter()
+                .any(|b| b.get("text").and_then(Value::as_str) == Some(identity));
+            if !present {
+                // Keep a leading billing block first, as Claude Code itself
+                // does: moved off index 0 it becomes part of the cached prefix.
+                let at = usize::from(
+                    blocks
+                        .first()
+                        .and_then(|b| b.get("text"))
+                        .and_then(Value::as_str)
+                        .is_some_and(|t| t.starts_with(BILLING_PREFIX)),
+                );
+                blocks.insert(at, block);
             }
         }
         Some(_) => {}
@@ -1613,6 +1626,21 @@ connection: close
         let mut body = json!({"system": [{"type": "text", "text": id}]});
         inject_identity(&mut body, id);
         assert_eq!(body["system"].as_array().unwrap().len(), 1);
+
+        let mut body = json!({"system": [{"type": "text", "text": "x-anthropic-billing-header: cch=1"}, {"type": "text", "text": id}]});
+        let before = body.clone();
+        inject_identity(&mut body, id);
+        assert_eq!(body, before);
+
+        // `claude -p` sends the SDK identity instead: ours goes after billing.
+        let mut body = json!({"system": [{"type": "text", "text": "x-anthropic-billing-header: cch=1"}, {"type": "text", "text": "sdk"}]});
+        inject_identity(&mut body, id);
+        assert_eq!(
+            body["system"][0]["text"],
+            "x-anthropic-billing-header: cch=1"
+        );
+        assert_eq!(body["system"][1]["text"], id);
+        assert_eq!(body["system"][2]["text"], "sdk");
     }
 
     /// One-shot server that records the full request head and body.

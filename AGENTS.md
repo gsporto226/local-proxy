@@ -30,7 +30,7 @@ cargo test --all-features
 # na pasta e2e/
 cargo build --manifest-path ../Cargo.toml
 bun install
-bun test mock.test.ts forward.test.ts
+bun test mock.test.ts forward.test.ts cache.test.ts
 ```
 O e2e usa o binário debug; o `cargo build` acima garante que ele existe.
 
@@ -38,6 +38,25 @@ O e2e usa o binário debug; o `cargo build` acima garante que ele existe.
 `cargo-audit` (job `cargo-audit`) exige rede e instalação do
 `rustsec/audit-check`; rode `cargo audit` se tiver disponível, mas não é
 bloqueante localmente.
+
+### 6. Cache funcionando (obrigatório antes de qualquer release)
+Nunca publique versão (tag, `chore: release`, bump do plugin) sem confirmar
+que o prompt cache está sendo reaproveitado numa sessão **real** do Claude Code.
+O `cache-check` usa um prefixo sintético e não pega regressões causadas pelo
+formato real das requisições (ex.: v0.27.x reinjetava o bloco de identidade na
+frente do billing header e errava o cache em todo turno).
+
+```powershell
+cargo run -- stop
+cargo run -- launch claude      # e também --no-forward, se o modo mudou
+# faça 3+ turnos na mesma sessão, depois:
+cargo run -- logs
+```
+Do 2º turno em diante, as linhas `request usage` devem ter `cache_read=Some(N)`
+com N > 0 e nenhum `StablePrefixChanged` nem `thread_fingerprint_mismatch`.
+Atalho automatizado (API real, gasta cota): `cd e2e; bun run test:cache`.
+Se falhar, não lance a versão. O `e2e/cache.test.ts` (no CI) cobre a forma
+conhecida da requisição; a sessão real cobre o que mudou no cliente.
 
 ### Regras
 - Todos os 4 primeiros itens acima devem passar **antes** de `git commit` /
