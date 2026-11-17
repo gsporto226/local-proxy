@@ -450,6 +450,12 @@ for (const [why, opts] of [
   })
 }
 
+test('forward launch: the mod finds the proxy through HTTPS_PROXY', { plugins: [STATUSLINE] }, async ($, on) => {
+  const { commands } = mockProxy(on, { baseUrl: '', env: { HTTPS_PROXY: BASE } })
+  await start($)
+  expect(commands).not.toEqual([])
+})
+
 test('meter fills proportionally with an eighth-block edge', async () => {
   expect(meter(0, 4)).toBe('    ')
   expect(meter(50, 4)).toBe('██  ')

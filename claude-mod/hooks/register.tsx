@@ -128,7 +128,8 @@ async function syncContextWindow($: $) {
 }
 
 async function detect($: $) {
-  const raw = await $.env.get('ANTHROPIC_BASE_URL')
+  // Base-URL launch sets ANTHROPIC_BASE_URL; forward launch (Code Mode) sets only HTTPS_PROXY.
+  const raw = (await $.env.get('ANTHROPIC_BASE_URL')) || (await $.env.get('HTTPS_PROXY'))
   let url: URL
   try {
     url = new URL(raw ?? '')
