@@ -100,7 +100,7 @@ jobs:
         run: |
           cargo build --manifest-path ../Cargo.toml
           bun install
-          bun test mock.test.ts forward.test.ts
+          bun test mock.test.ts forward.test.ts cache.test.ts
 
   claude-mod:
     name: claude-mod (validate + test)
