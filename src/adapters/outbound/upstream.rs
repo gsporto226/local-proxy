@@ -996,6 +996,11 @@ fn merge_betas(ours: Option<&str>, client: Option<&str>) -> Option<String> {
 const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
 
 fn inject_identity(body: &mut Value, identity: &str) {
+    // A Thread continuation must repeat the client's system verbatim (the
+    // upstream rejects it with thread_fingerprint_mismatch otherwise).
+    if body["thread"]["type"] == "continue" {
+        return;
+    }
     let block = json!({"type": "text", "text": identity});
     match body.get_mut("system") {
         None => body["system"] = Value::Array(vec![block]),
@@ -1621,6 +1626,12 @@ connection: close
         inject_identity(&mut body, id);
         assert_eq!(body["system"][0]["text"], id);
         assert_eq!(body["system"][1]["text"], "other");
+
+        // Thread continuation: the client's system is sent verbatim.
+        let continued = json!({"thread": {"type": "continue", "previous_message_id": "m"}, "system": [{"type": "text", "text": "x-anthropic-billing-header: cch=1"}]});
+        let mut body = continued.clone();
+        inject_identity(&mut body, id);
+        assert_eq!(body, continued);
 
         // already first: not duplicated
         let mut body = json!({"system": [{"type": "text", "text": id}]});
