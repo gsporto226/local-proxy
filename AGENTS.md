@@ -30,7 +30,7 @@ cargo test --all-features
 # na pasta e2e/
 cargo build --manifest-path ../Cargo.toml
 bun install
-bun test mock.test.ts
+bun test mock.test.ts forward.test.ts
 ```
 O e2e usa o binário debug; o `cargo build` acima garante que ele existe.
 

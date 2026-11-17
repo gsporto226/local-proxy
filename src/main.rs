@@ -103,6 +103,10 @@ enum Command {
         /// Print the env/command without running anything
         #[arg(long)]
         dry_run: bool,
+        /// Claude only: reach the proxy through `ANTHROPIC_BASE_URL` instead of
+        /// `HTTPS_PROXY` (adds the proxy catalog to `/model`, disables Code Mode)
+        #[arg(long)]
+        no_forward: bool,
         /// Arguments passed through to the tool (after --)
         #[arg(trailing_var_arg = true, allow_hyphen_values = true)]
         args: Vec<String>,
@@ -271,6 +275,7 @@ fn main() -> miette::Result<()> {
             model,
             yes,
             dry_run,
+            no_forward,
             args,
         }) => cli::launch(
             &ports,
@@ -279,6 +284,7 @@ fn main() -> miette::Result<()> {
             model.as_deref(),
             yes,
             dry_run,
+            !no_forward,
             args,
         ),
         Some(Command::Status) => cli::status(&ports, config),

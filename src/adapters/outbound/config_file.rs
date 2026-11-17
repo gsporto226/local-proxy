@@ -23,8 +23,7 @@ pub fn load(path: &Path) -> Result<Config, ConfigError> {
     let ext = path
         .extension()
         .and_then(|e| e.to_str())
-        .map(str::to_ascii_lowercase)
-        .unwrap_or_default();
+        .map_or_else(Default::default, str::to_ascii_lowercase);
     Config::parse(&content, &ext, &path.display().to_string())
 }
 

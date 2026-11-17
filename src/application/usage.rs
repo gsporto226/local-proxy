@@ -111,8 +111,7 @@ impl UsageRecorder {
     pub fn record_response(&self, request: &RequestMeta, status: u16, body: Option<&Value>) {
         let tokens = body
             .and_then(|body| body.get("usage"))
-            .map(translate::parse_usage)
-            .unwrap_or_default();
+            .map_or_else(Default::default, translate::parse_usage);
         self.record_parsed(request, status, body, tokens);
     }
 

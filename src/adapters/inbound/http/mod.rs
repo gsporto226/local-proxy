@@ -6,6 +6,7 @@ use axum::Router;
 use crate::application::runtime::AppState;
 
 pub mod admin;
+pub mod forward;
 pub mod proxy;
 
 /// The axum [`Router`] wiring up every route with the given state.
@@ -21,5 +22,7 @@ pub fn app(state: AppState) -> Router {
         // Merged after the trace layer: the mod polls /admin, and tracing those
         // calls would feed its own `log` event stream back to it.
         .merge(admin::routes())
+        // `CONNECT` lands here: forward-proxy mode (see [`forward`]).
+        .fallback(forward::fallback)
         .with_state(state)
 }

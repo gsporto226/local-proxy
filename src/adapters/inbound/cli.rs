@@ -380,6 +380,11 @@ pub async fn serve(
     watcher::spawn(&config_path, watched, &app_state).map_err(CliError::from)?;
     app_state.start_account_tracking();
     let app = http::app(app_state);
+    // Forward mode (the default `launch claude`) trusts this CA file, so it must exist
+    // before a client starts; a failure only disables forward mode.
+    if let Err(e) = http::forward::prepare() {
+        tracing::warn!(target: crate::LOG_TARGET, error = %e, "forward proxy CA unavailable");
+    }
 
     let listener = tokio::net::TcpListener::bind(&addr)
         .await
@@ -461,6 +466,32 @@ pub fn launch_environment(
     if let Some(m) = model.filter(|m| !m.is_empty()) {
         env.push(("ANTHROPIC_MODEL".to_string(), m.to_string()));
         env.push(("ANTHROPIC_SMALL_FAST_MODEL".to_string(), m.to_string()));
+    }
+    env
+}
+
+/// Env vars cleared for a forward launch: each one disables Code Mode.
+const FORWARD_CLEARED_ENV: [&str; 3] = [
+    "ANTHROPIC_BASE_URL",
+    "ANTHROPIC_API_KEY",
+    "ANTHROPIC_AUTH_TOKEN",
+];
+
+/// The env vars for a forward Claude Code launch: the proxy is an
+/// `HTTPS_PROXY` that terminates `api.anthropic.com` with its local CA, so
+/// `ANTHROPIC_BASE_URL` stays unset and Code Mode stays available.
+fn forward_launch_env(config: &Config, port: u16, model: Option<&str>) -> Vec<(String, String)> {
+    let proxy = format!("http://{}:{}", config.server.host, port);
+    let mut env = vec![
+        ("LOCAL_PROXY_PORT".to_string(), port.to_string()),
+        ("HTTPS_PROXY".to_string(), proxy),
+        (
+            "NODE_EXTRA_CA_CERTS".to_string(),
+            http::forward::ca_cert_path().display().to_string(),
+        ),
+    ];
+    if let Some(m) = model.filter(|m| !m.is_empty()) {
+        env.push(("ANTHROPIC_MODEL".to_string(), m.to_string()));
     }
     env
 }
@@ -596,7 +627,7 @@ fn fetch_model_picker(host: &str, port: u16) -> Option<serde_json::Value> {
 ///
 /// Returns an error if the config cannot be loaded, the proxy cannot be
 /// started, or the tool cannot be spawned.
-#[allow(clippy::needless_pass_by_value)]
+#[allow(clippy::needless_pass_by_value, clippy::too_many_arguments)]
 pub fn launch(
     ports: &Ports,
     config_path: PathBuf,
@@ -604,9 +635,12 @@ pub fn launch(
     model: Option<&str>,
     yes: bool,
     dry_run: bool,
+    forward: bool,
     args: Vec<String>,
 ) -> miette::Result<()> {
     let config = load_config(ports, &config_path)?;
+    // Forward mode (the default) only applies to Claude Code.
+    let forward = forward && tool_command_name(tool) == "claude";
     let host = config.server.host.clone();
     let tool_cmd = tool_command_name(tool);
 
@@ -633,7 +667,11 @@ pub fn launch(
         )?)
     };
 
-    let (env, oai_base) = tool_launch_env(&config, port, model, tool_cmd);
+    let (env, oai_base) = if forward {
+        (forward_launch_env(&config, port, model), None)
+    } else {
+        tool_launch_env(&config, port, model, tool_cmd)
+    };
 
     if dry_run {
         for (k, v) in &env {
@@ -658,13 +696,20 @@ pub fn launch(
     }
 
     let mut cmd = Command::new(tool_cmd);
+    if forward {
+        // Any of these turns Code Mode off; the proxy is reached via HTTPS_PROXY.
+        for k in FORWARD_CLEARED_ENV {
+            cmd.env_remove(k);
+        }
+    }
     for (k, v) in &env {
         cmd.env(k, v);
     }
     if yes && tool_cmd != "cursor" {
         cmd.arg("--yes");
     }
-    if tool_cmd == "claude" {
+    // The proxy catalog's ids are not Claude models, and Code Mode needs one.
+    if tool_cmd == "claude" && !forward {
         if let Some(picker) = fetch_model_picker(&host, port) {
             cmd.arg("--settings")
                 .arg(serde_json::json!({ "modelPicker": picker }).to_string());
@@ -1850,6 +1895,18 @@ mod tests {
         assert_eq!(map["CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY"], "1");
         assert_eq!(map["ANTHROPIC_MODEL"], "kimi-k2.6");
         assert_eq!(map["ANTHROPIC_SMALL_FAST_MODEL"], "kimi-k2.6");
+    }
+
+    #[test]
+    fn forward_launch_env_uses_https_proxy_and_never_a_base_url() {
+        let cfg = config_with(vec!["sk-proxy".to_string()]);
+        let map: std::collections::HashMap<_, _> =
+            forward_launch_env(&cfg, 8787, None).into_iter().collect();
+        assert_eq!(map["HTTPS_PROXY"], "http://127.0.0.1:8787");
+        assert!(map["NODE_EXTRA_CA_CERTS"].ends_with("forward-ca.pem"));
+        for k in FORWARD_CLEARED_ENV {
+            assert!(!map.contains_key(k), "{k} would disable Code Mode");
+        }
     }
 
     #[test]
