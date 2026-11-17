@@ -75,7 +75,12 @@ pub fn prepare_upstream_body(
     if client_format == Format::Anthropic {
         // The harness's `/effort` wins; `active_effort` only fills a request
         // that carries none.
-        if let Some(effort) = active_effort {
+        // ponytail: name-based denylist; move to a catalog flag if more
+        // models reject `effort` ("This model does not support the effort parameter").
+        let rejects_effort = ["claude-haiku-4", "claude-3"]
+            .iter()
+            .any(|p| upstream_model.starts_with(p));
+        if let Some(effort) = active_effort.filter(|_| !rejects_effort) {
             if body.pointer("/output_config/effort").is_none() {
                 body["output_config"]["effort"] = json!(effort);
             }
@@ -360,6 +365,20 @@ mod tests {
         // ...and so does the proxy's effort default, which used to be stripped
         // right after being injected.
         assert_eq!(prepared["output_config"]["effort"], "high");
+
+        // Haiku 4.5 rejects `effort`: the default is not injected there.
+        let prepared = prepare_upstream_body(
+            crate::domain::ir::Format::Anthropic,
+            &provider,
+            "claude-haiku-4-5-20251001",
+            json!({"messages": [{"role": "user", "content": "hi"}]}),
+            Some("high"),
+            None,
+            "",
+            false,
+        )
+        .unwrap();
+        assert!(prepared.pointer("/output_config/effort").is_none());
     }
 
     #[test]
