@@ -138,7 +138,7 @@ defaults:
         assert_eq!(chatgpt.base_url, "https://chatgpt.com/backend-api/codex");
         assert_eq!(chatgpt.session_header.as_deref(), Some("session_id"));
         // Models are discovered from the Codex `/models` endpoint, not pinned.
-        assert!(chatgpt.models.is_empty());
+        assert_eq!(chatgpt.models, Vec::<String>::new());
         assert!(!chatgpt.headers.is_empty());
 
         // The effort aliases resolve to a real slug plus a reasoning effort.
