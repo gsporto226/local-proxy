@@ -33,13 +33,23 @@ fn positive_tokens(value: &Value) -> Option<u64> {
     value.as_u64().filter(|tokens| *tokens > 0)
 }
 
+/// Client version sent to the Codex `/models` endpoint, which hides models
+/// newer than the client. High on purpose so every model is listed.
+const CODEX_CLIENT_VERSION: &str = "99.0.0";
+
 fn discovered_models(body: &Value) -> Vec<DiscoveredModel> {
+    // `data[].id` for OpenAI/Anthropic; `models[].slug` for the Codex backend.
     body["data"]
         .as_array()
+        .or_else(|| body["models"].as_array())
         .into_iter()
         .flatten()
+        .filter(|model| model["visibility"].as_str() != Some("hide"))
         .filter_map(|model| {
-            let id = model["id"].as_str()?.to_string();
+            let id = model["id"]
+                .as_str()
+                .or_else(|| model["slug"].as_str())?
+                .to_string();
             let context_window = [
                 "/top_provider/context_length",
                 "/context_length",
@@ -904,7 +914,16 @@ impl ProviderClient {
         if oauth_access.is_none() && api_key.is_none() {
             return Vec::new();
         }
-        let url = format!("{}/v1/models", self.base_url);
+        // The ChatGPT (Codex) backend has no `/v1/models`; its catalog lives at
+        // `/models` and filters by client version.
+        let url = if is_oauth && self.format == ProviderFormat::OpenaiResponses {
+            format!(
+                "{}/models?client_version={CODEX_CLIENT_VERSION}",
+                self.base_url
+            )
+        } else {
+            format!("{}/v1/models", self.base_url)
+        };
         let mut req = self.http.get(&url);
         if let Some(access) = oauth_access {
             req = req.header(AUTHORIZATION, format!("Bearer {access}"));
@@ -1478,6 +1497,21 @@ mod tests {
         assert_eq!(
             catalog_context(&Value::Null, "opencode-go", "new-model"),
             None
+        );
+    }
+
+    #[test]
+    fn discovered_models_reads_codex_slugs_and_skips_hidden() {
+        let body = serde_json::json!({"models": [
+            {"slug": "gpt-6.2-sol", "visibility": "list", "context_window": 400_000},
+            {"slug": "internal", "visibility": "hide"},
+        ]});
+        assert_eq!(
+            discovered_models(&body),
+            vec![DiscoveredModel {
+                id: "gpt-6.2-sol".to_string(),
+                context_window: Some(400_000),
+            }]
         );
     }
 

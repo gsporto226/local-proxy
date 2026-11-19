@@ -119,7 +119,7 @@ defaults:
         assert!(config
             .providers
             .iter()
-            .all(|p| p.models.is_empty() == !matches!(p.name.as_str(), "chatgpt" | "gemini")));
+            .all(|p| p.models.is_empty() == (p.name != "gemini")));
         assert!(
             config.defaults.provider.is_empty(),
             "catalog defaults.provider should be empty"
@@ -137,9 +137,8 @@ defaults:
         assert_eq!(chatgpt.format, ProviderFormat::OpenaiResponses);
         assert_eq!(chatgpt.base_url, "https://chatgpt.com/backend-api/codex");
         assert_eq!(chatgpt.session_header.as_deref(), Some("session_id"));
-        // The Codex catalog slugs, not the chat web UI's `-wm` names.
-        assert!(chatgpt.models.iter().any(|m| m == "gpt-6-sol"));
-        assert!(!chatgpt.models.iter().any(|m| m.contains("-wm")));
+        // Models are discovered from the Codex `/models` endpoint, not pinned.
+        assert!(chatgpt.models.is_empty());
         assert!(!chatgpt.headers.is_empty());
 
         // The effort aliases resolve to a real slug plus a reasoning effort.
