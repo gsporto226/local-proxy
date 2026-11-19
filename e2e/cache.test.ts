@@ -82,8 +82,12 @@ async function turn(messages: unknown[], model = "claude-opus-5-5", billing = sy
   } as RequestInit);
   const text = await readBody(res);
   expect(res.status, text).toBe(200);
-  const start = parseSse(text).find((f) => f.event === "message_start")!;
-  return { usage: JSON.parse(start.data).message.usage, sent: mock.requests().at(-1)!.body };
+  const frames = parseSse(text);
+  const start = frames.find((f) => f.event === "message_start")!;
+  // Translated streams (Responses) only know usage at the end: merge it in.
+  const delta = frames.filter((f) => f.event === "message_delta").at(-1);
+  const usage = { ...JSON.parse(start.data).message.usage, ...(delta ? JSON.parse(delta.data).usage : {}) };
+  return { usage, sent: mock.requests().at(-1)!.body };
 }
 
 describe("prompt cache", () => {
