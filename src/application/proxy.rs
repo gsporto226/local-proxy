@@ -100,6 +100,11 @@ fn is_connected(state: &RuntimeState, provider: &str) -> bool {
 /// with the real `anthropic` provider.
 pub const GATEWAY_ID_MARKER: &str = "anthropic:";
 
+/// Prefix that makes a proxy model ID pass Claude Code's Code Mode model
+/// check (forward launches): Claude Code sees an Opus 5.5 id, and
+/// [`resolve_model`] strips the prefix to route the real model.
+pub const CODE_MODE_ID_PREFIX: &str = "claude-opus-5-5+";
+
 /// Whether Claude Code's gateway model discovery keeps this ID as-is.
 #[must_use]
 pub fn passes_gateway_filter(id: &str) -> bool {
@@ -133,6 +138,7 @@ pub fn resolve_model(
     client_model: Option<&str>,
 ) -> Result<(Arc<Provider>, String, Option<String>), ApiError> {
     let client_model = client_model
+        .map(|m| m.strip_prefix(CODE_MODE_ID_PREFIX).unwrap_or(m))
         .map(|m| m.strip_prefix(GATEWAY_ID_MARKER).unwrap_or(m))
         .filter(|m| !m.is_empty());
     let connected = |name: &str| is_connected(state, name);

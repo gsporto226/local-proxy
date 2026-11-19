@@ -477,6 +477,12 @@ const FORWARD_CLEARED_ENV: [&str; 3] = [
     "ANTHROPIC_AUTH_TOKEN",
 ];
 
+/// Whether a forward launch must hide `model` behind
+/// [`crate::application::proxy::CODE_MODE_ID_PREFIX`] so Code Mode accepts it.
+fn masks_model(model: Option<&str>) -> bool {
+    model.is_some_and(|m| !m.is_empty() && !crate::application::proxy::passes_gateway_filter(m))
+}
+
 /// The env vars for a forward Claude Code launch: the proxy is an
 /// `HTTPS_PROXY` that terminates `api.anthropic.com` with its local CA, so
 /// `ANTHROPIC_BASE_URL` stays unset and Code Mode stays available.
@@ -491,7 +497,13 @@ fn forward_launch_env(config: &Config, port: u16, model: Option<&str>) -> Vec<(S
         ),
     ];
     if let Some(m) = model.filter(|m| !m.is_empty()) {
-        env.push(("ANTHROPIC_MODEL".to_string(), m.to_string()));
+        let m = if masks_model(Some(m)) {
+            format!("{}{m}", crate::application::proxy::CODE_MODE_ID_PREFIX)
+        } else {
+            m.to_string()
+        };
+        env.push(("ANTHROPIC_SMALL_FAST_MODEL".to_string(), m.clone()));
+        env.push(("ANTHROPIC_MODEL".to_string(), m));
     }
     env
 }
@@ -592,11 +604,23 @@ fn start_ephemeral_proxy(
 /// Claude Code's `modelPicker` setting built from an Anthropic-shaped
 /// `/v1/models` body: the proxy's catalog replaces the built-in lineup in
 /// `/model`. `None` when the body lists no models.
-fn model_picker(models: &serde_json::Value) -> Option<serde_json::Value> {
+fn model_picker(models: &serde_json::Value, code_mode: bool) -> Option<serde_json::Value> {
     let options: Vec<_> = models["data"]
         .as_array()?
         .iter()
-        .map(|m| serde_json::json!({ "model": m["id"], "label": m["display_name"] }))
+        .map(|m| {
+            let id = m["id"].as_str().unwrap_or_default();
+            // Forward launches keep Code Mode: give each entry an Opus 5.5 id.
+            let id = if code_mode {
+                let bare = id
+                    .strip_prefix(crate::application::proxy::GATEWAY_ID_MARKER)
+                    .unwrap_or(id);
+                format!("{}{bare}", crate::application::proxy::CODE_MODE_ID_PREFIX)
+            } else {
+                id.to_string()
+            };
+            serde_json::json!({ "model": id, "label": m["display_name"] })
+        })
         .collect();
     (!options.is_empty())
         .then(|| serde_json::json!({ "options": options, "replaceBuiltInOptions": true }))
@@ -605,7 +629,7 @@ fn model_picker(models: &serde_json::Value) -> Option<serde_json::Value> {
 /// Ask the launched proxy for its live catalog (`GET /v1/models`, Anthropic
 /// shape) and turn it into a [`model_picker`]. `None` on any failure, which
 /// leaves Claude Code's built-in `/model` lineup in place.
-fn fetch_model_picker(host: &str, port: u16) -> Option<serde_json::Value> {
+fn fetch_model_picker(host: &str, port: u16, code_mode: bool) -> Option<serde_json::Value> {
     use std::io::{Read, Write};
     let mut stream = TcpStream::connect((host, port)).ok()?;
     stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
@@ -617,7 +641,7 @@ fn fetch_model_picker(host: &str, port: u16) -> Option<serde_json::Value> {
     let mut raw = String::new();
     stream.read_to_string(&mut raw).ok()?;
     let body = raw.split_once("\r\n\r\n")?.1;
-    model_picker(&serde_json::from_str(body).ok()?)
+    model_picker(&serde_json::from_str(body).ok()?, code_mode)
 }
 
 /// Launch the given CLI tool against this proxy, starting the proxy in the
@@ -708,9 +732,9 @@ pub fn launch(
     if yes && tool_cmd != "cursor" {
         cmd.arg("--yes");
     }
-    // The proxy catalog's ids are not Claude models, and Code Mode needs one.
-    if tool_cmd == "claude" && !forward {
-        if let Some(picker) = fetch_model_picker(&host, port) {
+    // In forward mode the ids carry an Opus 5.5 prefix so Code Mode stays on.
+    if tool_cmd == "claude" {
+        if let Some(picker) = fetch_model_picker(&host, port, forward) {
             cmd.arg("--settings")
                 .arg(serde_json::json!({ "modelPicker": picker }).to_string());
         }
@@ -1914,11 +1938,33 @@ mod tests {
         let body = serde_json::json!({"data": [
             {"type": "model", "id": "anthropic:openai/gpt-4o", "display_name": "openai/gpt-4o"},
         ]});
-        let picker = model_picker(&body).expect("picker");
+        let picker = model_picker(&body, false).expect("picker");
         assert_eq!(picker["replaceBuiltInOptions"], true);
         assert_eq!(picker["options"][0]["model"], "anthropic:openai/gpt-4o");
         assert_eq!(picker["options"][0]["label"], "openai/gpt-4o");
-        assert!(model_picker(&serde_json::json!({"data": []})).is_none());
+        assert!(model_picker(&serde_json::json!({"data": []}), false).is_none());
+        let forward = model_picker(&body, true).expect("picker");
+        assert_eq!(
+            forward["options"][0]["model"],
+            "claude-opus-5-5+openai/gpt-4o"
+        );
+    }
+
+    #[test]
+    fn forward_launch_env_masks_non_claude_models_for_code_mode() {
+        let cfg = config_with(Vec::new());
+        let model = |m| -> String {
+            let map: std::collections::HashMap<_, _> = forward_launch_env(&cfg, 8787, Some(m))
+                .into_iter()
+                .collect();
+            map["ANTHROPIC_MODEL"].clone()
+        };
+        assert_eq!(
+            model("chatgpt/gpt-5.6-luna"),
+            "claude-opus-5-5+chatgpt/gpt-5.6-luna"
+        );
+        assert_eq!(model("claude-sonnet-5-5"), "claude-sonnet-5-5");
+        assert!(!masks_model(None));
     }
 
     #[test]
