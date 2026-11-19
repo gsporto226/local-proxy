@@ -881,3 +881,15 @@ fn parallel_tool_calls_and_results_group_into_one_turn() {
         2
     );
 }
+
+#[test]
+fn billing_block_is_dropped_for_non_anthropic_formats() {
+    let body = json!({"model": "m", "max_tokens": 1, "system": [
+        {"type": "text", "text": "x-anthropic-billing-header: cch=1; cc_turn_index=2"},
+        {"type": "text", "text": "stable"},
+    ], "messages": [{"role": "user", "content": "hi"}]});
+    let r = req(Format::Anthropic, Format::Responses, body.clone()).unwrap();
+    assert_eq!(r["instructions"], "stable");
+    let o = anthropic_to_openai_request(body).unwrap();
+    assert_eq!(o["messages"][0]["content"], "stable");
+}

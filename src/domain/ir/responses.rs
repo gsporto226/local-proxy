@@ -231,14 +231,7 @@ fn encode_input(req: &Request) -> Vec<Value> {
 pub fn encode_request(req: &Request) -> Value {
     let mut out = Map::new();
     out.insert("model".into(), json!(req.model));
-    let instructions: Vec<&str> = req
-        .system
-        .iter()
-        .filter_map(|b| match &b.part {
-            Part::Text(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .collect();
+    let instructions: Vec<&str> = super::system_texts(&req.system).collect();
     if !instructions.is_empty() {
         out.insert("instructions".into(), json!(instructions.join("\n\n")));
     }
