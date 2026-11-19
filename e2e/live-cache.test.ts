@@ -2,7 +2,9 @@
 // release (AGENTS.md, item 6). Runs the real `claude` CLI in forward mode
 // (HTTPS_PROXY + NODE_EXTRA_CA_CERTS, exactly what `launch claude` sets)
 // through a proxy on the user's real config, for two turns of one session,
-// and asserts the second turn reads the prefix the first one cached.
+// and asserts the second turn reads the prefix the first one cached. Runs once
+// per model: a Claude model and a ChatGPT model behind a Code Mode id (what
+// forward `launch --model chatgpt/...` and `/model` send).
 //
 // Opt-in (spends subscription quota): LOCAL_PROXY_LIVE=1 bun test live-cache.test.ts
 // Read-only on the credential store: the proxy only reads accounts.db.
@@ -14,7 +16,9 @@ import { join } from "node:path";
 
 import { BINARY, findFreePort, waitHealth, type ProxyHandle } from "./helpers";
 
-const MODEL = process.env.LOCAL_PROXY_LIVE_MODEL ?? "claude-sonnet-5-5";
+// Comma-separated; override with LOCAL_PROXY_LIVE_MODELS.
+const MODELS = (process.env.LOCAL_PROXY_LIVE_MODELS
+  ?? "claude-sonnet-5-5,claude-opus-5-5+chatgpt/gpt-5.6-luna").split(",").map((m) => m.trim()).filter(Boolean);
 const configDir = process.platform === "win32"
   ? join(process.env.APPDATA ?? "", "local-proxy", "config")
   : join(process.env.HOME ?? "", ".config", "local-proxy");
@@ -35,7 +39,10 @@ beforeAll(async () => {
   if (skipReason) return;
   const port = await findFreePort();
   const log = openSync(proxyLog, "w");
-  const proc = spawn([BINARY, "serve", "--config", configPath, "--port", String(port)], {
+  // A Claude id the router can't resolve (model discovery down) falls back to
+  // the active model; pin it so the user's own selection can't steal the run.
+  const fallback = process.env.LOCAL_PROXY_LIVE_FALLBACK ?? "claude/claude-sonnet-5-5";
+  const proc = spawn([BINARY, "serve", "--config", configPath, "--port", String(port), "--model", fallback], {
     stdout: log, stderr: log, env: { ...process.env, RUST_LOG: "local_proxy=debug" },
   });
   proxy = { proc, base: `http://127.0.0.1:${port}`, port };
@@ -50,14 +57,14 @@ afterAll(async () => {
   console.log(`[live-cache] proxy log: ${proxyLog}`);
 });
 
-async function claude(args: string[]) {
+async function claude(model: string, args: string[]) {
   const env: Record<string, string | undefined> = {
     ...process.env,
     HTTPS_PROXY: proxy.base,
     NODE_EXTRA_CA_CERTS: join(configDir, "forward-ca.pem"),
   };
   for (const k of ["ANTHROPIC_BASE_URL", "ANTHROPIC_API_KEY", "ANTHROPIC_AUTH_TOKEN", "HTTP_PROXY", "NO_PROXY", "no_proxy"]) delete env[k];
-  const child = spawn(["claude", "-p", ...args, "--model", MODEL, "--output-format", "json", "--max-turns", "1"], { cwd: workDir, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
+  const child = spawn(["claude", "-p", ...args, "--model", model, "--output-format", "json", "--max-turns", "1"], { cwd: workDir, env, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
   children.add(child);
   let timedOut = false;
   const timer = setTimeout(() => { timedOut = true; child.kill(); }, 75000);
@@ -72,10 +79,13 @@ async function claude(args: string[]) {
 }
 
 describe.skipIf(skipReason)("live: prompt cache via real API (forward mode)", () => {
-  test("the second turn of a session reads the cached prefix", async () => {
-    const first = await claude(["Reply with exactly: one"]);
-    const second = await claude(["--resume", first.session_id, "Reply with exactly: two"]);
-    console.log("[live-cache]", { first: first.usage, second: second.usage });
-    expect(second.usage.cache_read_input_tokens ?? 0).toBeGreaterThan(0);
-  }, 180000);
+  test.each(MODELS)("%s: the last of three turns reads the cached prefix", async (model) => {
+    // Three turns, asserting the last: OpenAI sometimes misses right after
+    // the first write, which would make a two-turn check flaky.
+    const first = await claude(model, ["Reply with exactly: one"]);
+    await claude(model, ["--resume", first.session_id, "Reply with exactly: two"]);
+    const last = await claude(model, ["--resume", first.session_id, "Reply with exactly: three"]);
+    console.log("[live-cache]", model, { first: first.usage, last: last.usage });
+    expect(last.usage.cache_read_input_tokens ?? 0).toBeGreaterThan(0);
+  }, 300000);
 });

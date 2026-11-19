@@ -158,14 +158,7 @@ fn thinking_config(model: &str, effort: Option<Effort>) -> Value {
 }
 
 fn system_text(system: &[Block]) -> String {
-    system
-        .iter()
-        .filter_map(|b| match &b.part {
-            Part::Text(t) => Some(t.as_str()),
-            _ => None,
-        })
-        .collect::<Vec<_>>()
-        .join("\n\n")
+    super::system_texts(system).collect::<Vec<_>>().join("\n\n")
 }
 
 fn part(p: &Part, names: &HashMap<&str, &str>) -> Option<Value> {

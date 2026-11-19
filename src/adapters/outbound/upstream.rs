@@ -993,7 +993,7 @@ fn merge_betas(ours: Option<&str>, client: Option<&str>) -> Option<String> {
 /// all models except Haiku when the request does not lead with this exact
 /// block, so it is prepended verbatim and never merged with other text.
 /// Claude Code's per-request billing block; the upstream expects it first.
-const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
+use crate::domain::ir::BILLING_PREFIX;
 
 fn inject_identity(body: &mut Value, identity: &str) {
     // A Thread continuation must repeat the client's system verbatim (the

@@ -62,6 +62,21 @@ pub struct Request {
     pub ext: Ext,
 }
 
+/// Start of Claude Code's per-request billing block.
+///
+/// It changes every request (`cch`, prompt id, turn index), so
+/// non-Anthropic encoders drop it or it
+/// would break automatic prefix caching from the first token.
+pub const BILLING_PREFIX: &str = "x-anthropic-billing-header:";
+
+/// The text of the system blocks, minus Claude Code's billing block.
+pub fn system_texts(system: &[Block]) -> impl Iterator<Item = &str> {
+    system.iter().filter_map(|b| match &b.part {
+        Part::Text(t) if !t.starts_with(BILLING_PREFIX) => Some(t.as_str()),
+        _ => None,
+    })
+}
+
 /// A content part plus its prompt-cache breakpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Block {

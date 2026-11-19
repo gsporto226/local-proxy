@@ -237,14 +237,7 @@ fn user_content(parts: &[&Part]) -> Value {
 fn encode_messages(req: &Request) -> Vec<Value> {
     let mut out = Vec::new();
     if !req.system.is_empty() {
-        let text: Vec<String> = req
-            .system
-            .iter()
-            .filter_map(|b| match &b.part {
-                Part::Text(t) => Some(t.clone()),
-                _ => None,
-            })
-            .collect();
+        let text: Vec<&str> = super::system_texts(&req.system).collect();
         out.push(json!({"role": "system", "content": text.join("\n")}));
     }
     for m in &req.messages {
