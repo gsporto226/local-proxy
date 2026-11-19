@@ -55,6 +55,8 @@ cargo run -- logs
 Do 2º turno em diante, as linhas `request usage` devem ter `cache_read=Some(N)`
 com N > 0 e nenhum `StablePrefixChanged` nem `thread_fingerprint_mismatch`.
 Atalho automatizado (API real, gasta cota): `cd e2e; bun run test:cache`.
+Ele cobre um modelo Claude e um ChatGPT (via id do Code Mode); troque a lista
+com `LOCAL_PROXY_LIVE_MODELS` (separada por vírgula).
 Se falhar, não lance a versão. O `e2e/cache.test.ts` (no CI) cobre a forma
 conhecida da requisição; a sessão real cobre o que mudou no cliente.
 
