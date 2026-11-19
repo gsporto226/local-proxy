@@ -39,8 +39,8 @@ providers:
   # `local-proxy connect chatgpt --account <alias> --oauth` (browser PKCE with
   # a localhost callback); it speaks the Responses API.
   #
-  # These are the Codex-catalog slugs, pinned here because the backend has no
-  # `/v1/models`. They are NOT the same as the ones the chat web UI uses
+  # Models are discovered from `GET /models?client_version=…` (the backend has
+  # no `/v1/models`). These are the Codex-catalog slugs, NOT the same as the ones the chat web UI uses
   # (`/backend-api/models` returns e.g. `gpt-6.1-sol-wm`, which this backend
   # rejects with "model is not supported when using Codex with a ChatGPT
   # account"). The authoritative list for an account is
@@ -76,19 +76,6 @@ providers:
       token_encoding: form
       account_id_claim: https://api.openai.com/auth
       account_id_header: chatgpt-account-id
-    models:
-      - gpt-6-sol
-      - gpt-6-astra
-      - gpt-6-luna
-      - gpt-5.6-sol
-      - gpt-5.6-terra
-      - gpt-5.6-luna
-      # Reasoning-effort variants: the same model at a fixed effort. They are
-      # listed here so `local-proxy models` offers them and `local-proxy model`
-      # accepts them; the routes below map each one back to its real slug plus
-      # the effort field.
-      - gpt-6-sol-low
-      - gpt-6-sol-medium
   - name: opencode-go
     base_url: https://opencode.ai/zen/go
     format: openai
